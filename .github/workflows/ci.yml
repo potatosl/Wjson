@@ -78,4 +78,15 @@ jobs:
           powershell -NoProfile -ExecutionPolicy Bypass -File .\setup-windows.ps1
           $code = $LASTEXITCODE
           Get-Content run-log.txt -ErrorAction SilentlyContinue | Select-Object -Last 40
+          # On failure, also publish the tail of both logs as annotations so the
+          # reason is visible on the run summary page without opening the raw log.
+          if ($code -ne 0) {
+            foreach ($f in 'setup-log.txt', 'run-log.txt') {
+              if (Test-Path $f) {
+                $tail = (Get-Content $f -Tail 60) -join "`n"
+                $msg = $tail.Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
+                Write-Output "::error title=$f (last 60 lines)::$msg"
+              }
+            }
+          }
           exit $code
