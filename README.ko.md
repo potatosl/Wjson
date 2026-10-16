@@ -19,7 +19,13 @@ Wave ↔ Rust/C++ 경계는 모두 C ABI(`extern(c)`)입니다. C/C++ 프로그�
 
 wjson은 소스로 받아서 씁니다. 정적 라이브러리 두 개를 한 번 빌드한 뒤, 내 프로그램을 그 라이브러리에 링크해서 컴파일하면 돼요.
 
-**1. 도구 설치** — Wave 컴파일러 `wavec`(0.2.1-pre-beta), Rust 1.99 이상, C++20 컴파일러. Windows는 [Windows (MSVC 없이)](#windows-msvc-없이)를 보세요. `setup-windows.cmd`가 필요한 걸 전부 설치해 줘요.
+**1. 도구 설치** — Wave 컴파일러 `wavec`(0.2.1-pre-beta, 현재 최신), Rust 1.99 이상, C++20 컴파일러. Wave 공식 설치 방법은 [설치 페이지](https://wave-lang.dev/docs/en/getting-started/install)에 있어요:
+
+```sh
+curl -fsSL https://wave-lang.dev/install.sh | bash     # Linux, macOS, FreeBSD
+```
+
+Windows는 [Windows (MSVC 없이)](#windows-msvc-없이)를 보세요. `setup-windows.cmd`가 필요한 걸 전부 설치해 줘요.
 
 **2. wjson 받고 라이브러리 빌드**
 
@@ -57,7 +63,7 @@ wavec build hello.wave \
       -L /usr/lib/gcc/x86_64-linux-gnu/15 --run
 ```
 
-`0.0.0.0:8080`이 출력돼요. `--dep=wjson=wjson`은 받은 폴더를 가리켜요. `--link=...`와 `-L ...` 부분은 2단계의 `link :` 줄로 바꿔 쓰세요(gcc 폴더는 컴퓨터마다 달라요). `wavec`이 표준 라이브러리를 못 찾는다고 하면 `--std-root=<Wave의 std가 있는 폴더>`를 붙이세요.
+`0.0.0.0:8080`이 출력돼요. `--dep=wjson=wjson`은 받은 폴더를 가리켜요. `--link=...`와 `-L ...` 부분은 2단계의 `link :` 줄로 바꿔 쓰세요(gcc 폴더는 컴퓨터마다 달라요). `wavec`이 표준 라이브러리를 못 찾는다고 하면(`wavec print std-path`가 찾는 위치를 보여 주고, 설치 스크립트는 `~/.wave/bin/std`에 둬요) `--std-root=<Wave의 std가 있는 폴더>`를 붙이거나, Wave 문제 해결 페이지의 안내처럼 `wavec install std`를 실행하세요.
 
 **C / C++에서 쓰기** (Wave 없이) — 같은 라이브러리 두 개를 링크하고 헤더를 include 하면 돼요. `wjson.hpp`는 헤더만으로 된 C++ 래퍼이고, `wjson.h`는 순수 C API예요(`libwjson_core.a`만 있으면 됩니다):
 
@@ -143,7 +149,7 @@ json_stream_close(&s);
 
 ## 빌드와 테스트
 
-빌드 드라이버도 Wave로 짜여 있어요(`build.wave`). 필요한 것: [wavec](https://wave-lang.dev/docs/getting-started/install)(LLVM 21 기반), Rust 1.99 이상(cargo), C++20 컴파일러.
+빌드 드라이버도 Wave로 짜여 있어요(`build.wave`). 필요한 것: [wavec](https://wave-lang.dev/docs/en/getting-started/install)(LLVM 21 기반), Rust 1.99 이상(cargo), C++20 컴파일러.
 
 ```sh
 wavec run build.wave                                   # Rust + C++ + Wave 테스트, 예제 전부 실행
@@ -196,6 +202,8 @@ winget install Rustlang.Rustup
 # 3) clang
 winget install LLVM.LLVM
 ```
+
+Wave의 Windows 설치 스크립트는 마지막에 스모크 컴파일을 하는데, Wave 문서에 따르면 이때 Windows SDK와 MSVC/UCRT 라이브러리가 보여야 해요(GitHub의 `windows-2025` 러너에서는 통과해요). 이 검사는 wjson 빌드가 아니라 Wave 설치 스크립트의 것이에요. SDK가 없다면 [Wave 릴리스](https://github.com/wavefnd/Wave/releases)에서 `wave-<버전>-x86_64-pc-windows-msvc.zip`을 받아 폴더 구조(`wavec.exe`, `std`, `llvm`)를 그대로 풀고, 그 폴더를 `PATH`에 추가한 뒤 아래처럼 `--std-root`를 넘기세요.
 
 일반 PowerShell에서 실행하면 돼요(Developer PowerShell 불필요). `build.wave`도 wavec가 링크해야 하는 Wave 프로그램이라, wjlink를 먼저 한 번 빌드한 뒤 wavec에 넘겨 줘야 해요. std 위치도 함께 넘겨 주세요. Windows 설치 프로그램은 std를 `wavec.exe` 옆에 두는데, wavec가 그 위치를 자동으로 찾지 않아요. (`setup-windows.cmd`는 이걸 전부 알아서 해요.)
 
@@ -298,7 +306,7 @@ build.wave     빌드 드라이버 (Wave)
 
 - Wave 언어가 pre-beta라 문법이 바뀌면 `src/`를 맞춰야 할 수 있습니다.
 - 다른 모듈에서 `extern(c) fun name(...)` 형태(심볼 이름 생략)로 선언하면 현재 wavec가 이름을 맹글링해 링크가 깨집니다. 그래서 `src/ffi.wave`는 항상 `extern(c, "symbol")` 형태를 씁니다.
-- Linux x86-64와 Windows 11 x64(MSVC 없이)에서 검증했습니다. macOS와 ARM은 아직 검증하지 않았습니다.
+- Linux x86-64와 Windows 11 x64(MSVC 없이)에서 검증했고, CI가 푸시할 때마다 두 환경(`ubuntu-26.04`, `windows-2025`)에서 빌드와 테스트를 합니다. macOS와 ARM은 아직 검증하지 않았습니다.
 - 1.0 전이라 API가 바뀔 수 있어요. 바뀐 점은 `CHANGELOG.md`에 적어요.
 - Windows 빌드는 C 런타임으로 시스템의 `msvcrt.dll`을 써요(MinGW와 같은 방식). Microsoft가 앱용으로 권장하는 런타임은 아니에요. C99 수학 함수 일부(`fma`)만 `ucrtbase.dll`에서 가져와요.
 - `wjlink`는 wjson 빌드에 필요한 범위(x86-64, 콘솔 프로그램)에서 검증했어요. 범용 링커로 쓰기에는 아직 이릅니다.

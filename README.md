@@ -30,9 +30,16 @@ Studio**.
 wjson is used from source: build its two static libraries once, then compile
 your own program against them.
 
-**1. Install the tools** — the Wave compiler `wavec` (0.2.1-pre-beta), Rust
-1.99 or newer, and a C++20 compiler. On Windows see
-[Windows (no MSVC)](#windows-no-msvc); `setup-windows.cmd` installs everything.
+**1. Install the tools** — the Wave compiler `wavec` (0.2.1-pre-beta, the
+newest release), Rust 1.99 or newer, and a C++20 compiler. Wave's official
+installer (see its [install page](https://wave-lang.dev/docs/en/getting-started/install)):
+
+```sh
+curl -fsSL https://wave-lang.dev/install.sh | bash     # Linux, macOS, FreeBSD
+```
+
+On Windows see [Windows (no MSVC)](#windows-no-msvc); `setup-windows.cmd`
+installs everything.
 
 **2. Get wjson and build the libraries**
 
@@ -75,7 +82,9 @@ wavec build hello.wave \
 This prints `0.0.0.0:8080`. `--dep=wjson=wjson` points at the cloned folder.
 Replace the `--link=...` and `-L ...` flags with the `link :` line from step 2
 (the gcc directory differs from machine to machine). If `wavec` cannot find its
-standard library, add `--std-root=<folder containing Wave's std>`.
+standard library (`wavec print std-path` shows where it looks; the installer
+puts it in `~/.wave/bin/std`), add `--std-root=<folder containing Wave's std>`
+or run `wavec install std`, as Wave's troubleshooting page suggests.
 
 **From C or C++** (no Wave needed) link the same two libraries and include the
 headers. `wjson.hpp` is a header-only C++ view; `wjson.h` is the plain C API
@@ -175,7 +184,7 @@ The example data is **synthetic** — generated for this repository
 ## Building and testing
 
 The build driver is itself written in Wave (`build.wave`). Requirements:
-[wavec](https://wave-lang.dev/docs/getting-started/install) 0.2.1-pre-beta
+[wavec](https://wave-lang.dev/docs/en/getting-started/install) 0.2.1-pre-beta
 (LLVM 21), Rust 1.99 or newer (cargo), and a C++20 compiler (clang on Windows).
 
 ```sh
@@ -245,6 +254,15 @@ winget install Rustlang.Rustup
 # 3) clang
 winget install LLVM.LLVM
 ```
+
+Wave's own Windows installer finishes with a smoke compile that, according to
+its documentation, needs the Windows SDK and MSVC/UCRT libraries to be visible
+(on GitHub's `windows-2025` runner it passes). That check belongs to the Wave
+installer, not to wjson's build. If you have no SDK, download the
+`wave-<version>-x86_64-pc-windows-msvc.zip` from
+[Wave's releases](https://github.com/wavefnd/Wave/releases), extract it keeping
+its layout (`wavec.exe`, `std`, `llvm`), add that folder to `PATH` and pass
+`--std-root` as below.
 
 A normal PowerShell is enough (no Developer PowerShell). `build.wave` is
 itself a Wave program, so wjlink has to exist before wavec can link it —
@@ -425,7 +443,8 @@ build.wave     build driver (Wave)
 - Declaring `extern(c) fun name(...)` without an explicit symbol in another
   module currently gets the name mangled by wavec and breaks linking, so
   `src/ffi.wave` always uses the `extern(c, "symbol")` form.
-- Verified on Linux x86-64 and Windows 11 x64 (without MSVC). macOS and ARM
+- Verified on Linux x86-64 and Windows 11 x64 (without MSVC); CI builds and
+  tests both on every push (`ubuntu-26.04`, `windows-2025`). macOS and ARM
   have not been tested.
 - Before 1.0 the API may change; changes are listed in `CHANGELOG.md`.
 - The Windows build uses the system `msvcrt.dll` as its C runtime (as MinGW
