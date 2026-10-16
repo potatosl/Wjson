@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MPL-2.0
 [package]
 name = "wjson_core"
-authors = ["panda"]
+authors = ["potatosl"]
 version = "0.4.0"
 edition = "2024"
 rust-version = "1.99"

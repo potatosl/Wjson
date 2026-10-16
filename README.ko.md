@@ -242,4 +242,4 @@ build.wave     빌드 드라이버 (Wave)
 
 ## 라이선스
 
-Mozilla Public License 2.0 (MPL-2.0) — `LICENSE` 참고. Copyright (c) 2026 panda and the wjson contributors. 이 저장소의 파일을 수정해 배포하면 그 파일은 MPL-2.0을 유지해야 하고, wjson을 가져다 쓰는 프로그램은 어떤 라이선스든 괜찮아요.
+Mozilla Public License 2.0 (MPL-2.0) — `LICENSE` 참고. Copyright (c) 2026 potatosl and the wjson contributors. 이 저장소의 파일을 수정해 배포하면 그 파일은 MPL-2.0을 유지해야 하고, wjson을 가져다 쓰는 프로그램은 어떤 라이선스든 괜찮아요.

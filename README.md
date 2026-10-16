@@ -362,6 +362,6 @@ See `CONTRIBUTING.md`; report vulnerabilities as described in `SECURITY.md`.
 
 ## License
 
-Mozilla Public License 2.0 (MPL-2.0) — see `LICENSE`. Copyright (c) 2026 panda and the
+Mozilla Public License 2.0 (MPL-2.0) — see `LICENSE`. Copyright (c) 2026 potatosl and the
 wjson contributors. Modified copies of the files in this repository must stay under the
 MPL-2.0; programs that merely use wjson may use any license.
