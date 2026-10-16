@@ -1,0 +1,287 @@
+// SPDX-License-Identifier: MIT
+//
+// Small CSV reader shared by the CSV examples (csv2json.wave,
+// survey_report.wave). Not part of wjson itself.
+//
+//   var csv: Csv = csv_empty();
+//   if (!csv_load("data/survey_sample.csv", &csv)) { ... }
+//   cell_ptr(&csv, row, col) / cell_len(&csv, row, col)   // trimmed, unquoted
+//   csv_free(&csv);
+//
+// Handles quoted fields ("a,b"), doubled quotes, CRLF, a UTF-8 BOM and
+// surrounding spaces. Fields are byte ranges into the loaded file buffer.
+
+import("std::fs::file")::{fs_read_all, fs_file_size};
+import("std::mem::alloc")::{mem_alloc, mem_free};
+
+pub struct Csv {
+    data: ptr<u8>;
+    size: i64;
+    data_cap: i64;        // allocation size when csv_load owns the buffer (0 otherwise)
+    starts: ptr<i64>;     // field byte offsets
+    lens: ptr<i64>;       // field byte lengths (after trimming/unquoting)
+    row_first: ptr<i64>;  // index of each row's first field
+    rows: i64;
+    fields: i64;
+    field_cap: i64;
+}
+
+fun is_space(c: u8) -> bool {
+    return c == 32 || c == 9;
+}
+
+fun push_field(c: ptr<Csv>, start: i64, len: i64) {
+    var s: i64 = start;
+    var n: i64 = len;
+    var d: ptr<u8> = deref c.data;
+    while (n > 0 && is_space(d[s])) {
+        s += 1;
+        n -= 1;
+    }
+    while (n > 0 && is_space(d[s + n - 1])) {
+        n -= 1;
+    }
+    var starts: ptr<i64> = deref c.starts;
+    var lens: ptr<i64> = deref c.lens;
+    var k: i64 = deref c.fields;
+    deref starts[k] = s;
+    deref lens[k] = n;
+    deref c.fields = k + 1;
+}
+
+fun begin_row(c: ptr<Csv>) {
+    var rf: ptr<i64> = deref c.row_first;
+    deref rf[deref c.rows] = deref c.fields;
+    deref c.rows = deref c.rows + 1;
+}
+
+// Tokenizes data[0..size) in place (doubled quotes are collapsed inside the
+// buffer, so every field ends up as a plain byte range).
+pub fun csv_parse(c: ptr<Csv>) -> bool {
+    var d: ptr<u8> = deref c.data;
+    var size: i64 = deref c.size;
+
+    // Upper bounds: one field per comma or newline, plus one.
+    var bound: i64 = 2;
+    var k: i64 = 0;
+    while (k < size) {
+        if (d[k] == 44 || d[k] == 10) {
+            bound += 1;
+        }
+        k += 1;
+    }
+    deref c.field_cap = bound;
+    deref c.starts = mem_alloc(bound * 8) as ptr<i64>;
+    deref c.lens = mem_alloc(bound * 8) as ptr<i64>;
+    deref c.row_first = mem_alloc((bound + 1) * 8) as ptr<i64>;
+    deref c.rows = 0;
+    deref c.fields = 0;
+
+    var i: i64 = 0;
+    if (size >= 3 && d[0] == 239 && d[1] == 187 && d[2] == 191) {
+        i = 3;                                       // UTF-8 BOM
+    }
+    var row_open: bool = false;
+    var pending: bool = false;                       // a comma promised another field
+
+    while (i < size) {
+        if (!row_open) {
+            begin_row(c);
+            row_open = true;
+        }
+        pending = false;
+        if (d[i] == 34) {                            // quoted field
+            var src: i64 = i + 1;
+            var dst: i64 = i + 1;
+            var closed: bool = false;
+            while (src < size) {
+                if (d[src] == 34) {
+                    if (src + 1 < size && d[src + 1] == 34) {
+                        deref d[dst] = 34;           // "" -> "
+                        dst += 1;
+                        src += 2;
+                        continue;
+                    }
+                    closed = true;
+                    break;
+                }
+                deref d[dst] = d[src];
+                dst += 1;
+                src += 1;
+            }
+            if (!closed) {
+                println("csv: unterminated quote at byte {}", i);
+                return false;
+            }
+            push_field(c, i + 1, dst - i - 1);
+            i = src + 1;
+            while (i < size && is_space(d[i])) {
+                i += 1;
+            }
+        } else {
+            var j: i64 = i;
+            while (j < size && d[j] != 44 && d[j] != 10 && d[j] != 13) {
+                j += 1;
+            }
+            push_field(c, i, j - i);
+            i = j;
+        }
+
+        if (i < size && d[i] == 44) {                // ',' -> next field
+            i += 1;
+            pending = true;
+            continue;
+        }
+        if (i < size && d[i] == 13) {
+            i += 1;
+        }
+        if (i < size && d[i] == 10) {
+            i += 1;
+        } else if (i < size) {
+            println("csv: unexpected byte {} at {}", d[i], i);
+            return false;
+        }
+        row_open = false;
+    }
+    if (pending) {
+        push_field(c, size, 0);                      // "a,b," at EOF
+    }
+    var rf: ptr<i64> = deref c.row_first;
+    deref rf[deref c.rows] = deref c.fields;         // sentinel
+    return true;
+}
+
+pub fun csv_free(c: ptr<Csv>) {
+    if (deref c.data_cap > 0) {
+        mem_free(deref c.data, deref c.data_cap);
+        deref c.data_cap = 0;
+    }
+    if (deref c.starts == null) {
+        return;
+    }
+    var cap: i64 = deref c.field_cap;
+    mem_free(deref c.starts as ptr<u8>, cap * 8);
+    mem_free(deref c.lens as ptr<u8>, cap * 8);
+    mem_free(deref c.row_first as ptr<u8>, (cap + 1) * 8);
+}
+
+pub fun row_width(c: ptr<Csv>, row: i64) -> i64 {
+    var rf: ptr<i64> = deref c.row_first;
+    return rf[row + 1] - rf[row];
+}
+
+pub fun cell_ptr(c: ptr<Csv>, row: i64, col: i64) -> ptr<u8> {
+    var rf: ptr<i64> = deref c.row_first;
+    var starts: ptr<i64> = deref c.starts;
+    var d: ptr<u8> = deref c.data;
+    return d + starts[rf[row] + col];
+}
+
+pub fun cell_len(c: ptr<Csv>, row: i64, col: i64) -> i64 {
+    var rf: ptr<i64> = deref c.row_first;
+    var lens: ptr<i64> = deref c.lens;
+    return lens[rf[row] + col];
+}
+
+pub fun bytes_eq(a: ptr<u8>, an: i64, b: ptr<u8>, bn: i64) -> bool {
+    if (an != bn) {
+        return false;
+    }
+    var i: i64 = 0;
+    while (i < an) {
+        if (a[i] != b[i]) {
+            return false;
+        }
+        i += 1;
+    }
+    return true;
+}
+
+pub fun cells_eq(c: ptr<Csv>, r1: i64, c1: i64, r2: i64, c2: i64) -> bool {
+    return bytes_eq(cell_ptr(c, r1, c1), cell_len(c, r1, c1), cell_ptr(c, r2, c2), cell_len(c, r2, c2));
+}
+
+// RFC 8259 number grammar, so numeric cells can be copied verbatim.
+pub fun is_json_number(p: ptr<u8>, n: i64) -> bool {
+    var i: i64 = 0;
+    if (i < n && p[i] == 45) {
+        i += 1;
+    }
+    if (i >= n) {
+        return false;
+    }
+    if (p[i] == 48) {
+        i += 1;
+    } else if (p[i] >= 49 && p[i] <= 57) {
+        while (i < n && p[i] >= 48 && p[i] <= 57) {
+            i += 1;
+        }
+    } else {
+        return false;
+    }
+    if (i < n && p[i] == 46) {
+        i += 1;
+        var f: i64 = i;
+        while (i < n && p[i] >= 48 && p[i] <= 57) {
+            i += 1;
+        }
+        if (i == f) {
+            return false;
+        }
+    }
+    if (i < n && (p[i] == 101 || p[i] == 69)) {
+        i += 1;
+        if (i < n && (p[i] == 43 || p[i] == 45)) {
+            i += 1;
+        }
+        var e: i64 = i;
+        while (i < n && p[i] >= 48 && p[i] <= 57) {
+            i += 1;
+        }
+        if (i == e) {
+            return false;
+        }
+    }
+    return i == n;
+}
+
+
+pub fun csv_empty() -> Csv {
+    return Csv {
+        data: null, size: 0, data_cap: 0, starts: null, lens: null, row_first: null,
+        rows: 0, fields: 0, field_cap: 0,
+    };
+}
+
+// Wraps caller-owned bytes (not freed by csv_free) and tokenizes them.
+pub fun csv_from_bytes(c: ptr<Csv>, data: ptr<u8>, size: i64) -> bool {
+    deref c = csv_empty();
+    deref c.data = data;
+    deref c.size = size;
+    return csv_parse(c);
+}
+
+// Reads and tokenizes a file; csv_free releases the buffer too.
+pub fun csv_load(path: str, c: ptr<Csv>) -> bool {
+    deref c = csv_empty();
+    var size: i64 = fs_file_size(path);
+    if (size < 0) {
+        println("csv: cannot open {}", path);
+        return false;
+    }
+    var data: ptr<u8> = mem_alloc(size + 1);
+    var n: i64 = fs_read_all(path, data, size);
+    if (n < 0) {
+        mem_free(data, size + 1);
+        println("csv: cannot read {}", path);
+        return false;
+    }
+    deref c.data = data;
+    deref c.size = n;
+    deref c.data_cap = size + 1;
+    return csv_parse(c);
+}
+
+pub fun csv_rows(c: ptr<Csv>) -> i64 {
+    return deref c.rows;
+}

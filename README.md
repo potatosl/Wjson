@@ -1,0 +1,349 @@
+# wjson — JSON for the Wave language
+
+**English** | [한국어](README.ko.md)
+
+A JSON library for [Wave](https://wave-lang.dev) in which Rust, C++ and Wave
+each do the part they are best at.
+
+| Layer | Language | Responsibility | Location |
+| --- | --- | --- | --- |
+| API | **Wave** | navigation, path queries, document editing (incl. by path), writer, serialization, deep equality, file streaming | `src/*.wave` |
+| Core | **Rust** | RFC 8259 parser, index-based DOM and edit operations, hash index for large objects, incremental (pull) parser, JSON Pointer, error positions | `core/` |
+| Native | **C++17** (freestanding) | number conversion (own implementation: correctly rounded parsing, shortest round-trip output), string escaping, UTF-8 validation; compiles without any standard-library or SDK headers | `native/` |
+| Toolchain | **Rust** | `wjlink`: the Windows link driver used instead of MSVC — generates import libraries from system DLLs, emits the startup object, archives objects, drives rust-lld | `chain/` |
+
+Every boundary between Wave and Rust/C++ is a C ABI (`extern(c)`). C and C++
+programs can use the same core through `include/wjson.h` and
+`native/include/wjson.hpp`.
+
+**Zero external dependencies.** No crates, no C++ libraries
+(`core/Cargo.lock` lists only `wjson_core`); even the reference parser used
+for differential fuzzing is written inside the tests. You only need build
+tools (wavec, cargo, a C++ compiler) — and on Windows **no MSVC or Visual
+Studio**.
+
+> Status: 0.x. Wave itself is pre-beta and the API may still change; see
+> [Known limitations](#known-limitations).
+
+## Quick start
+
+```wave
+import("wjson")::{JsonDoc, Json, json_parse, json_ok, json_root, json_path_str,
+                  json_path_i64, json_free};
+
+fun main() {
+    var doc: JsonDoc = json_parse("{\"server\": {\"host\": \"0.0.0.0\", \"ports\": [8080, 8443]}}");
+    if (!json_ok(doc)) { return; }
+    var cfg: Json = json_root(doc);
+    println("{}:{}", json_path_str(cfg, "server.host", "localhost"),
+                     json_path_i64(cfg, "server.ports[0]", 80));
+    json_free(&doc);
+}
+```
+
+Writing JSON:
+
+```wave
+var w: JsonWriter = json_writer_new(2);      // indent 2; 0 = one line
+json_begin_object(&w);
+json_field_str(&w, "name", "wave");
+json_key(&w, "tags");
+json_begin_array(&w);
+json_write_i64(&w, 1);
+json_write_f64(&w, 2.5);
+json_end_array(&w);
+json_end_object(&w);
+println("{}", json_writer_finish(&w));       // null string if the structure is wrong
+json_writer_free(&w);
+```
+
+Editing a document:
+
+```wave
+var doc: JsonDoc = json_parse("{\"name\": \"wave\", \"tags\": []}");
+var root: Json = json_root(doc);
+json_set_str(root, "name", "wjson");               // replace a value
+json_set_path_i64(root, "limits.depth", 512);      // intermediate objects are created
+json_push_str(json_get(root, "tags"), "json");     // append to an array
+json_remove(root, "obsolete");                     // delete a key
+```
+
+Streaming a large file (constant memory regardless of file size):
+
+```wave
+var s: JsonStream = json_stream_open("big.jsonl", JSON_STREAM_MULTI);
+var ev: i32 = json_stream_next(&s);
+while (ev != JSON_EV_END && ev != JSON_EV_ERROR) {
+    if (ev == JSON_EV_KEY && json_stream_text_eq(&s, "id")) { ... }
+    ev = json_stream_next(&s);
+}
+json_stream_close(&s);
+```
+
+Longer examples in `examples/`:
+
+| Example | Shows |
+| --- | --- |
+| `config.wave` | reading a config file with comments and trailing commas, typed path queries |
+| `transform.wave` | filtering and producing new JSON |
+| `edit_config.wave` | editing a config document |
+| `stream_rows.wave` | streaming search in 4 KB chunks |
+| `csv2json.wave` | statistics-style CSV (3 header rows, quoted fields) to nested JSON, then 1,449 cells checked back against the CSV |
+| `survey_report.wave` | the same CSV built into a document with the edit API only, then copy, sort, rank, rename, summarize and save |
+| `show_data.wave` | printing the converted data as a table |
+
+The example data is **synthetic** — generated for this repository
+(see `examples/data/README.md`).
+
+## Building and testing
+
+The build driver is itself written in Wave (`build.wave`). Requirements:
+[wavec](https://wave-lang.dev/docs/getting-started/install) 0.2.1-pre-beta
+(LLVM 21), Rust (cargo), and a C++17 compiler (clang on Windows).
+
+```sh
+wavec run build.wave                                   # Rust + C++ + Wave tests, all examples
+WJSON_RUN=examples/show_data.wave wavec run build.wave # build and run one program
+WJSON_TASK=libs wavec run build.wave                   # only the static libraries (+ link flags)
+WJSON_TASK=bench wavec run build.wave                  # benchmarks (Rust core + C++ layer)
+WJSON_DRY_RUN=1 wavec run build.wave                   # print the commands only
+```
+
+Wave's `main` takes no arguments, so tasks are chosen with environment
+variables. Other knobs: `WAVEC`, `WAVE_STD` (explicit std root), `CARGO`,
+`RUSTC`, `CXX`. Because `std::process` cannot spawn processes on Windows yet,
+the driver runs commands through the C library's `system()`.
+
+Tests:
+
+| Test | Covers |
+| --- | --- |
+| `core/src` unit tests | parser, editing, key index, streaming (down to 1-byte chunks) |
+| `core/tests/fuzz.rs` | differential against an in-house reference parser, streaming vs DOM (same error code and offset), random edits vs a model, large-object index |
+| `native/tests/native_test.cpp` | C++ conversions against an exact in-house oracle (decimal expansions): parse rounding, halfway cases, shortest output, fixed notation, escape → parse round trip |
+| `chain/src/tests.rs` | wjlink: import library and archive layout, runtime object, command-line quoting |
+| `tests/*.wave` | Wave API end to end: basics, editing, streaming (incl. 100k-line JSON Lines) |
+
+Increase the randomized iterations with `WJSON_FUZZ_ITERS` (defaults: 5,000
+Rust / 50,000 C++). During development every randomized test was run for
+1,000,000 iterations.
+
+Performance (Linux, Xeon 2.8 GHz, one core, `WJSON_TASK=bench`):
+
+| Operation | Result |
+| --- | --- |
+| DOM parsing | records 150–176 MB/s, number-heavy 145–197 MB/s, string-heavy 300–350 MB/s |
+| Streaming parsing | 180–310 MB/s; memory fixed at chunk + one token |
+| Key lookup (100k-key object) | hash index ~330 ns, linear scan ~150 µs |
+| Array append (two arrays, 1M interleaved) | ~42 ns |
+| f64 → text | ~175 ns (snprintf `%.17g` ~340 ns) |
+| text → f64 | ~48 ns (strtod ~88 ns) |
+
+### Windows (no MSVC)
+
+The Windows build uses no MSVC, Visual Studio or Windows SDK:
+
+- **Linking** is done by `wjlink` (`chain/`, Rust). `build.wave` first builds
+  wjlink with rust-lld — wjlink itself is `no_std` and uses raw-dylib, so it
+  links with no libraries at all — then `wjlink init` generates import
+  libraries (kernel32.lib, msvcrt.lib, …) from the DLLs in
+  `C:\Windows\System32` and writes the startup object `wjrt.obj`. cargo,
+  wavec and the C++ test all use wjlink as their linker. The C runtime is the
+  `msvcrt.dll` that ships with Windows.
+- **C++** is compiled by clang in freestanding mode
+  (`-ffreestanding -nostdlibinc`), without any standard-library or SDK headers.
+- **Static libraries** are archived by `wjlink lib` instead of lib.exe.
+
+Easiest: **double-click `setup-windows.cmd`**. It installs whatever is
+missing (Rust, LLVM/clang, Wave) and runs `wavec run build.wave`; output goes
+to `setup-log.txt` and `run-log.txt`. Accept the UAC prompt when LLVM installs.
+
+Manual setup (once):
+
+```powershell
+# 1) Wave compiler (official installer) — open a new terminal afterwards
+irm https://wave-lang.dev/install.ps1 -OutFile install.ps1; powershell -ExecutionPolicy Bypass -File .\install.ps1
+# 2) Rust (includes rust-lld)
+winget install Rustlang.Rustup
+# 3) clang
+winget install LLVM.LLVM
+```
+
+A normal PowerShell is enough (no Developer PowerShell). `build.wave` is
+itself a Wave program, so wjlink has to exist before wavec can link it —
+build it once, then pass it to wavec. Also pass the std location: the
+Windows installer puts std next to `wavec.exe`, where wavec does not look on
+its own. (`setup-windows.cmd` does all of this.)
+
+```powershell
+# once: build wjlink with rust-lld and generate the import libraries
+cargo build --release --manifest-path chain/Cargo.toml --target-dir build/chain `
+  --config "target.x86_64-pc-windows-msvc.linker='rust-lld'" `
+  --config "target.x86_64-pc-windows-msvc.rustflags=['-Clink-arg=/NODEFAULTLIB']"
+build\chain\release\wjlink.exe init --lld "$(rustc --print sysroot)\lib\rustlib\x86_64-pc-windows-msvc\bin\rust-lld.exe"
+
+# then
+$wj = "-Clinker=build\chain\release\wjlink.exe", "-L", "build\chain\release\lib"
+wavec --std-root="$env:LOCALAPPDATA\Wave\bin\std" @wj run build.wave
+$env:WJSON_RUN="examples/show_data.wave"; wavec --std-root="$env:LOCALAPPDATA\Wave\bin\std" @wj run build.wave
+```
+
+Verified on Windows 11 with wavec 0.2.1-pre-beta, Rust 1.99.1 and clang
+23.1.3, with all MSVC paths removed from the environment.
+
+### Using the libraries directly
+
+Once built, programs can be compiled with wavec alone; `WJSON_TASK=libs`
+prints the right link flags for the machine. The examples read their data
+relative to `examples/`, so run them from there:
+
+```sh
+cd examples
+wavec build show_data.wave ../build/native/libwjson_native.a ../build/cargo/release/libwjson_core.a \
+      --dep=wjson=.. --link=gcc_s --link=pthread --link=m --link=dl --link=c \
+      -L /usr/lib/gcc/x86_64-linux-gnu/13 --run
+```
+
+### Vex
+
+`vex.ws` follows the Vex manifest format (format 2, `lib = true`). Vex
+(as of 2026-10) has no manifest field for linking native libraries and
+rejects unknown fields, so wjson — which links Rust and C++ libraries —
+cannot be built with `vex build` yet. Use `build.wave`.
+
+## API overview (Wave)
+
+Everything is imported with `import("wjson")::{...}`.
+
+**Parsing** — `json_parse(text)`, `json_parse_with(text, max_depth, flags)`,
+`json_parse_bytes(ptr, len, max_depth, flags)`, `json_ok(doc)`,
+`json_error(doc) -> JsonError{code, message, offset, line, column}`,
+`json_root(doc)`, `json_free(&doc)`
+
+- flags: `JSON_STRICT` (default), `JSON_ALLOW_TRAILING_COMMAS`,
+  `JSON_ALLOW_COMMENTS`, `JSON_RELAXED` (both)
+- default maximum nesting depth 512; a UTF-8 BOM is accepted; invalid UTF-8
+  and lone surrogates are rejected
+
+**Navigation** — `json_get(v, key)`, `json_at(v, i)`, `json_key_at(v, i)`,
+`json_len(v)`, `json_has(v, key)`, `json_pointer(v, "/a/0/b")`,
+`json_path(v, "a.b[0][\"x.y\"]")`
+
+- missing keys, out-of-range indices and type mismatches return an "invalid"
+  value instead of failing, so chains are always safe; check with
+  `json_is_valid()` at the end
+- with duplicate keys the last one wins (like JavaScript's `JSON.parse`)
+
+**Reading values** — `json_type`, `json_is_*`, `json_as_bool`, `json_as_str`,
+`json_as_bytes`, `json_as_i64`, `json_as_f64` (+ `_checked` variants),
+`json_number_text` (the source lexeme), with defaults `json_i64_or` /
+`json_f64_or` / `json_bool_or` / `json_str_or`, path + default
+`json_path_i64` etc., `json_str_eq`
+
+**Writing** — `json_writer_new(indent)`, `json_begin_object/array`,
+`json_end_object/array`, `json_key`,
+`json_write_null/bool/i64/f64/f64_fixed/str/raw`, `json_field_*`,
+`json_writer_finish`, `json_writer_status`, `json_writer_reset`,
+`json_writer_free`, `json_writer_set_escape(JSON_ESCAPE_ASCII | JSON_ESCAPE_HTML)`
+
+- the writer manages commas, colons and nesting; out-of-order calls (a value
+  without a key, mismatched closers, two top-level values, …) put it in an
+  error state
+- NaN and infinity have no JSON spelling: `JSON_WRITER_ERR_NUMBER`
+
+**Trees** — `json_write_value(&w, v)`, `json_to_string(v, indent)`,
+`json_to_string_with(v, indent, escape_flags)`, `json_string_free(s)`,
+`json_equal(a, b)` (ignores member order and number spelling), `json_depth(v)`
+
+**Editing** — new values: `json_new_document()`,
+`json_new_null/bool/i64/f64/str/array/object(doc, …)`,
+`json_new_number_text(doc, "12.50")`, `json_new_number_bytes(doc, p, n)`,
+`json_new_f64_fixed(doc, 82.349, 1)` (→ `82.3`), `json_copy(doc, v)` (also
+across documents), `json_set_root(doc, v)`.
+Objects: `json_set(obj, key, v)`, `json_set_i64/f64/str/bool/null`,
+`json_set_object/array` (insert a new container and return it),
+`json_remove(obj, key)`.
+Arrays: `json_push`, `json_push_i64/…/object/array`, `json_insert(arr, i, v)`,
+`json_replace(arr, i, v)`, `json_remove_at(arr, i)`, `json_clear(v)`.
+Paths: `json_set_path(root, "a.b[0].c", v)` (creates intermediate objects),
+`json_set_path_i64/f64/str/bool`, `json_remove_path`.
+Structure: `json_parent(v)`, `json_is_attached(v)`, `json_edit_error(v)`.
+
+- results are `JSON_EDIT_*` codes. A value can be attached in one place only
+  (`JSON_EDIT_ATTACHED` → use `json_copy`); inserting a value into itself is
+  `JSON_EDIT_CYCLE`; NaN, infinity or a malformed number text is
+  `JSON_EDIT_BAD_VALUE`
+- replaced or removed values become detached and can be attached again; a
+  document that failed to parse cannot be edited
+- objects with 16 or more keys build a hash index on the first lookup and
+  keep it up to date on insert and remove
+
+**Streaming** — low level: `json_reader_new(flags)`,
+`json_reader_feed/feed_str/finish/next`, `json_reader_text/text_eq/i64/f64`,
+`json_reader_depth/documents/buffered/error`, `json_reader_free`.
+Files: `json_stream_open(path, flags)`, `json_stream_open_with(path, flags, chunk)`,
+`json_stream_next(&s)`, `json_stream_skip(&s)` (skip the current container),
+`json_stream_text/text_eq/i64/f64`,
+`json_stream_depth/documents/bytes_read/buffered/error/io_error`,
+`json_stream_close(&s)`.
+
+- events: `JSON_EV_OBJECT_START/END`, `ARRAY_START/END`, `KEY`, `STRING`,
+  `NUMBER`, `TRUE`, `FALSE`, `NULL`, `END`, `ERROR` (and `NEED_MORE` for the
+  reader)
+- flags: `JSON_ALLOW_TRAILING_COMMAS`, `JSON_ALLOW_COMMENTS`,
+  `JSON_STREAM_MULTI` (several top-level values, JSON Lines)
+- same grammar, error codes and error positions as the DOM parser (checked by
+  fuzzing)
+
+**Null strings** — Wave's `str` cannot be null, so "no string" is returned as
+a `str` whose pointer is null. Test it with `json_str_is_null(s)`.
+
+## Memory rules
+
+- `Json` values and strings returned by `json_as_str`, `json_key_at` and
+  `json_number_text` live inside the document: do not use them after
+  `json_free`. Until then they **stay valid even while the document is
+  edited** — parsed text is never rewritten, and text created by edits is
+  allocated separately and never moves. Passing a string from the same
+  document (`json_set_str(v, "new", json_as_str(json_get(v, "old")))`) is safe.
+- `json_writer_finish` returns writer-owned text (valid until the next write,
+  reset or free).
+- `json_to_string*` results belong to the caller → `json_string_free`.
+- old child-list slots left behind by edits are released with the document.
+- streaming `*_text` results are valid until the next `next` call.
+
+## Layout
+
+```
+core/          Rust core: parser/dom/edit/stream (staticlib + unit tests, tests/fuzz.rs, examples/bench.rs)
+native/        C++ conversion layer, wjson.hpp (C++ wrapper), C++ tests and benchmark
+chain/         wjlink: MSVC-free Windows link driver (Rust)
+include/       C header for the Rust core
+src/           Wave API (lib.wave is the entry point)
+tests/         Wave end-to-end tests
+examples/      Wave examples and sample data
+build.wave     build driver (Wave)
+```
+
+## Known limitations
+
+- Wave is pre-beta; `src/` may need updates when the language changes.
+- Declaring `extern(c) fun name(...)` without an explicit symbol in another
+  module currently gets the name mangled by wavec and breaks linking, so
+  `src/ffi.wave` always uses the `extern(c, "symbol")` form.
+- Verified on Linux x86-64 and Windows 11 x64 (without MSVC). macOS and ARM
+  have not been tested.
+- Before 1.0 the API may change; changes are listed in `CHANGELOG.md`.
+- The Windows build uses the system `msvcrt.dll` as its C runtime (as MinGW
+  does), which Microsoft does not recommend for applications. Only a few C99
+  math functions (`fma`) come from `ucrtbase.dll`.
+- `wjlink` is verified for what wjson needs (x86-64 console programs); it is
+  not yet a general-purpose linker.
+
+## Contributing and security
+
+See `CONTRIBUTING.md`; report vulnerabilities as described in `SECURITY.md`.
+
+## License
+
+MIT License — see `LICENSE`.

@@ -1,0 +1,251 @@
+// SPDX-License-Identifier: MIT
+//
+// Tests for document editing (src/edit.wave over the Rust core).
+// Run with:  wavec run build.wave
+
+import("wjson")::{
+    wjson_console_utf8,
+    JsonDoc, Json,
+    JSON_EDIT_OK, JSON_EDIT_INVALID, JSON_EDIT_ATTACHED, JSON_EDIT_CYCLE,
+    JSON_EDIT_NOT_FOUND, JSON_EDIT_WRONG_TYPE, JSON_EDIT_BAD_VALUE, JSON_OBJECT,
+    json_parse, json_ok, json_root, json_free, json_len, json_get, json_at, json_type,
+    json_is_valid, json_is_null, json_str_eq, json_i64_or, json_f64_or, json_bool_or,
+    json_number_text, json_path, json_path_i64, json_path_str, json_has,
+    json_to_string, json_string_free, json_equal, json_str_is_null,
+    json_new_document, json_set_root, json_edit_error, json_new_null, json_new_bool,
+    json_new_i64, json_new_f64, json_new_number_text, json_new_str, json_new_array,
+    json_new_object, json_copy, json_parent, json_is_attached,
+    json_set, json_set_null, json_set_bool, json_set_i64, json_set_f64, json_set_str,
+    json_set_object, json_set_array, json_remove,
+    json_push, json_push_i64, json_push_str, json_push_object, json_push_array,
+    json_insert, json_replace, json_remove_at, json_clear,
+    json_set_path, json_set_path_i64, json_set_path_str, json_set_path_bool, json_remove_path,
+};
+
+static CHECKS: i32 = 0;
+static FAILURES: i32 = 0;
+
+fun check(cond: bool, label: str) {
+    CHECKS += 1;
+    if (!cond) {
+        FAILURES += 1;
+        println("FAIL: {}", label);
+    }
+}
+
+fun streq(a: str, b: str) -> bool {
+    var pa: ptr<u8> = a as ptr<u8>;
+    var pb: ptr<u8> = b as ptr<u8>;
+    if (pa == null || pb == null) {
+        return pa == pb;
+    }
+    var i: i64 = 0;
+    while (pa[i] != 0 && pa[i] == pb[i]) {
+        i += 1;
+    }
+    return pa[i] == pb[i];
+}
+
+// Serializes compactly and compares with the expected text.
+fun renders(v: Json, expected: str) -> bool {
+    var text: str = json_to_string(v, 0);
+    var ok: bool = streq(text, expected);
+    if (!ok) {
+        println("  got: {}", text);
+    }
+    json_string_free(text);
+    return ok;
+}
+
+fun test_build_from_scratch() {
+    var doc: JsonDoc = json_new_document();
+    check(json_ok(doc), "new document is ok");
+    check(!json_is_valid(json_root(doc)), "new document has no root");
+
+    var root: Json = json_new_object(doc);
+    check(json_set_root(doc, root) == JSON_EDIT_OK, "set root");
+    check(json_set_str(root, "name", "wjson") == JSON_EDIT_OK, "set str");
+    check(json_set_i64(root, "version", 2) == JSON_EDIT_OK, "set i64");
+    check(json_set_f64(root, "ratio", 0.25) == JSON_EDIT_OK, "set f64");
+    check(json_set_bool(root, "stable", false) == JSON_EDIT_OK, "set bool");
+    check(json_set_null(root, "owner") == JSON_EDIT_OK, "set null");
+
+    var langs: Json = json_set_array(root, "langs");
+    json_push_str(langs, "wave");
+    json_push_str(langs, "rust");
+    json_push_str(langs, "c++");
+    var limits: Json = json_set_object(root, "limits");
+    json_set_i64(limits, "depth", 512);
+
+    check(renders(root, "{\"name\":\"wjson\",\"version\":2,\"ratio\":0.25,\"stable\":false,\"owner\":null,\"langs\":[\"wave\",\"rust\",\"c++\"],\"limits\":{\"depth\":512}}"), "built document renders");
+
+    // The serialized text parses back to an equal tree.
+    var text: str = json_to_string(root, 2);
+    var again: JsonDoc = json_parse(text);
+    check(json_ok(again) && json_equal(root, json_root(again)), "round trip equal");
+    json_string_free(text);
+    json_free(&again);
+    json_free(&doc);
+}
+
+fun test_edit_parsed() {
+    var doc: JsonDoc = json_parse("{\"a\":1,\"list\":[10,20,30],\"obj\":{\"x\":true},\"gone\":0}");
+    var root: Json = json_root(doc);
+
+    // replace and add
+    check(json_set_str(root, "a", "one") == JSON_EDIT_OK, "replace a");
+    check(json_str_eq(json_get(root, "a"), "one"), "a replaced");
+    check(json_set_i64(root, "new", -7) == JSON_EDIT_OK, "add key");
+    check(json_i64_or(json_get(root, "new"), 0) == -7, "new key readable");
+
+    // remove
+    check(json_remove(root, "gone") == 1, "remove existing key");
+    check(json_remove(root, "gone") == 0, "remove absent key");
+    check(!json_has(root, "gone"), "key gone");
+
+    // arrays
+    var list: Json = json_get(root, "list");
+    check(json_insert(list, 0, json_new_i64(doc, 5)) == JSON_EDIT_OK, "insert front");
+    check(json_push_i64(list, 40) == JSON_EDIT_OK, "push back");
+    check(json_replace(list, 2, json_new_str(doc, "twenty")) == JSON_EDIT_OK, "replace element");
+    var removed: Json = json_remove_at(list, 1);
+    check(json_i64_or(removed, 0) == 10, "removed element returned");
+    check(!json_is_attached(removed), "removed element is detached");
+    check(renders(list, "[5,\"twenty\",30,40]"), "array after edits");
+    check(json_insert(list, 99, json_new_null(doc)) == JSON_EDIT_NOT_FOUND, "insert out of range");
+    check(json_push(list, removed) == JSON_EDIT_OK, "re-attach removed element");
+    check(json_i64_or(json_at(list, 4), 0) == 10, "re-attached at end");
+
+    // nested containers
+    var item: Json = json_push_object(list);
+    json_set_str(item, "k", "v");
+    check(streq(json_path_str(root, "list[5].k", ""), "v"), "pushed object filled");
+
+    // clear
+    check(json_clear(json_get(root, "obj")) == JSON_EDIT_OK, "clear object");
+    check(json_len(json_get(root, "obj")) == 0, "object empty");
+    json_free(&doc);
+}
+
+fun test_rules() {
+    var doc: JsonDoc = json_parse("{\"a\":[1],\"b\":{}}");
+    var root: Json = json_root(doc);
+    var a: Json = json_get(root, "a");
+    var b: Json = json_get(root, "b");
+
+    check(json_set(b, "k", a) == JSON_EDIT_ATTACHED, "attached value refused");
+    check(json_push(a, root) == JSON_EDIT_ATTACHED, "root cannot be nested");
+    var outer: Json = json_new_array(doc);
+    var inner: Json = json_new_array(doc);
+    check(json_push(outer, inner) == JSON_EDIT_OK, "detached nesting");
+    check(json_push(inner, outer) == JSON_EDIT_CYCLE, "cycle refused");
+    check(json_set(a, "k", json_new_null(doc)) == JSON_EDIT_WRONG_TYPE, "object op on array");
+    check(json_push(b, json_new_null(doc)) == JSON_EDIT_WRONG_TYPE, "array op on object");
+
+    // bad values
+    var nan: f64 = 0.0 / 0.0;
+    var bad: Json = json_new_f64(doc, nan);
+    check(!json_is_valid(bad) && json_edit_error(bad) == JSON_EDIT_BAD_VALUE, "NaN refused");
+    check(json_set(b, "n", bad) == JSON_EDIT_BAD_VALUE, "creation error propagates");
+    check(json_edit_error(json_new_number_text(doc, "01")) == JSON_EDIT_BAD_VALUE, "bad number text");
+    check(streq(json_number_text(json_new_number_text(doc, "12.50")), "12.50"), "number text kept verbatim");
+
+    // copy instead of sharing, across documents too
+    var other: JsonDoc = json_parse("{\"deep\":{\"x\":[1,2,{\"y\":null}]}}");
+    var copied: Json = json_copy(doc, json_get(json_root(other), "deep"));
+    json_free(&other);                       // the copy does not depend on it
+    check(json_set(b, "deep", copied) == JSON_EDIT_OK, "copied value attaches");
+    check(renders(b, "{\"deep\":{\"x\":[1,2,{\"y\":null}]}}"), "copy is complete");
+    check(json_set(b, "a2", json_copy(doc, a)) == JSON_EDIT_OK, "same-document copy");
+    check(json_type(json_parent(json_get(b, "a2"))) == JSON_OBJECT, "parent of attached value");
+    check(!json_is_valid(json_parent(root)), "root has no parent");
+
+    // failed documents cannot be edited
+    var broken: JsonDoc = json_parse("[1,");
+    check(json_edit_error(json_new_null(broken)) == JSON_EDIT_INVALID, "failed document read-only");
+    json_free(&broken);
+    json_free(&doc);
+}
+
+fun test_paths() {
+    var doc: JsonDoc = json_parse("{\"server\":{\"ports\":[80,443]}}");
+    var root: Json = json_root(doc);
+    check(json_set_path_i64(root, "server.tls.port", 8443) == JSON_EDIT_OK, "creates intermediate objects");
+    check(json_path_i64(root, "server.tls.port", 0) == 8443, "deep value set");
+    check(json_set_path_str(root, "server.ports[1]", "https") == JSON_EDIT_OK, "replace by index");
+    check(json_set_path_bool(root, "[\"a.b\"].on", true) == JSON_EDIT_OK, "quoted key segment");
+    check(json_bool_or(json_path(root, "[\"a.b\"].on"), false), "quoted key readable");
+    check(json_set_path_i64(root, "server.ports[5].x", 1) == JSON_EDIT_NOT_FOUND, "arrays are not grown");
+    check(json_set_path_i64(root, "server..x", 1) == JSON_EDIT_INVALID, "malformed path");
+    check(json_remove_path(root, "server.tls.port") == 1, "remove by path");
+    check(json_remove_path(root, "server.ports[0]") == 1, "remove element by path");
+    check(json_remove_path(root, "nope.deeper") == 0, "remove missing path");
+    check(renders(root, "{\"server\":{\"ports\":[\"https\"],\"tls\":{}},\"a.b\":{\"on\":true}}"), "paths result");
+    json_free(&doc);
+}
+
+fun test_bulk() {
+    // Many appends to two interleaved arrays exercise list relocation.
+    var doc: JsonDoc = json_new_document();
+    var root: Json = json_new_object(doc);
+    json_set_root(doc, root);
+    var evens: Json = json_set_array(root, "evens");
+    var odds: Json = json_set_array(root, "odds");
+    var i: i64 = 0;
+    while (i < 2000) {
+        json_push_i64(evens, i * 2);
+        json_push_i64(odds, i * 2 + 1);
+        i += 1;
+    }
+    check(json_len(evens) == 2000 && json_len(odds) == 2000, "bulk lengths");
+    check(json_i64_or(json_at(evens, 1999), 0) == 3998, "bulk last even");
+    check(json_i64_or(json_at(odds, 1234), 0) == 2469, "bulk middle odd");
+
+    // A big object: lookups go through the hash index.
+    var big: Json = json_set_object(root, "big");
+    var k: i64 = 0;
+    var key: array<u8, 16>;
+    while (k < 1000) {
+        key[0] = 107;                                   // 'k'
+        var n: i64 = k;
+        var digits: array<u8, 8>;
+        var d: i64 = 0;
+        while (true) {
+            digits[d] = (48 + n % 10) as u8;
+            d += 1;
+            n = n / 10;
+            if (n == 0) {
+                break;
+            }
+        }
+        var j: i64 = 0;
+        while (j < d) {
+            key[1 + j] = digits[d - 1 - j];
+            j += 1;
+        }
+        key[1 + d] = 0;
+        json_set_i64(big, &key[0] as str, k);
+        k += 1;
+    }
+    check(json_len(big) == 1000, "big object size");
+    check(json_i64_or(json_get(big, "k777"), -1) == 777, "indexed lookup");
+    check(json_set_i64(big, "k777", -777) == JSON_EDIT_OK, "replace in big object");
+    check(json_i64_or(json_get(big, "k777"), 0) == -777, "replaced via index");
+    check(json_remove(big, "k500") == 1, "remove in big object");
+    check(!json_has(big, "k500") && json_has(big, "k501"), "index updated after remove");
+    json_free(&doc);
+}
+
+fun main() -> i32 {
+    wjson_console_utf8();
+    test_build_from_scratch();
+    test_edit_parsed();
+    test_rules();
+    test_paths();
+    test_bulk();
+    println("edit_test: {}/{} checks passed", CHECKS - FAILURES, CHECKS);
+    if (FAILURES != 0) {
+        return 1;
+    }
+    return 0;
+}

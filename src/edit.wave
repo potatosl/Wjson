@@ -1,0 +1,514 @@
+// SPDX-License-Identifier: MIT
+//
+// Editing documents: create values, change objects and arrays, copy between
+// documents, and build a document from scratch.
+//
+//   var doc: JsonDoc = json_parse("{\"name\": \"wave\", \"tags\": []}");
+//   var root: Json = json_root(doc);
+//   json_set_str(root, "name", "wjson");          // replace
+//   json_set_i64(root, "stars", 42);              // add
+//   json_push_str(json_get(root, "tags"), "json");
+//   json_remove(root, "obsolete");
+//   println("{}", json_to_string(root, 2));        // (free with json_string_free)
+//
+// Rules (enforced by the Rust core, reported as JSON_EDIT_* codes):
+//   * json_new_* creates a *detached* value; json_set / json_push / ...
+//     attach it. A value can have only one parent: attaching an attached
+//     value gives JSON_EDIT_ATTACHED — use json_copy to duplicate it.
+//   * A container cannot be put inside itself (JSON_EDIT_CYCLE).
+//   * Replaced or removed values become detached and can be attached again.
+//   * A document whose parse failed cannot be edited (JSON_EDIT_INVALID).
+
+import("./ffi")::{
+    ffi_new_doc, ffi_new_null, ffi_new_bool, ffi_new_number, ffi_new_string,
+    ffi_new_array, ffi_new_object, ffi_set_root, ffi_parent, ffi_arr_push,
+    ffi_arr_insert, ffi_arr_set, ffi_arr_remove, ffi_obj_set, ffi_obj_remove,
+    ffi_copy, ffi_format_i64, ffi_format_f64, ffi_format_f64_fixed, ffi_type, ffi_len, ffi_key,
+};
+import("./consts")::{
+    JSON_EDIT_OK, JSON_EDIT_INVALID, JSON_EDIT_NOT_FOUND, JSON_EDIT_WRONG_TYPE,
+    JSON_EDIT_BAD_VALUE, JSON_ARRAY, JSON_OBJECT,
+};
+import("./value")::{JsonDoc, Json, json_get_bytes, json_at, json_is_valid, json_type};
+
+fun _len(p: ptr<u8>) -> i64 {
+    if (p == null) {
+        return 0;
+    }
+    var n: i64 = 0;
+    while (p[n] != 0) {
+        n += 1;
+    }
+    return n;
+}
+
+fun _doc_of(v: Json) -> JsonDoc {
+    return JsonDoc { handle: v.doc };
+}
+
+// A node id from the core: >= 0 is a value, < 0 is an edit error code. The
+// invalid Json keeps the code in `node` so json_edit_error can report it.
+fun _wrap(doc: ptr<u8>, id: i32) -> Json {
+    return Json { doc: doc, node: id };
+}
+
+// ---- documents --------------------------------------------------------------
+
+// An empty document to build from scratch; give it a root with json_set_root.
+pub fun json_new_document() -> JsonDoc {
+    return JsonDoc { handle: ffi_new_doc() };
+}
+
+// Makes a detached value the root (the previous root becomes detached).
+pub fun json_set_root(doc: JsonDoc, v: Json) -> i32 {
+    if (v.doc != doc.handle) {
+        return JSON_EDIT_INVALID;
+    }
+    return ffi_set_root(doc.handle, v.node);
+}
+
+// For a value that failed to be created (invalid Json), the JSON_EDIT_* code
+// explaining why; JSON_EDIT_OK for a valid value.
+pub fun json_edit_error(v: Json) -> i32 {
+    if (v.node >= 0) {
+        return JSON_EDIT_OK;
+    }
+    return v.node;
+}
+
+// ---- creating detached values ----------------------------------------------------
+
+pub fun json_new_null(doc: JsonDoc) -> Json {
+    return _wrap(doc.handle, ffi_new_null(doc.handle));
+}
+
+pub fun json_new_bool(doc: JsonDoc, value: bool) -> Json {
+    var flag: i32 = 0;
+    if (value) {
+        flag = 1;
+    }
+    return _wrap(doc.handle, ffi_new_bool(doc.handle, flag));
+}
+
+pub fun json_new_i64(doc: JsonDoc, value: i64) -> Json {
+    var buf: array<u8, 32>;
+    var n: i64 = ffi_format_i64(value, &buf[0], 32);
+    return _wrap(doc.handle, ffi_new_number(doc.handle, &buf[0], n));
+}
+
+// NaN and infinity have no JSON form: the result is invalid with
+// JSON_EDIT_BAD_VALUE.
+pub fun json_new_f64(doc: JsonDoc, value: f64) -> Json {
+    var buf: array<u8, 64>;
+    var n: i64 = ffi_format_f64(value, &buf[0], 64);
+    if (n < 0) {
+        return _wrap(doc.handle, JSON_EDIT_BAD_VALUE);
+    }
+    return _wrap(doc.handle, ffi_new_number(doc.handle, &buf[0], n));
+}
+
+// A number rounded to `precision` (0..17) fraction digits, stored as written
+// ("82.35"): handy for reports and prices.
+pub fun json_new_f64_fixed(doc: JsonDoc, value: f64, precision: i32) -> Json {
+    var buf: array<u8, 400>;
+    var n: i64 = ffi_format_f64_fixed(value, precision, &buf[0], 400);
+    if (n < 0) {
+        return _wrap(doc.handle, JSON_EDIT_BAD_VALUE);
+    }
+    return _wrap(doc.handle, ffi_new_number(doc.handle, &buf[0], n));
+}
+
+// A number given exactly as text ("12.50", "1e-9"), kept verbatim. Useful for
+// values that must not be rounded through f64.
+pub fun json_new_number_text(doc: JsonDoc, lexeme: str) -> Json {
+    var p: ptr<u8> = lexeme as ptr<u8>;
+    return _wrap(doc.handle, ffi_new_number(doc.handle, p, _len(p)));
+}
+
+// Same, from a byte range (e.g. a CSV cell that is not NUL-terminated).
+pub fun json_new_number_bytes(doc: JsonDoc, lexeme: ptr<u8>, n: i64) -> Json {
+    return _wrap(doc.handle, ffi_new_number(doc.handle, lexeme, n));
+}
+
+pub fun json_new_str(doc: JsonDoc, text: str) -> Json {
+    var p: ptr<u8> = text as ptr<u8>;
+    return _wrap(doc.handle, ffi_new_string(doc.handle, p, _len(p)));
+}
+
+pub fun json_new_str_bytes(doc: JsonDoc, text: ptr<u8>, n: i64) -> Json {
+    return _wrap(doc.handle, ffi_new_string(doc.handle, text, n));
+}
+
+pub fun json_new_array(doc: JsonDoc) -> Json {
+    return _wrap(doc.handle, ffi_new_array(doc.handle));
+}
+
+pub fun json_new_object(doc: JsonDoc) -> Json {
+    return _wrap(doc.handle, ffi_new_object(doc.handle));
+}
+
+// Deep copy of `v` (from any document, including `doc` itself) as a new
+// detached value of `doc`.
+pub fun json_copy(doc: JsonDoc, v: Json) -> Json {
+    return _wrap(doc.handle, ffi_copy(doc.handle, v.doc, v.node));
+}
+
+// ---- structure queries --------------------------------------------------------------
+
+// Parent container of `v`; invalid for the root and for detached values.
+pub fun json_parent(v: Json) -> Json {
+    var p: i32 = ffi_parent(v.doc, v.node);
+    if (p < 0) {
+        return _wrap(v.doc, JSON_EDIT_NOT_FOUND);
+    }
+    return _wrap(v.doc, p);
+}
+
+// True when `v` sits inside the document tree (it is the root or has a parent).
+pub fun json_is_attached(v: Json) -> bool {
+    var p: i32 = ffi_parent(v.doc, v.node);
+    return p >= 0 || p == -2;
+}
+
+// ---- objects --------------------------------------------------------------------------
+
+// Sets `key` to `value` (replacing the existing value, or adding the key).
+pub fun json_set(obj: Json, key: str, value: Json) -> i32 {
+    var k: ptr<u8> = key as ptr<u8>;
+    return json_set_bytes(obj, k, _len(k), value);
+}
+
+pub fun json_set_bytes(obj: Json, key: ptr<u8>, key_len: i64, value: Json) -> i32 {
+    if (value.node < 0) {
+        return value.node;                       // propagate a creation error
+    }
+    if (value.doc != obj.doc) {
+        return JSON_EDIT_INVALID;                // json_copy it into this document
+    }
+    return ffi_obj_set(obj.doc, obj.node, key, key_len, value.node);
+}
+
+pub fun json_set_null(obj: Json, key: str) -> i32 {
+    return json_set(obj, key, json_new_null(_doc_of(obj)));
+}
+
+pub fun json_set_bool(obj: Json, key: str, value: bool) -> i32 {
+    return json_set(obj, key, json_new_bool(_doc_of(obj), value));
+}
+
+pub fun json_set_i64(obj: Json, key: str, value: i64) -> i32 {
+    return json_set(obj, key, json_new_i64(_doc_of(obj), value));
+}
+
+pub fun json_set_f64(obj: Json, key: str, value: f64) -> i32 {
+    return json_set(obj, key, json_new_f64(_doc_of(obj), value));
+}
+
+pub fun json_set_str(obj: Json, key: str, value: str) -> i32 {
+    return json_set(obj, key, json_new_str(_doc_of(obj), value));
+}
+
+// Adds (or replaces) `key` with a new empty object / array and returns it,
+// ready to be filled: json_set_i64(json_set_object(root, "limits"), "max", 5).
+pub fun json_set_object(obj: Json, key: str) -> Json {
+    var child: Json = json_new_object(_doc_of(obj));
+    var rc: i32 = json_set(obj, key, child);
+    if (rc != JSON_EDIT_OK) {
+        return _wrap(obj.doc, rc);
+    }
+    return child;
+}
+
+pub fun json_set_array(obj: Json, key: str) -> Json {
+    var child: Json = json_new_array(_doc_of(obj));
+    var rc: i32 = json_set(obj, key, child);
+    if (rc != JSON_EDIT_OK) {
+        return _wrap(obj.doc, rc);
+    }
+    return child;
+}
+
+// Removes every member named `key`. Returns how many were removed (0 when the
+// key was absent), or a negative JSON_EDIT_* code.
+pub fun json_remove(obj: Json, key: str) -> i32 {
+    var k: ptr<u8> = key as ptr<u8>;
+    return ffi_obj_remove(obj.doc, obj.node, k, _len(k));
+}
+
+// ---- arrays ---------------------------------------------------------------------------
+
+pub fun json_push(arr: Json, value: Json) -> i32 {
+    if (value.node < 0) {
+        return value.node;
+    }
+    if (value.doc != arr.doc) {
+        return JSON_EDIT_INVALID;
+    }
+    return ffi_arr_push(arr.doc, arr.node, value.node);
+}
+
+pub fun json_push_null(arr: Json) -> i32 { return json_push(arr, json_new_null(_doc_of(arr))); }
+pub fun json_push_bool(arr: Json, value: bool) -> i32 { return json_push(arr, json_new_bool(_doc_of(arr), value)); }
+pub fun json_push_i64(arr: Json, value: i64) -> i32 { return json_push(arr, json_new_i64(_doc_of(arr), value)); }
+pub fun json_push_f64(arr: Json, value: f64) -> i32 { return json_push(arr, json_new_f64(_doc_of(arr), value)); }
+pub fun json_push_str(arr: Json, value: str) -> i32 { return json_push(arr, json_new_str(_doc_of(arr), value)); }
+
+pub fun json_push_object(arr: Json) -> Json {
+    var child: Json = json_new_object(_doc_of(arr));
+    var rc: i32 = json_push(arr, child);
+    if (rc != JSON_EDIT_OK) {
+        return _wrap(arr.doc, rc);
+    }
+    return child;
+}
+
+pub fun json_push_array(arr: Json) -> Json {
+    var child: Json = json_new_array(_doc_of(arr));
+    var rc: i32 = json_push(arr, child);
+    if (rc != JSON_EDIT_OK) {
+        return _wrap(arr.doc, rc);
+    }
+    return child;
+}
+
+// Inserts before `index` (index == length appends).
+pub fun json_insert(arr: Json, index: i64, value: Json) -> i32 {
+    if (value.node < 0) {
+        return value.node;
+    }
+    if (value.doc != arr.doc) {
+        return JSON_EDIT_INVALID;
+    }
+    return ffi_arr_insert(arr.doc, arr.node, index, value.node);
+}
+
+// Replaces element `index`; the old element becomes detached.
+pub fun json_replace(arr: Json, index: i64, value: Json) -> i32 {
+    if (value.node < 0) {
+        return value.node;
+    }
+    if (value.doc != arr.doc) {
+        return JSON_EDIT_INVALID;
+    }
+    return ffi_arr_set(arr.doc, arr.node, index, value.node);
+}
+
+// Removes element `index` and returns it (now detached, still usable until
+// the document is freed); invalid on error.
+pub fun json_remove_at(arr: Json, index: i64) -> Json {
+    return _wrap(arr.doc, ffi_arr_remove(arr.doc, arr.node, index));
+}
+
+// Removes all elements of an array or all members of an object.
+pub fun json_clear(v: Json) -> i32 {
+    var kind: i32 = ffi_type(v.doc, v.node);
+    if (kind == JSON_ARRAY) {
+        while (ffi_len(v.doc, v.node) > 0) {
+            var rc: i32 = ffi_arr_remove(v.doc, v.node, ffi_len(v.doc, v.node) - 1);
+            if (rc < 0) {
+                return rc;
+            }
+        }
+        return JSON_EDIT_OK;
+    }
+    if (kind == JSON_OBJECT) {
+        // Removing by key drops duplicates too; repeat until empty.
+        while (ffi_len(v.doc, v.node) > 0) {
+            var klen: i64 = 0;
+            var key: ptr<u8> = _first_key(v, &klen);
+            var removed: i32 = ffi_obj_remove(v.doc, v.node, key, klen);
+            if (removed <= 0) {
+                return JSON_EDIT_INVALID;
+            }
+        }
+        return JSON_EDIT_OK;
+    }
+    return JSON_EDIT_WRONG_TYPE;
+}
+
+fun _first_key(v: Json, len_out: ptr<i64>) -> ptr<u8> {
+    return ffi_key(v.doc, v.node, 0, len_out);
+}
+
+// ---- path-based editing ----------------------------------------------------------------
+
+fun _is_digit(c: u8) -> bool {
+    return c >= 48 && c <= 57;
+}
+
+// Parses one segment of a dotted path starting at p[i]: a bare key, ["key"]
+// or [n]. Writes either the key range (index = -1) or the index. Returns the
+// position just after the segment, or -1 on a syntax error.
+fun _segment(p: ptr<u8>, i: i64, key_start: ptr<i64>, key_len: ptr<i64>, index: ptr<i64>) -> i64 {
+    deref key_start = -1;
+    deref key_len = 0;
+    deref index = -1;
+    if (p[i] == 91) {                                        // '['
+        if (p[i + 1] == 34) {                                // ["quoted key"]
+            var qs: i64 = i + 2;
+            var qe: i64 = qs;
+            while (p[qe] != 0 && p[qe] != 34) {
+                qe += 1;
+            }
+            if (p[qe] != 34 || p[qe + 1] != 93) {
+                return -1;
+            }
+            deref key_start = qs;
+            deref key_len = qe - qs;
+            return qe + 2;
+        }
+        var j: i64 = i + 1;
+        var value: i64 = 0;
+        var digits: i32 = 0;
+        while (_is_digit(p[j])) {
+            if (digits >= 18) {
+                return -1;
+            }
+            value = value * 10 + (p[j] - 48) as i64;
+            digits += 1;
+            j += 1;
+        }
+        if (digits == 0 || p[j] != 93) {
+            return -1;
+        }
+        deref index = value;
+        return j + 1;
+    }
+    var s: i64 = i;
+    while (p[i] != 0 && p[i] != 46 && p[i] != 91) {         // until '.', '[' or end
+        i += 1;
+    }
+    if (i == s) {
+        return -1;
+    }
+    deref key_start = s;
+    deref key_len = i - s;
+    return i;
+}
+
+// Walks every segment but the last, returning the container that should hold
+// the final segment (described through key_start/key_len/index). With
+// `create`, missing object members along the way become new empty objects;
+// arrays are never grown implicitly.
+fun _walk(root: Json, p: ptr<u8>, create: bool, key_start: ptr<i64>, key_len: ptr<i64>, index: ptr<i64>) -> Json {
+    var cur: Json = root;
+    var i: i64 = 0;
+    if (p[0] == 36) {                                        // optional '$'
+        i = 1;
+    }
+    if (p[i] == 46) {                                        // optional leading '.'
+        i += 1;
+    }
+    while (true) {
+        var ks: i64 = 0;
+        var kl: i64 = 0;
+        var idx: i64 = 0;
+        i = _segment(p, i, &ks, &kl, &idx);
+        if (i < 0) {
+            return _wrap(root.doc, JSON_EDIT_INVALID);
+        }
+        if (p[i] == 0) {
+            deref key_start = ks;
+            deref key_len = kl;
+            deref index = idx;
+            return cur;
+        }
+        if (p[i] == 46) {
+            i += 1;
+        }
+
+        var next: Json = cur;
+        if (idx >= 0) {
+            next = json_at(cur, idx);
+        } else {
+            next = json_get_bytes(cur, p + ks, kl);
+            if (!json_is_valid(next) && create) {
+                if (json_type(cur) != JSON_OBJECT) {
+                    return _wrap(root.doc, JSON_EDIT_WRONG_TYPE);
+                }
+                next = json_new_object(_doc_of(cur));
+                var rc: i32 = ffi_obj_set(cur.doc, cur.node, p + ks, kl, next.node);
+                if (rc != JSON_EDIT_OK) {
+                    return _wrap(root.doc, rc);
+                }
+            }
+        }
+        if (!json_is_valid(next)) {
+            return _wrap(root.doc, JSON_EDIT_NOT_FOUND);
+        }
+        cur = next;
+    }
+    return cur;
+}
+
+// Sets the value at a dotted path, creating intermediate objects:
+//   json_set_path(root, "server.tls.port", json_new_i64(doc, 8443))
+// A final "[n]" replaces an existing array element.
+pub fun json_set_path(root: Json, path: str, value: Json) -> i32 {
+    if (value.node < 0) {
+        return value.node;
+    }
+    var p: ptr<u8> = path as ptr<u8>;
+    if (p == null || p[0] == 0) {
+        return JSON_EDIT_INVALID;
+    }
+    var ks: i64 = 0;
+    var kl: i64 = 0;
+    var idx: i64 = -1;
+    var parent: Json = _walk(root, p, true, &ks, &kl, &idx);
+    if (parent.node < 0) {
+        return parent.node;
+    }
+    if (idx >= 0) {
+        return json_replace(parent, idx, value);
+    }
+    return json_set_bytes(parent, p + ks, kl, value);
+}
+
+pub fun json_set_path_i64(root: Json, path: str, value: i64) -> i32 {
+    return json_set_path(root, path, json_new_i64(_doc_of(root), value));
+}
+
+pub fun json_set_path_f64(root: Json, path: str, value: f64) -> i32 {
+    return json_set_path(root, path, json_new_f64(_doc_of(root), value));
+}
+
+pub fun json_set_path_str(root: Json, path: str, value: str) -> i32 {
+    return json_set_path(root, path, json_new_str(_doc_of(root), value));
+}
+
+pub fun json_set_path_bool(root: Json, path: str, value: bool) -> i32 {
+    return json_set_path(root, path, json_new_bool(_doc_of(root), value));
+}
+
+// Removes the member or element at a dotted path. Returns the number of
+// values removed (0 if nothing was there), or a negative JSON_EDIT_* code
+// for a malformed path.
+pub fun json_remove_path(root: Json, path: str) -> i32 {
+    var p: ptr<u8> = path as ptr<u8>;
+    if (p == null || p[0] == 0) {
+        return JSON_EDIT_INVALID;
+    }
+    var ks: i64 = 0;
+    var kl: i64 = 0;
+    var idx: i64 = -1;
+    var parent: Json = _walk(root, p, false, &ks, &kl, &idx);
+    if (parent.node == JSON_EDIT_INVALID) {
+        return JSON_EDIT_INVALID;
+    }
+    if (parent.node < 0) {
+        return 0;
+    }
+    if (idx >= 0) {
+        var removed: Json = json_remove_at(parent, idx);
+        if (removed.node < 0) {
+            return 0;
+        }
+        return 1;
+    }
+    var count: i32 = ffi_obj_remove(parent.doc, parent.node, p + ks, kl);
+    if (count < 0) {
+        return 0;
+    }
+    return count;
+}

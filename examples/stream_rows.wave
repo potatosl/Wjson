@@ -1,0 +1,112 @@
+// SPDX-License-Identifier: MIT
+//
+// Streaming example: scan data/survey_sample.json without loading it and list
+// the manufacturing industries whose "매출증대 · 규모확장" subtotal is above
+// 90%. The same loop works for files of any size: the reader only ever holds
+// one chunk plus the current token.
+//
+//   WJSON_RUN=examples/stream_rows.wave wavec run build.wave
+
+import("wjson")::{
+    wjson_console_utf8,
+    JsonStream, JsonError,
+    JSON_EV_KEY, JSON_EV_STRING, JSON_EV_NUMBER, JSON_EV_OBJECT_START, JSON_EV_OBJECT_END,
+    JSON_EV_END, JSON_EV_ERROR,
+    json_stream_open_with, json_stream_next, json_stream_text, json_stream_text_eq,
+    json_stream_f64, json_stream_depth, json_stream_bytes_read, json_stream_buffered,
+    json_stream_error, json_stream_close,
+};
+import("std::mem::alloc")::{mem_alloc, mem_free};
+
+const KEY_GROUP: str = "매출증대 · 규모확장 (%)";
+
+// Copies the current string event into a small fixed buffer.
+fun remember(s: ptr<JsonStream>, dst: ptr<u8>, cap: i64) {
+    var src: ptr<u8> = json_stream_text(s) as ptr<u8>;
+    var i: i64 = 0;
+    while (src[i] != 0 && i < cap - 1) {
+        deref dst[i] = src[i];
+        i += 1;
+    }
+    deref dst[i] = 0;
+}
+
+fun main() -> i32 {
+    wjson_console_utf8();
+    // 4 KB chunks: the reader holds at most one chunk plus the current token.
+    var s: JsonStream = json_stream_open_with("data/survey_sample.json", 0, 4096);
+
+    // Row state (rows are objects at depth 3: root > "rows" array > row).
+    var dim1: ptr<u8> = mem_alloc(128);
+    var dim2: ptr<u8> = mem_alloc(128);
+    var dim3: ptr<u8> = mem_alloc(128);
+    var key: i32 = 0;              // 1/2/3 = which dimension the next string is
+    var in_group: bool = false;    // inside the "매출증대" object of a row
+    var want_subtotal: bool = false;
+    var matches: i32 = 0;
+    var rows: i32 = 0;
+    var in_rows: bool = false;     // inside the top-level "rows" array
+    var max_held: i64 = 0;
+
+    println("제조업 업종 중 매출증대 · 규모확장 90% 초과:");
+    var ev: i32 = json_stream_next(&s);
+    while (ev != JSON_EV_END && ev != JSON_EV_ERROR) {
+        var depth: i32 = json_stream_depth(&s);
+        if (json_stream_buffered(&s) > max_held) {
+            max_held = json_stream_buffered(&s);
+        }
+        if (ev == JSON_EV_KEY && depth == 1) {
+            in_rows = json_stream_text_eq(&s, "rows");
+        } else if (!in_rows) {
+            // only rows matter here
+        } else if (ev == JSON_EV_OBJECT_START && depth == 3) {
+            rows += 1;
+            deref dim1[0] = 0;
+            deref dim2[0] = 0;
+            deref dim3[0] = 0;
+        } else if (ev == JSON_EV_KEY && depth == 3) {
+            key = 0;
+            in_group = json_stream_text_eq(&s, KEY_GROUP);
+            if (json_stream_text_eq(&s, "특성별(1)")) { key = 1; }
+            if (json_stream_text_eq(&s, "특성별(2)")) { key = 2; }
+            if (json_stream_text_eq(&s, "특성별(3)")) { key = 3; }
+        } else if (ev == JSON_EV_STRING && depth == 3) {
+            if (key == 1) { remember(&s, dim1, 128); }
+            if (key == 2) { remember(&s, dim2, 128); }
+            if (key == 3) { remember(&s, dim3, 128); }
+        } else if (ev == JSON_EV_KEY && depth == 4 && in_group) {
+            want_subtotal = json_stream_text_eq(&s, "소계");
+        } else if (ev == JSON_EV_NUMBER && want_subtotal) {
+            want_subtotal = false;
+            var v: f64 = 0.0;
+            json_stream_f64(&s, &v);
+            if (v > 90.0 && streq_raw(dim1, "제조업") && streq_raw(dim2, "업종별")) {
+                println("  {}  {}", dim3 as str, json_stream_text(&s));
+                matches += 1;
+            }
+        }
+        ev = json_stream_next(&s);
+    }
+
+    if (ev == JSON_EV_ERROR) {
+        var err: JsonError = json_stream_error(&s);
+        println("error at {}:{}: {}", err.line, err.column, err.message);
+    } else {
+        println("{}개 업종 / 전체 {}행. 파일 {} bytes를 읽는 동안 리더가 들고 있던 데이터는 최대 {} bytes",
+                matches, rows, json_stream_bytes_read(&s), max_held);
+    }
+    json_stream_close(&s);
+    mem_free(dim1, 128);
+    mem_free(dim2, 128);
+    mem_free(dim3, 128);
+    return 0;
+}
+
+fun streq_raw(a: ptr<u8>, b: str) -> bool {
+    var pb: ptr<u8> = b as ptr<u8>;
+    var i: i64 = 0;
+    while (a[i] != 0 && a[i] == pb[i]) {
+        i += 1;
+    }
+    return a[i] == pb[i];
+}

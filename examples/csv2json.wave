@@ -1,0 +1,348 @@
+// SPDX-License-Identifier: MIT
+//
+// Data test: converts a statistics-style CSV (synthetic sample data, see
+// examples/data/README.md) with a 3-row header into nested
+// JSON with the wjson writer, then parses the result back and checks every
+// cell against the original CSV.
+//
+//   input : examples/data/survey_sample.csv
+//   output: examples/data/survey_sample.json
+//
+// CSV layout handled here:
+//   row 0      : col 0..2 dimension names, col 3.. year
+//   row 1      : col 3.. measure group  ("매출증대 · 규모확장 (%)")
+//   row 2      : col 3.. measure item   ("시장점유율 확대")
+//   row 3..    : dimension values, then numbers
+// Quoted fields ("a,b"), doubled quotes, CRLF, a UTF-8 BOM and surrounding
+// spaces are all accepted.
+//
+// Output shape:
+//   { "source": ..., "year": 2020, "dimensions": [...],
+//     "measures": [{"name": group, "items": [...]}, ...],
+//     "rows": [{"특성별(1)": "전체", ..., "<group>": {"<item>": 73.7, ...}}, ...] }
+
+import("std::fs::file")::{fs_read_all, fs_file_size, write};
+import("std::mem::alloc")::{mem_alloc, mem_free};
+import("./csvlib")::{
+    Csv, csv_from_bytes, csv_free, row_width, cell_ptr, cell_len, bytes_eq, cells_eq,
+    is_json_number,
+};
+import("wjson")::{
+    wjson_console_utf8,
+    JsonDoc, Json, JsonWriter, JsonError,
+    json_parse, json_ok, json_error, json_root, json_free, json_len, json_at, json_get,
+    json_get_bytes, json_as_bytes, json_number_text, json_as_f64, json_i64_or, json_f64_or,
+    json_path, json_path_f64, json_is_null, json_is_valid, json_to_string, json_string_free,
+    json_equal, json_str_eq, json_as_str,
+    json_writer_new, json_writer_finish, json_writer_free, json_writer_status,
+    json_writer_len, json_begin_object, json_end_object, json_begin_array, json_end_array,
+    json_key, json_key_bytes, json_write_str, json_write_str_bytes, json_write_raw_bytes,
+    json_write_null, json_str_is_null,
+};
+
+const INPUT: str = "data/survey_sample.csv";
+const OUTPUT: str = "data/survey_sample.json";
+const HEADER_ROWS: i64 = 3;
+const DIM_COLS: i64 = 3;
+
+// Numbers verbatim, "-" / empty as null (statistics tables use "-" for
+// "no data"), anything else as a string.
+fun write_cell(w: ptr<JsonWriter>, p: ptr<u8>, n: i64) -> bool {
+    if (n == 0 || (n == 1 && p[0] == 45)) {
+        return json_write_null(w);
+    }
+    if (is_json_number(p, n)) {
+        return json_write_raw_bytes(w, p, n);
+    }
+    return json_write_str_bytes(w, p, n);
+}
+
+// ---- conversion -----------------------------------------------------------------
+
+fun key_cell(w: ptr<JsonWriter>, c: ptr<Csv>, row: i64, col: i64) -> bool {
+    return json_key_bytes(w, cell_ptr(c, row, col), cell_len(c, row, col));
+}
+
+fun convert(c: ptr<Csv>, w: ptr<JsonWriter>) -> bool {
+    var cols: i64 = row_width(c, 0);
+
+    json_begin_object(w);
+    json_key(w, "source");
+    json_write_str(w, INPUT);
+    json_key(w, "year");
+    write_cell(w, cell_ptr(c, 0, DIM_COLS), cell_len(c, 0, DIM_COLS));
+
+    json_key(w, "dimensions");
+    json_begin_array(w);
+    var d: i64 = 0;
+    while (d < DIM_COLS) {
+        json_write_str_bytes(w, cell_ptr(c, 0, d), cell_len(c, 0, d));
+        d += 1;
+    }
+    json_end_array(w);
+
+    // Consecutive columns sharing a row-1 label form one measure group.
+    json_key(w, "measures");
+    json_begin_array(w);
+    var col: i64 = DIM_COLS;
+    while (col < cols) {
+        json_begin_object(w);
+        json_key(w, "name");
+        json_write_str_bytes(w, cell_ptr(c, 1, col), cell_len(c, 1, col));
+        json_key(w, "items");
+        json_begin_array(w);
+        var g: i64 = col;
+        while (g < cols && cells_eq(c, 1, g, 1, col)) {
+            json_write_str_bytes(w, cell_ptr(c, 2, g), cell_len(c, 2, g));
+            g += 1;
+        }
+        json_end_array(w);
+        json_end_object(w);
+        col = g;
+    }
+    json_end_array(w);
+
+    json_key(w, "rows");
+    json_begin_array(w);
+    var r: i64 = HEADER_ROWS;
+    while (r < deref c.rows) {
+        if (row_width(c, r) != cols) {
+            println("csv: row {} has {} fields, expected {}", r + 1, row_width(c, r), cols);
+            return false;
+        }
+        json_begin_object(w);
+        var dc: i64 = 0;
+        while (dc < DIM_COLS) {
+            key_cell(w, c, 0, dc);
+            json_write_str_bytes(w, cell_ptr(c, r, dc), cell_len(c, r, dc));
+            dc += 1;
+        }
+        var mc: i64 = DIM_COLS;
+        while (mc < cols) {
+            key_cell(w, c, 1, mc);
+            json_begin_object(w);
+            var g2: i64 = mc;
+            while (g2 < cols && cells_eq(c, 1, g2, 1, mc)) {
+                key_cell(w, c, 2, g2);
+                write_cell(w, cell_ptr(c, r, g2), cell_len(c, r, g2));
+                g2 += 1;
+            }
+            json_end_object(w);
+            mc = g2;
+        }
+        json_end_object(w);
+        r += 1;
+    }
+    json_end_array(w);
+    json_end_object(w);
+    return json_writer_status(w) == 0;
+}
+
+// ---- verification -----------------------------------------------------------------
+
+static CHECKS: i32 = 0;
+static FAILURES: i32 = 0;
+
+fun check(cond: bool, label: str) {
+    CHECKS += 1;
+    if (!cond) {
+        FAILURES += 1;
+        println("  FAIL: {}", label);
+    }
+}
+
+fun dim_is(row: Json, key: str, value: str) -> bool {
+    return json_str_eq(json_get(row, key), value);
+}
+
+fun find_row(rows: Json, d1: str, d2: str, d3: str) -> Json {
+    var i: i64 = 0;
+    while (i < json_len(rows)) {
+        var row: Json = json_at(rows, i);
+        if (dim_is(row, "특성별(1)", d1) && dim_is(row, "특성별(2)", d2) && dim_is(row, "특성별(3)", d3)) {
+            return row;
+        }
+        i += 1;
+    }
+    return json_get(rows, "no such row");          // an invalid Json
+}
+
+fun firms(row: Json) -> i64 {
+    return json_i64_or(json_get(json_get(row, "기업체수 (개)"), "소계"), -1);
+}
+
+// Every CSV cell must appear in the JSON under rows[r][group][item] with the
+// exact same text (numbers are kept as written, never re-formatted).
+fun verify_cells(c: ptr<Csv>, root: Json) -> i64 {
+    var rows: Json = json_get(root, "rows");
+    var cols: i64 = row_width(c, 0);
+    var verified: i64 = 0;
+    var r: i64 = HEADER_ROWS;
+    while (r < deref c.rows) {
+        var row: Json = json_at(rows, r - HEADER_ROWS);
+        var dc: i64 = 0;
+        while (dc < DIM_COLS) {
+            var v: Json = json_get_bytes(row, cell_ptr(c, 0, dc), cell_len(c, 0, dc));
+            var n: i64 = 0;
+            var s: ptr<u8> = json_as_bytes(v, &n);
+            if (!bytes_eq(s, n, cell_ptr(c, r, dc), cell_len(c, r, dc))) {
+                println("  mismatch: row {} dimension {}", r + 1, dc + 1);
+                FAILURES += 1;
+            }
+            verified += 1;
+            dc += 1;
+        }
+        var col: i64 = DIM_COLS;
+        while (col < cols) {
+            var group: Json = json_get_bytes(row, cell_ptr(c, 1, col), cell_len(c, 1, col));
+            var cell: Json = json_get_bytes(group, cell_ptr(c, 2, col), cell_len(c, 2, col));
+            var text: ptr<u8> = json_number_text(cell) as ptr<u8>;
+            var tn: i64 = 0;
+            if (text != null) {
+                while (text[tn] != 0) {
+                    tn += 1;
+                }
+            }
+            var value: f64 = 0.0;
+            if (!bytes_eq(text, tn, cell_ptr(c, r, col), cell_len(c, r, col)) || !json_as_f64(cell, &value)) {
+                println("  mismatch: row {} column {}", r + 1, col + 1);
+                FAILURES += 1;
+            }
+            verified += 1;
+            col += 1;
+        }
+        r += 1;
+    }
+    CHECKS += 1;
+    return verified;
+}
+
+fun verify_semantics(root: Json) {
+    var rows: Json = json_get(root, "rows");
+
+    // Firm counts: small + medium must add up to each subtotal.
+    var total: Json = find_row(rows, "전체", "소계", "소계");
+    check(firms(total) == 76431, "전체 기업체수 = 76431");
+    check(firms(find_row(rows, "소기업", "소계", "소계")) + firms(find_row(rows, "중기업", "소계", "소계")) == firms(total),
+          "소기업 + 중기업 = 전체");
+    check(firms(find_row(rows, "제조업", "규모별", "소기업")) + firms(find_row(rows, "제조업", "규모별", "중기업"))
+          == firms(find_row(rows, "제조업", "소계", "소계")), "제조업: 소기업 + 중기업 = 소계");
+    check(firms(find_row(rows, "정보통신업", "규모별", "소기업")) + firms(find_row(rows, "정보통신업", "규모별", "중기업"))
+          == firms(find_row(rows, "정보통신업", "소계", "소계")), "정보통신업: 소기업 + 중기업 = 소계");
+    check(firms(find_row(rows, "전문,과학및기술서비스업", "규모별", "소기업"))
+          + firms(find_row(rows, "전문,과학및기술서비스업", "규모별", "중기업"))
+          == firms(find_row(rows, "전문,과학및기술서비스업", "소계", "소계")), "전문과학: 소기업 + 중기업 = 소계 (quoted CSV field)");
+
+    // Industry rows (업종별) inside 제조업 must sum to the 제조업 subtotal.
+    var sum: i64 = 0;
+    var best: Json = json_get(rows, "none");
+    var worst: Json = json_get(rows, "none");
+    var i: i64 = 0;
+    while (i < json_len(rows)) {
+        var row: Json = json_at(rows, i);
+        if (dim_is(row, "특성별(1)", "제조업") && dim_is(row, "특성별(2)", "업종별")) {
+            sum += firms(row);
+            var growth: f64 = json_path_f64(row, "[\"매출증대 · 규모확장 (%)\"].소계", -1.0);
+            if (!json_is_valid(best) || growth > json_path_f64(best, "[\"매출증대 · 규모확장 (%)\"].소계", -1.0)) {
+                best = row;
+            }
+            if (!json_is_valid(worst) || growth < json_path_f64(worst, "[\"매출증대 · 규모확장 (%)\"].소계", 101.0)) {
+                worst = row;
+            }
+        }
+        i += 1;
+    }
+    var mfg: i64 = firms(find_row(rows, "제조업", "소계", "소계"));
+    println("  제조업 업종별 기업체수 합계 {} / 제조업 소계 {}", sum, mfg);
+    check(sum == mfg, "업종별 23개 업종 합계 = 제조업 소계");
+
+    println("  매출증대 · 규모확장 최고 업종: {} ({}%)", json_as_str(json_get(best, "특성별(3)")),
+            json_path_f64(best, "[\"매출증대 · 규모확장 (%)\"].소계", 0.0));
+    println("  매출증대 · 규모확장 최저 업종: {} ({}%)", json_as_str(json_get(worst, "특성별(3)")),
+            json_path_f64(worst, "[\"매출증대 · 규모확장 (%)\"].소계", 0.0));
+    check(json_str_eq(json_get(best, "특성별(3)"), "가죽가방및신발"), "최고 업종 = 가죽가방및신발 (98.8)");
+    check(json_str_eq(json_get(worst, "특성별(3)"), "기타기계및장비"), "최저 업종 = 기타기계및장비 (53.0)");
+
+    // Path queries through keys containing spaces, '·', '(' and '%'.
+    check(json_path_f64(root, "rows[0][\"매출증대 · 규모확장 (%)\"].시장점유율 확대", 0.0) == 48.1, "path into UTF-8 keys");
+    check(json_path_f64(root, "rows[68][\"에너지 절약 · 온실가스 저감 (%)\"].소계", -1.0) == 31.2, "last row through a quoted dimension");
+    check(json_len(json_get(root, "measures")) == 7, "7 measure groups");
+    check(json_len(json_get(json_at(json_get(root, "measures"), 1), "items")) == 5, "매출증대 group has 5 items");
+}
+
+// ---- main -------------------------------------------------------------------------
+
+fun main() -> i32 {
+    wjson_console_utf8();
+    var size: i64 = fs_file_size(INPUT);
+    if (size < 0) {
+        println("cannot open {} (run from examples/)", INPUT);
+        return 1;
+    }
+    var data: ptr<u8> = mem_alloc(size + 1);
+    var n: i64 = fs_read_all(INPUT, data, size);
+    if (n < 0) {
+        println("cannot read {}", INPUT);
+        return 1;
+    }
+    var csv: Csv = Csv {
+        data: null, size: 0, data_cap: 0, starts: null, lens: null, row_first: null,
+        rows: 0, fields: 0, field_cap: 0,
+    };
+    if (!csv_from_bytes(&csv, data, n)) {
+        return 1;
+    }
+    println("[1] CSV  : {} bytes, {} rows x {} columns ({} header rows)",
+            n, csv.rows, row_width(&csv, 0), HEADER_ROWS);
+
+    // CSV -> JSON with the streaming writer.
+    var w: JsonWriter = json_writer_new(2);
+    if (!convert(&csv, &w)) {
+        println("conversion failed (writer status {})", json_writer_status(&w));
+        return 1;
+    }
+    var text: str = json_writer_finish(&w);
+    var written: i64 = write(OUTPUT, text as ptr<u8>, json_writer_len(&w));
+    println("[2] JSON : {} bytes written to {}", json_writer_len(&w), OUTPUT);
+    check(written == json_writer_len(&w), "output file written");
+
+    // JSON -> parsed document.
+    var doc: JsonDoc = json_parse(text);
+    if (!json_ok(doc)) {
+        var err: JsonError = json_error(doc);
+        println("generated JSON does not parse: {}:{} {}", err.line, err.column, err.message);
+        return 1;
+    }
+    var root: Json = json_root(doc);
+    check(json_len(json_get(root, "rows")) == csv.rows - HEADER_ROWS, "one JSON row per CSV data row");
+
+    var cells: i64 = verify_cells(&csv, root);
+    println("[3] cells: {} CSV cells compared against parsed JSON", cells);
+
+    println("[4] data checks");
+    verify_semantics(root);
+
+    // Compact re-serialization must describe the very same tree.
+    var compact: str = json_to_string(root, 0);
+    var again: JsonDoc = json_parse(compact);
+    check(json_ok(again) && json_equal(root, json_root(again)), "pretty -> compact -> parse is deep-equal");
+    var cn: i64 = 0;
+    var cp: ptr<u8> = compact as ptr<u8>;
+    while (cp[cn] != 0) {
+        cn += 1;
+    }
+    println("[5] round trip: pretty {} bytes -> compact {} bytes, deep-equal", json_writer_len(&w), cn);
+
+    json_string_free(compact);
+    json_free(&again);
+    json_free(&doc);
+    json_writer_free(&w);
+    csv_free(&csv);
+    mem_free(data, size + 1);
+
+    println("csv2json: {}/{} checks passed", CHECKS - FAILURES, CHECKS);
+    if (FAILURES != 0) {
+        return 1;
+    }
+    return 0;
+}

@@ -1,0 +1,325 @@
+// SPDX-License-Identifier: MIT
+//
+// CSV -> document -> analysis, using the editing API end to end on the
+// survey data (data/survey_sample.csv):
+//
+//   1. Build a JSON document straight from the CSV with json_new_* / json_set
+//      (no writer) and check it equals csv2json's writer-built output.
+//   2. Copy the 23 manufacturing industries into a new report document.
+//   3. Sort them in place by "매출증대 · 규모확장" subtotal (json_remove_at +
+//      json_insert), add a rank, rename/remove fields.
+//   4. Add a computed summary, save data/survey_report.json, and verify the
+//      saved file parses back to the same tree.
+//
+//   WJSON_RUN=examples/survey_report.wave wavec run build.wave
+
+import("std::fs::file")::{fs_read_all, fs_file_size, write};
+import("std::mem::alloc")::{mem_alloc, mem_free};
+import("./csvlib")::{Csv, csv_empty, csv_load, csv_free, csv_rows, row_width, cell_ptr, cell_len, cells_eq, is_json_number};
+import("wjson")::{
+    wjson_console_utf8,
+    JsonDoc, Json, JSON_EDIT_OK,
+    json_parse_bytes, json_ok, json_root, json_free, json_len, json_at, json_get, json_get_bytes,
+    json_as_str, json_str_eq, json_f64_or, json_i64_or, json_path_f64, json_equal, json_number_text,
+    json_to_string, json_string_free,
+    json_new_document, json_set_root, json_new_object, json_new_array, json_new_null,
+    json_new_str, json_new_str_bytes, json_new_number_bytes, json_new_i64, json_new_f64, json_new_f64_fixed,
+    json_copy, json_set, json_set_bytes, json_set_str, json_set_i64, json_set_f64,
+    json_set_object, json_set_array, json_remove, json_push, json_push_object, json_push_str,
+    json_insert, json_remove_at,
+};
+
+const CSV_PATH: str = "data/survey_sample.csv";
+const WRITER_JSON: str = "data/survey_sample.json";      // made by csv2json.wave
+const REPORT_PATH: str = "data/survey_report.json";
+const GROWTH: str = "매출증대 · 규모확장 (%)";
+const HEADER_ROWS: i64 = 3;
+const DIM_COLS: i64 = 3;
+
+// ---- step 1: CSV -> document with the editing API -------------------------------
+
+fun cell_value(doc: JsonDoc, c: ptr<Csv>, r: i64, col: i64) -> Json {
+    var p: ptr<u8> = cell_ptr(c, r, col);
+    var n: i64 = cell_len(c, r, col);
+    if (n == 0 || (n == 1 && p[0] == 45)) {            // "" or "-" = no data
+        return json_new_null(doc);
+    }
+    if (is_json_number(p, n)) {
+        return json_new_number_bytes(doc, p, n);        // keeps "74.0" verbatim
+    }
+    return json_new_str_bytes(doc, p, n);
+}
+
+fun build_from_csv(c: ptr<Csv>) -> JsonDoc {
+    var doc: JsonDoc = json_new_document();
+    var root: Json = json_new_object(doc);
+    json_set_root(doc, root);
+    json_set_str(root, "source", "data/survey_sample.csv");
+    json_set(root, "year", cell_value(doc, c, 0, DIM_COLS));
+
+    var cols: i64 = row_width(c, 0);
+    var dims: Json = json_set_array(root, "dimensions");
+    var d: i64 = 0;
+    while (d < DIM_COLS) {
+        json_push(dims, json_new_str_bytes(doc, cell_ptr(c, 0, d), cell_len(c, 0, d)));
+        d += 1;
+    }
+
+    var measures: Json = json_set_array(root, "measures");
+    var col: i64 = DIM_COLS;
+    while (col < cols) {
+        var m: Json = json_push_object(measures);
+        json_set(m, "name", json_new_str_bytes(doc, cell_ptr(c, 1, col), cell_len(c, 1, col)));
+        var items: Json = json_set_array(m, "items");
+        var g: i64 = col;
+        while (g < cols && cells_eq(c, 1, g, 1, col)) {
+            json_push(items, json_new_str_bytes(doc, cell_ptr(c, 2, g), cell_len(c, 2, g)));
+            g += 1;
+        }
+        col = g;
+    }
+
+    var rows: Json = json_set_array(root, "rows");
+    var r: i64 = HEADER_ROWS;
+    while (r < csv_rows(c)) {
+        var row: Json = json_push_object(rows);
+        var dc: i64 = 0;
+        while (dc < DIM_COLS) {
+            json_set_bytes(row, cell_ptr(c, 0, dc), cell_len(c, 0, dc), cell_value(doc, c, r, dc));
+            dc += 1;
+        }
+        var mc: i64 = DIM_COLS;
+        while (mc < cols) {
+            var group: Json = json_new_object(doc);
+            json_set_bytes(row, cell_ptr(c, 1, mc), cell_len(c, 1, mc), group);
+            var g2: i64 = mc;
+            while (g2 < cols && cells_eq(c, 1, g2, 1, mc)) {
+                json_set_bytes(group, cell_ptr(c, 2, g2), cell_len(c, 2, g2), cell_value(doc, c, r, g2));
+                g2 += 1;
+            }
+            mc = g2;
+        }
+        r += 1;
+    }
+    return doc;
+}
+
+// ---- helpers ------------------------------------------------------------------------
+
+fun firms_of(row: Json) -> i64 {
+    return json_i64_or(json_get(json_get(row, "기업체수 (개)"), "소계"), 0);
+}
+
+fun growth(row: Json) -> f64 {
+    return json_f64_or(json_get(json_get(row, GROWTH), "소계"), -1.0);
+}
+
+fun load_json(path: str, doc: ptr<JsonDoc>) -> bool {
+    var size: i64 = fs_file_size(path);
+    if (size < 0) {
+        return false;
+    }
+    var data: ptr<u8> = mem_alloc(size);
+    var n: i64 = fs_read_all(path, data, size);
+    deref doc = json_parse_bytes(data, n, 0, 0);
+    mem_free(data, size);
+    return json_ok(deref doc);
+}
+
+fun spaces(n: i64) {
+    var i: i64 = 0;
+    while (i < n) {
+        print(" ");
+        i += 1;
+    }
+}
+
+// Terminal width: Hangul counts as 2 columns.
+fun width(s: str) -> i64 {
+    var p: ptr<u8> = s as ptr<u8>;
+    var i: i64 = 0;
+    var w: i64 = 0;
+    while (p[i] != 0) {
+        if (p[i] < 128) {
+            w += 1;
+            i += 1;
+        } else if (p[i] >= 224 && p[i] <= 237) {
+            w += 2;
+            i += 3;
+        } else if (p[i] >= 240) {
+            w += 2;
+            i += 4;
+        } else if (p[i] >= 224) {
+            w += 1;
+            i += 3;
+        } else {
+            w += 1;
+            i += 2;
+        }
+    }
+    return w;
+}
+
+fun print_row(item: Json) {
+    var name: str = json_as_str(json_get(item, "업종"));
+    print("  {}위  ", json_i64_or(json_get(item, "순위"), 0));
+    if (json_i64_or(json_get(item, "순위"), 0) < 10) {
+        print(" ");
+    }
+    print("{}", name);
+    spaces(34 - width(name));
+    var pct: str = json_number_text(json_get(json_get(item, GROWTH), "소계"));
+    print("{}%", pct);
+    spaces(8 - width(pct));
+    println("기업 {}개", firms_of(item));
+}
+
+// ---- main -------------------------------------------------------------------------------
+
+fun main() -> i32 {
+    wjson_console_utf8();
+
+    // 1. CSV -> document
+    var csv: Csv = csv_empty();
+    if (!csv_load(CSV_PATH, &csv)) {
+        return 1;
+    }
+    var survey: JsonDoc = build_from_csv(&csv);
+    csv_free(&csv);
+    var root: Json = json_root(survey);
+    var rows: Json = json_get(root, "rows");
+    println("[1] CSV {}행 -> 수정 API로 문서 생성: 행 {}개, 측정 항목 {}개",
+            json_len(rows) + HEADER_ROWS, json_len(rows), json_len(json_get(root, "measures")));
+
+    var writer_doc: JsonDoc = JsonDoc { handle: null };
+    if (load_json(WRITER_JSON, &writer_doc)) {
+        var same: bool = json_equal(root, json_root(writer_doc));
+        if (same) {
+            println("    writer로 만든 {}와 내용이 완전히 같음", WRITER_JSON);
+        } else {
+            println("    writer로 만든 {}와 다름!", WRITER_JSON);
+        }
+        json_free(&writer_doc);
+    }
+
+    // 2. Copy the manufacturing industries into a new document.
+    var report: JsonDoc = json_new_document();
+    var rep: Json = json_new_object(report);
+    json_set_root(report, rep);
+    json_set_str(rep, "title", "샘플 데이터: 제조업 업종별 매출증대 · 규모확장 순위");
+    var industries: Json = json_set_array(rep, "industries");
+    var i: i64 = 0;
+    while (i < json_len(rows)) {
+        var row: Json = json_at(rows, i);
+        if (json_str_eq(json_get(row, "특성별(1)"), "제조업") && json_str_eq(json_get(row, "특성별(2)"), "업종별")) {
+            json_push(industries, json_copy(report, row));
+        }
+        i += 1;
+    }
+    var n: i64 = json_len(industries);
+    println("[2] 제조업 업종 {}개를 새 문서로 복사", n);
+
+    // 3. Insertion sort in place by growth subtotal, descending.
+    var k: i64 = 1;
+    var moves: i64 = 0;
+    while (k < n) {
+        var j: i64 = k;
+        while (j > 0 && growth(json_at(industries, j - 1)) < growth(json_at(industries, j))) {
+            var moved: Json = json_remove_at(industries, j);      // detached...
+            json_insert(industries, j - 1, moved);                // ...and re-attached
+            moves += 1;
+            j -= 1;
+        }
+        k += 1;
+    }
+    // Rank, rename "특성별(3)" -> "업종", drop the now-redundant dimensions.
+    i = 0;
+    while (i < n) {
+        var item: Json = json_at(industries, i);
+        json_set_i64(item, "순위", i + 1);
+        json_set_str(item, "업종", json_as_str(json_get(item, "특성별(3)")));
+        json_remove(item, "특성별(1)");
+        json_remove(item, "특성별(2)");
+        json_remove(item, "특성별(3)");
+        i += 1;
+    }
+    println("[3] 매출증대 소계 기준 정렬 ({}번 이동), 순위 추가, 필드 이름 변경·삭제", moves);
+
+    // 4. Summary computed from the edited document.
+    var total_firms: i64 = 0;
+    var weighted: f64 = 0.0;
+    var above90: i64 = 0;
+    i = 0;
+    while (i < n) {
+        var item2: Json = json_at(industries, i);
+        var firms: i64 = firms_of(item2);
+        total_firms += firms;
+        weighted = weighted + growth(item2) * (firms as f64);
+        if (growth(item2) > 90.0) {
+            above90 += 1;
+        }
+        i += 1;
+    }
+    var summary: Json = json_set_object(rep, "summary");
+    json_set_i64(summary, "업종 수", n);
+    json_set_i64(summary, "기업체수 합계", total_firms);
+    json_set(summary, "기업 수 가중 평균 (%)", json_new_f64_fixed(report, weighted / (total_firms as f64), 1));
+    json_set_i64(summary, "90% 초과 업종 수", above90);
+    json_set_str(summary, "최고 업종", json_as_str(json_get(json_at(industries, 0), "업종")));
+    json_set_str(summary, "최저 업종", json_as_str(json_get(json_at(industries, n - 1), "업종")));
+    var mfg_total: i64 = 0;
+    i = 0;
+    while (i < json_len(rows)) {
+        var r2: Json = json_at(rows, i);
+        if (json_str_eq(json_get(r2, "특성별(1)"), "제조업") && json_str_eq(json_get(r2, "특성별(2)"), "소계")) {
+            mfg_total = json_i64_or(json_get(json_get(r2, "기업체수 (개)"), "소계"), 0);
+        }
+        i += 1;
+    }
+    var check: Json = json_set_object(summary, "검증");
+    json_set_i64(check, "제조업 소계 (CSV)", mfg_total);
+    json_set(check, "업종 합계 = 소계", json_new_str(report, "일치"));
+    if (mfg_total != total_firms) {
+        json_set_str(check, "업종 합계 = 소계", "불일치");
+    }
+
+    // Save and verify.
+    var text: str = json_to_string(rep, 2);
+    var tp: ptr<u8> = text as ptr<u8>;
+    var tlen: i64 = 0;
+    while (tp[tlen] != 0) {
+        tlen += 1;
+    }
+    write(REPORT_PATH, tp, tlen);
+    json_string_free(text);
+    var saved: JsonDoc = JsonDoc { handle: null };
+    var reread_ok: bool = load_json(REPORT_PATH, &saved) && json_equal(rep, json_root(saved));
+    json_free(&saved);
+    if (reread_ok) {
+        println("[4] 요약 추가 후 {} 저장 ({} bytes) — 다시 읽은 파일과 일치", REPORT_PATH, tlen);
+    } else {
+        println("[4] 저장한 파일을 다시 읽었더니 다름!");
+    }
+
+    println("");
+    println("상위 5개 업종");
+    i = 0;
+    while (i < 5) {
+        print_row(json_at(industries, i));
+        i += 1;
+    }
+    println("하위 5개 업종");
+    i = n - 5;
+    while (i < n) {
+        print_row(json_at(industries, i));
+        i += 1;
+    }
+    println("");
+    println("요약: 업종 {}개, 기업 {}개 (제조업 소계 {}와 {}), 기업 수 가중 평균 {}%, 90% 초과 {}개",
+            n, total_firms, mfg_total, json_as_str(json_get(check, "업종 합계 = 소계")),
+            json_number_text(json_get(summary, "기업 수 가중 평균 (%)")), above90);
+
+    json_free(&report);
+    json_free(&survey);
+    return 0;
+}

@@ -1,0 +1,85 @@
+// SPDX-License-Identifier: MIT
+//
+// Parse -> filter -> write: reads examples/users.json, keeps users who know
+// Wave, adds a computed field and pretty-prints the result.
+
+import("std::fs::file")::{fs_read_all, fs_file_size};
+import("std::mem::alloc")::{mem_alloc, mem_free};
+import("wjson")::{
+    wjson_console_utf8,
+    JsonDoc, Json, JsonWriter,
+    json_parse_bytes, json_ok, json_root, json_free, json_len, json_at, json_get,
+    json_str_eq, json_i64_or, json_write_value,
+    json_writer_new, json_writer_finish, json_writer_free, json_begin_object,
+    json_end_object, json_begin_array, json_end_array, json_key, json_field_i64,
+    json_field_bool, json_field_f64, json_writer_status,
+};
+
+fun knows(user: Json, lang: str) -> bool {
+    var langs: Json = json_get(user, "langs");
+    var i: i64 = 0;
+    while (i < json_len(langs)) {
+        if (json_str_eq(json_at(langs, i), lang)) {
+            return true;
+        }
+        i += 1;
+    }
+    return false;
+}
+
+fun main() -> i32 {
+    wjson_console_utf8();
+    var size: i64 = fs_file_size("users.json");
+    if (size < 0) {
+        println("users.json not found (run from examples/)");
+        return 1;
+    }
+    var data: ptr<u8> = mem_alloc(size);
+    var n: i64 = fs_read_all("users.json", data, size);
+    var doc: JsonDoc = json_parse_bytes(data, n, 0, 0);
+    mem_free(data, size);
+    if (!json_ok(doc)) {
+        println("users.json is not valid JSON");
+        return 1;
+    }
+    var users: Json = json_root(doc);
+
+    var w: JsonWriter = json_writer_new(2);
+    json_begin_object(&w);
+    json_key(&w, "wave_users");
+    json_begin_array(&w);
+
+    var kept: i64 = 0;
+    var age_sum: i64 = 0;
+    var i: i64 = 0;
+    while (i < json_len(users)) {
+        var u: Json = json_at(users, i);
+        if (knows(u, "wave")) {
+            json_begin_object(&w);
+            json_key(&w, "name");
+            json_write_value(&w, json_get(u, "name"));      // copy straight from the input
+            json_field_i64(&w, "age", json_i64_or(json_get(u, "age"), 0));
+            json_field_bool(&w, "polyglot", json_len(json_get(u, "langs")) >= 3);
+            json_end_object(&w);
+            kept += 1;
+            age_sum += json_i64_or(json_get(u, "age"), 0);
+        }
+        i += 1;
+    }
+    json_end_array(&w);
+    json_field_i64(&w, "count", kept);
+    if (kept > 0) {
+        json_field_f64(&w, "average_age", (age_sum as f64) / (kept as f64));
+    }
+    json_end_object(&w);
+
+    var text: str = json_writer_finish(&w);
+    if (json_writer_status(&w) != 0) {
+        println("writer error {}", json_writer_status(&w));
+        return 1;
+    }
+    println("{}", text);
+    json_writer_free(&w);
+    json_free(&doc);
+    return 0;
+}

@@ -1,0 +1,40 @@
+# SPDX-License-Identifier: MIT
+# Full build and test on Linux and Windows (Windows without MSVC).
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+env:
+  WAVE_VERSION: v0.2.1-pre-beta
+
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install wavec
+        run: |
+          curl -sSfL -o wave.tar.gz \
+            "https://github.com/wavefnd/Wave/releases/download/${WAVE_VERSION}/wave-${WAVE_VERSION}-x86_64-linux-gnu.tar.gz"
+          mkdir -p "$HOME/wave" && tar -xzf wave.tar.gz -C "$HOME/wave" --strip-components=1
+          echo "$HOME/wave" >> "$GITHUB_PATH"
+          echo "WAVE_STD=$HOME/wave/std" >> "$GITHUB_ENV"
+      - name: Build and test
+        run: wavec --std-root="$WAVE_STD" run build.wave
+
+  windows:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      # The runner already has Rust and LLVM (clang); the script installs
+      # Wave, clears every MSVC environment variable and runs build.wave.
+      - name: Build and test (no MSVC)
+        shell: pwsh
+        run: |
+          powershell -NoProfile -ExecutionPolicy Bypass -File .\setup-windows.ps1
+          $code = $LASTEXITCODE
+          Get-Content run-log.txt -ErrorAction SilentlyContinue | Select-Object -Last 40
+          exit $code

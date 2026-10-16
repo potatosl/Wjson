@@ -1,0 +1,499 @@
+// SPDX-License-Identifier: MIT
+//
+// Streaming JSON writer with structural validation.
+//
+//   var w: JsonWriter = json_writer_new(2);          // indent 2; 0 = compact
+//   json_begin_object(&w);
+//   json_field_str(&w, "name", "wave");
+//   json_key(&w, "tags");
+//   json_begin_array(&w);
+//   json_write_i64(&w, 1);
+//   json_write_f64(&w, 2.5);
+//   json_end_array(&w);
+//   json_end_object(&w);
+//   var text: str = json_writer_finish(&w);         // null on any error
+//   println("{}", text);
+//   json_writer_free(&w);
+//
+// The writer tracks nesting, commas and key/value alternation itself; a call
+// out of place (a value where a key is required, end_array closing an
+// object, a second top-level value, ...) puts it into an error state that
+// json_writer_status() reports and json_writer_finish() refuses. Strings are
+// escaped and numbers formatted by the C++ native layer (shortest round-trip).
+
+import("std::mem::alloc")::{mem_alloc, mem_realloc, mem_free};
+import("./ffi")::{ffi_escape, ffi_format_f64, ffi_format_f64_fixed, ffi_format_i64};
+import("./consts")::{
+    JSON_ESCAPE_DEFAULT, JSON_ESCAPE_QUOTES, JSON_WRITER_OK, JSON_WRITER_ERR_STATE,
+    JSON_WRITER_ERR_ALLOC, JSON_WRITER_ERR_NUMBER, JSON_WRITER_ERR_UTF8,
+    JSON_WRITER_ERR_INCOMPLETE, json_null_str,
+};
+
+// Per-depth state bits.
+const FRAME_OBJECT: u8 = 1;
+const FRAME_HAS_ITEMS: u8 = 2;
+const FRAME_AWAIT_VALUE: u8 = 4;
+
+pub struct JsonWriter {
+    data: ptr<u8>;
+    len: i64;
+    cap: i64;
+    stack: ptr<u8>;
+    stack_cap: i64;
+    depth: i64;
+    done: bool;
+    indent: i32;
+    flags: u32;
+    status: i32;
+}
+
+pub fun json_writer_new(indent: i32) -> JsonWriter {
+    var spaces: i32 = indent;
+    if (spaces < 0) {
+        spaces = 0;
+    }
+    if (spaces > 16) {
+        spaces = 16;
+    }
+    return JsonWriter {
+        data: null, len: 0, cap: 0,
+        stack: null, stack_cap: 0, depth: 0,
+        done: false, indent: spaces, flags: JSON_ESCAPE_DEFAULT,
+        status: JSON_WRITER_OK,
+    };
+}
+
+// JSON_ESCAPE_ASCII and/or JSON_ESCAPE_HTML; applies to later strings.
+pub fun json_writer_set_escape(w: ptr<JsonWriter>, flags: u32) {
+    deref w.flags = flags & 3;
+}
+
+pub fun json_writer_status(w: ptr<JsonWriter>) -> i32 {
+    return deref w.status;
+}
+
+pub fun json_writer_len(w: ptr<JsonWriter>) -> i64 {
+    return deref w.len;
+}
+
+// Clears output and state but keeps the allocations for reuse.
+pub fun json_writer_reset(w: ptr<JsonWriter>) {
+    deref w.len = 0;
+    deref w.depth = 0;
+    deref w.done = false;
+    deref w.status = JSON_WRITER_OK;
+}
+
+pub fun json_writer_free(w: ptr<JsonWriter>) {
+    if (deref w.data != null) {
+        mem_free(deref w.data, deref w.cap);
+    }
+    if (deref w.stack != null) {
+        mem_free(deref w.stack, deref w.stack_cap);
+    }
+    deref w.data = null;
+    deref w.cap = 0;
+    deref w.stack = null;
+    deref w.stack_cap = 0;
+    json_writer_reset(w);
+}
+
+// NUL-terminated output, owned by the writer (valid until the next write,
+// reset or free). Null when the writer is in an error state or the
+// document is incomplete.
+pub fun json_writer_finish(w: ptr<JsonWriter>) -> str {
+    if (deref w.status != JSON_WRITER_OK) {
+        return json_null_str();
+    }
+    if (deref w.depth != 0 || !(deref w.done)) {
+        deref w.status = JSON_WRITER_ERR_INCOMPLETE;
+        return json_null_str();
+    }
+    if (!_reserve(w, 1)) {
+        return json_null_str();
+    }
+    var d: ptr<u8> = deref w.data;
+    deref d[deref w.len] = 0;
+    return d as str;
+}
+
+// ---- internal buffer management ---------------------------------------------------
+
+fun _fail(w: ptr<JsonWriter>, code: i32) -> bool {
+    if (deref w.status == JSON_WRITER_OK) {
+        deref w.status = code;
+    }
+    return false;
+}
+
+// Ensures room for `extra` more bytes after len.
+fun _reserve(w: ptr<JsonWriter>, extra: i64) -> bool {
+    var need: i64 = deref w.len + extra;
+    var cap: i64 = deref w.cap;
+    if (need <= cap) {
+        return true;
+    }
+    var new_cap: i64 = cap * 2;
+    if (new_cap < 64) {
+        new_cap = 64;
+    }
+    while (new_cap < need) {
+        new_cap = new_cap * 2;
+    }
+    var grown: ptr<u8> = null;
+    if (deref w.data == null) {
+        grown = mem_alloc(new_cap);
+    } else {
+        grown = mem_realloc(deref w.data, cap, new_cap);
+    }
+    if (grown == null) {
+        return _fail(w, JSON_WRITER_ERR_ALLOC);
+    }
+    deref w.data = grown;
+    deref w.cap = new_cap;
+    return true;
+}
+
+fun _put(w: ptr<JsonWriter>, c: u8) -> bool {
+    if (!_reserve(w, 1)) {
+        return false;
+    }
+    var d: ptr<u8> = deref w.data;
+    deref d[deref w.len] = c;
+    deref w.len = deref w.len + 1;
+    return true;
+}
+
+fun _put_bytes(w: ptr<JsonWriter>, src: ptr<u8>, n: i64) -> bool {
+    if (n <= 0) {
+        return true;
+    }
+    if (!_reserve(w, n)) {
+        return false;
+    }
+    var d: ptr<u8> = deref w.data;
+    var base: i64 = deref w.len;
+    var i: i64 = 0;
+    while (i < n) {
+        deref d[base + i] = src[i];
+        i += 1;
+    }
+    deref w.len = base + n;
+    return true;
+}
+
+fun _put_str(w: ptr<JsonWriter>, s: str) -> bool {
+    var p: ptr<u8> = s as ptr<u8>;
+    var n: i64 = 0;
+    while (p[n] != 0) {
+        n += 1;
+    }
+    return _put_bytes(w, p, n);
+}
+
+fun _newline(w: ptr<JsonWriter>) -> bool {
+    if (deref w.indent == 0) {
+        return true;
+    }
+    if (!_put(w, 10)) {
+        return false;
+    }
+    var spaces: i64 = deref w.depth * (deref w.indent as i64);
+    var i: i64 = 0;
+    while (i < spaces) {
+        if (!_put(w, 32)) {
+            return false;
+        }
+        i += 1;
+    }
+    return true;
+}
+
+fun _top(w: ptr<JsonWriter>) -> u8 {
+    var s: ptr<u8> = deref w.stack;
+    return s[deref w.depth - 1];
+}
+
+fun _set_top(w: ptr<JsonWriter>, bits: u8) {
+    var s: ptr<u8> = deref w.stack;
+    deref s[deref w.depth - 1] = bits;
+}
+
+fun _push(w: ptr<JsonWriter>, bits: u8) -> bool {
+    var depth: i64 = deref w.depth;
+    if (depth >= deref w.stack_cap) {
+        var old_cap: i64 = deref w.stack_cap;
+        var new_cap: i64 = old_cap * 2;
+        if (new_cap < 16) {
+            new_cap = 16;
+        }
+        var grown: ptr<u8> = null;
+        if (deref w.stack == null) {
+            grown = mem_alloc(new_cap);
+        } else {
+            grown = mem_realloc(deref w.stack, old_cap, new_cap);
+        }
+        if (grown == null) {
+            return _fail(w, JSON_WRITER_ERR_ALLOC);
+        }
+        deref w.stack = grown;
+        deref w.stack_cap = new_cap;
+    }
+    var s: ptr<u8> = deref w.stack;
+    deref s[depth] = bits;
+    deref w.depth = depth + 1;
+    return true;
+}
+
+// Separator/state bookkeeping before any value (scalar or container).
+fun _before_value(w: ptr<JsonWriter>) -> bool {
+    if (deref w.status != JSON_WRITER_OK) {
+        return false;
+    }
+    if (deref w.depth == 0) {
+        if (deref w.done) {
+            return _fail(w, JSON_WRITER_ERR_STATE);
+        }
+        return true;
+    }
+    var top: u8 = _top(w);
+    if ((top & FRAME_OBJECT) != 0) {
+        if ((top & FRAME_AWAIT_VALUE) == 0) {
+            return _fail(w, JSON_WRITER_ERR_STATE);   // value without key
+        }
+        _set_top(w, top & (255 - FRAME_AWAIT_VALUE));
+        return true;
+    }
+    if ((top & FRAME_HAS_ITEMS) != 0) {
+        if (!_put(w, 44)) {                          // ','
+            return false;
+        }
+    }
+    _set_top(w, top | FRAME_HAS_ITEMS);
+    return _newline(w);
+}
+
+fun _after_value(w: ptr<JsonWriter>) {
+    if (deref w.depth == 0) {
+        deref w.done = true;
+    }
+}
+
+// Writes an escaped, quoted string.
+fun _put_escaped(w: ptr<JsonWriter>, src: ptr<u8>, n: i64) -> bool {
+    var flags: u32 = deref w.flags | JSON_ESCAPE_QUOTES;
+    var need: i64 = ffi_escape(src, n, null, 0, flags);
+    if (need < 0) {
+        return _fail(w, JSON_WRITER_ERR_UTF8);
+    }
+    if (!_reserve(w, need + 1)) {
+        return false;
+    }
+    var d: ptr<u8> = deref w.data;
+    ffi_escape(src, n, d + deref w.len, need + 1, flags);
+    deref w.len = deref w.len + need;
+    return true;
+}
+
+fun _cstr_len(s: str) -> i64 {
+    var p: ptr<u8> = s as ptr<u8>;
+    if (p == null) {
+        return 0;
+    }
+    var n: i64 = 0;
+    while (p[n] != 0) {
+        n += 1;
+    }
+    return n;
+}
+
+// ---- structure ------------------------------------------------------------------
+
+pub fun json_begin_object(w: ptr<JsonWriter>) -> bool {
+    if (!_before_value(w)) {
+        return false;
+    }
+    return _put(w, 123) && _push(w, FRAME_OBJECT);   // '{'
+}
+
+pub fun json_begin_array(w: ptr<JsonWriter>) -> bool {
+    if (!_before_value(w)) {
+        return false;
+    }
+    return _put(w, 91) && _push(w, 0);              // '['
+}
+
+fun _end(w: ptr<JsonWriter>, want_kind: u8, close: u8) -> bool {
+    if (deref w.status != JSON_WRITER_OK) {
+        return false;
+    }
+    if (deref w.depth == 0) {
+        return _fail(w, JSON_WRITER_ERR_STATE);
+    }
+    var top: u8 = _top(w);
+    if ((top & FRAME_OBJECT) != want_kind || (top & FRAME_AWAIT_VALUE) != 0) {
+        return _fail(w, JSON_WRITER_ERR_STATE);
+    }
+    deref w.depth = deref w.depth - 1;
+    if ((top & FRAME_HAS_ITEMS) != 0) {
+        if (!_newline(w)) {
+            return false;
+        }
+    }
+    if (!_put(w, close)) {
+        return false;
+    }
+    _after_value(w);
+    return true;
+}
+
+pub fun json_end_object(w: ptr<JsonWriter>) -> bool { return _end(w, FRAME_OBJECT, 125); }
+pub fun json_end_array(w: ptr<JsonWriter>) -> bool { return _end(w, 0, 93); }
+
+// Object key given as a byte range.
+pub fun json_key_bytes(w: ptr<JsonWriter>, key: ptr<u8>, n: i64) -> bool {
+    if (deref w.status != JSON_WRITER_OK) {
+        return false;
+    }
+    if (deref w.depth == 0) {
+        return _fail(w, JSON_WRITER_ERR_STATE);
+    }
+    var top: u8 = _top(w);
+    if ((top & FRAME_OBJECT) == 0 || (top & FRAME_AWAIT_VALUE) != 0) {
+        return _fail(w, JSON_WRITER_ERR_STATE);
+    }
+    if ((top & FRAME_HAS_ITEMS) != 0) {
+        if (!_put(w, 44)) {
+            return false;
+        }
+    }
+    _set_top(w, top | FRAME_HAS_ITEMS | FRAME_AWAIT_VALUE);
+    if (!_newline(w) || !_put_escaped(w, key, n) || !_put(w, 58)) {   // ':'
+        return false;
+    }
+    if (deref w.indent != 0) {
+        return _put(w, 32);
+    }
+    return true;
+}
+
+pub fun json_key(w: ptr<JsonWriter>, key: str) -> bool {
+    return json_key_bytes(w, key as ptr<u8>, _cstr_len(key));
+}
+
+// ---- scalars --------------------------------------------------------------------
+
+pub fun json_write_null(w: ptr<JsonWriter>) -> bool {
+    if (!_before_value(w) || !_put_str(w, "null")) {
+        return false;
+    }
+    _after_value(w);
+    return true;
+}
+
+pub fun json_write_bool(w: ptr<JsonWriter>, value: bool) -> bool {
+    if (!_before_value(w)) {
+        return false;
+    }
+    var ok: bool = false;
+    if (value) {
+        ok = _put_str(w, "true");
+    } else {
+        ok = _put_str(w, "false");
+    }
+    if (ok) {
+        _after_value(w);
+    }
+    return ok;
+}
+
+pub fun json_write_i64(w: ptr<JsonWriter>, value: i64) -> bool {
+    if (!_before_value(w) || !_reserve(w, 32)) {
+        return false;
+    }
+    var d: ptr<u8> = deref w.data;
+    var n: i64 = ffi_format_i64(value, d + deref w.len, 32);
+    deref w.len = deref w.len + n;
+    _after_value(w);
+    return true;
+}
+
+// Shortest decimal that round-trips. NaN/inf are rejected (JSON has no
+// spelling for them) with JSON_WRITER_ERR_NUMBER.
+pub fun json_write_f64(w: ptr<JsonWriter>, value: f64) -> bool {
+    if (ffi_format_f64(value, null, 0) < 0) {
+        return _fail(w, JSON_WRITER_ERR_NUMBER);
+    }
+    if (!_before_value(w) || !_reserve(w, 64)) {
+        return false;
+    }
+    var d: ptr<u8> = deref w.data;
+    var n: i64 = ffi_format_f64(value, d + deref w.len, 64);
+    deref w.len = deref w.len + n;
+    _after_value(w);
+    return true;
+}
+
+// Fixed notation with `precision` (0..17) fraction digits, e.g. prices.
+pub fun json_write_f64_fixed(w: ptr<JsonWriter>, value: f64, precision: i32) -> bool {
+    var need: i64 = ffi_format_f64_fixed(value, precision, null, 0);
+    if (need < 0) {
+        return _fail(w, JSON_WRITER_ERR_NUMBER);
+    }
+    if (!_before_value(w) || !_reserve(w, need + 1)) {
+        return false;
+    }
+    var d: ptr<u8> = deref w.data;
+    ffi_format_f64_fixed(value, precision, d + deref w.len, need + 1);
+    deref w.len = deref w.len + need;
+    _after_value(w);
+    return true;
+}
+
+pub fun json_write_str(w: ptr<JsonWriter>, value: str) -> bool {
+    return json_write_str_bytes(w, value as ptr<u8>, _cstr_len(value));
+}
+
+pub fun json_write_str_bytes(w: ptr<JsonWriter>, value: ptr<u8>, n: i64) -> bool {
+    if (!_before_value(w) || !_put_escaped(w, value, n)) {
+        return false;
+    }
+    _after_value(w);
+    return true;
+}
+
+// Inserts already-serialized JSON verbatim (not validated). Useful for
+// copying number lexemes exactly or splicing cached fragments.
+pub fun json_write_raw_bytes(w: ptr<JsonWriter>, text: ptr<u8>, n: i64) -> bool {
+    if (!_before_value(w) || !_put_bytes(w, text, n)) {
+        return false;
+    }
+    _after_value(w);
+    return true;
+}
+
+pub fun json_write_raw(w: ptr<JsonWriter>, text: str) -> bool {
+    return json_write_raw_bytes(w, text as ptr<u8>, _cstr_len(text));
+}
+
+// ---- key + value shortcuts --------------------------------------------------------
+
+pub fun json_field_str(w: ptr<JsonWriter>, key: str, value: str) -> bool {
+    return json_key(w, key) && json_write_str(w, value);
+}
+
+pub fun json_field_i64(w: ptr<JsonWriter>, key: str, value: i64) -> bool {
+    return json_key(w, key) && json_write_i64(w, value);
+}
+
+pub fun json_field_f64(w: ptr<JsonWriter>, key: str, value: f64) -> bool {
+    return json_key(w, key) && json_write_f64(w, value);
+}
+
+pub fun json_field_bool(w: ptr<JsonWriter>, key: str, value: bool) -> bool {
+    return json_key(w, key) && json_write_bool(w, value);
+}
+
+pub fun json_field_null(w: ptr<JsonWriter>, key: str) -> bool {
+    return json_key(w, key) && json_write_null(w);
+}

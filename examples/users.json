@@ -1,0 +1,6 @@
+[
+  {"id": 1, "name": "Minji", "age": 34, "langs": ["wave", "rust"]},
+  {"id": 2, "name": "Jisoo", "age": 27, "langs": ["c++"]},
+  {"id": 3, "name": "Haneul", "age": 41, "langs": ["wave", "c++", "rust"]},
+  {"id": 4, "name": "Dohyun", "age": 30, "langs": []}
+]

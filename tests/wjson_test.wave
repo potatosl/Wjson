@@ -1,0 +1,302 @@
+// SPDX-License-Identifier: MIT
+//
+// End-to-end tests for wjson: Wave API -> Rust core + C++ native.
+// Run with:  wavec run build.wave
+
+import("wjson")::{
+    wjson_console_utf8,
+    JsonDoc, Json, JsonError, JsonWriter,
+    JSON_NULL, JSON_BOOL, JSON_NUMBER, JSON_STRING, JSON_ARRAY, JSON_OBJECT, JSON_INVALID,
+    JSON_RELAXED, JSON_ALLOW_COMMENTS, JSON_ERR_UNEXPECTED_CHAR, JSON_ERR_TOO_DEEP,
+    JSON_ERR_EMPTY, JSON_NUM_RANGE, JSON_NUM_INVALID, JSON_ESCAPE_ASCII, JSON_ESCAPE_HTML,
+    JSON_WRITER_OK, JSON_WRITER_ERR_STATE, JSON_WRITER_ERR_NUMBER, JSON_WRITER_ERR_INCOMPLETE,
+    JSON_WRITER_ERR_UTF8,
+    json_version, json_parse, json_parse_with, json_ok, json_error, json_root, json_free,
+    json_node_count, json_type, json_type_name, json_is_valid, json_is_null, json_is_integer,
+    json_len, json_get, json_at, json_key_at, json_has, json_pointer, json_as_bool,
+    json_as_str, json_number_text, json_as_i64, json_as_i64_checked, json_as_f64,
+    json_as_f64_checked, json_i64_or, json_str_or, json_str_eq, json_bool_or,
+    json_path, json_path_i64, json_path_str, json_path_f64,
+    json_writer_new, json_writer_set_escape, json_writer_status, json_writer_finish,
+    json_writer_free, json_writer_reset, json_str_is_null, json_begin_object, json_end_object,
+    json_begin_array, json_end_array, json_key, json_write_null, json_write_bool,
+    json_write_i64, json_write_f64, json_write_f64_fixed, json_write_str, json_write_raw,
+    json_field_str, json_field_i64, json_field_bool, json_field_f64,
+    json_write_value, json_to_string, json_to_string_with, json_string_free,
+    json_equal, json_depth,
+};
+
+static CHECKS: i32 = 0;
+static FAILURES: i32 = 0;
+
+fun check(cond: bool, label: str) {
+    CHECKS += 1;
+    if (!cond) {
+        FAILURES += 1;
+        println("FAIL: {}", label);
+    }
+}
+
+fun streq(a: str, b: str) -> bool {
+    var pa: ptr<u8> = a as ptr<u8>;
+    var pb: ptr<u8> = b as ptr<u8>;
+    if (pa == null || pb == null) {
+        return pa == pb;
+    }
+    var i: i64 = 0;
+    while (pa[i] != 0 && pa[i] == pb[i]) {
+        i += 1;
+    }
+    return pa[i] == pb[i];
+}
+
+const SAMPLE: str = "{\"name\":\"wjson\",\"version\":[0,1,0],\"ratio\":0.75,\"big\":12345678901234567890,\"ok\":true,\"nothing\":null,\"nested\":{\"list\":[{\"id\":7,\"tag\":\"a.b\"}],\"empty\":{}},\"text\":\"line\\nnext \\u00e9\\ud83d\\ude00\",\"a/b\":1,\"m~n\":2}";
+
+fun test_parse_and_navigate() {
+    var doc: JsonDoc = json_parse(SAMPLE);
+    check(json_ok(doc), "sample parses");
+    var root: Json = json_root(doc);
+    check(json_type(root) == JSON_OBJECT, "root is object");
+    check(json_len(root) == 10, "root has 10 members");
+    check(streq(json_key_at(root, 0), "name"), "first key");
+    check(json_str_is_null(json_key_at(root, 99)), "key out of range is null");
+
+    check(json_str_eq(json_get(root, "name"), "wjson"), "name");
+    check(!json_str_eq(json_get(root, "name"), "wjso"), "str_eq prefix mismatch");
+    check(json_len(json_get(root, "version")) == 3, "version len");
+    check(json_i64_or(json_at(json_get(root, "version"), 1), -1) == 1, "version[1]");
+
+    var ratio: f64 = 0.0;
+    check(json_as_f64(json_get(root, "ratio"), &ratio) && ratio == 0.75, "ratio f64");
+    var as_int: i64 = 0;
+    check(!json_as_i64(json_get(root, "ratio"), &as_int), "ratio is not i64");
+    check(!json_is_integer(json_get(root, "ratio")), "ratio not integer lexeme");
+
+    var big: i64 = 0;
+    check(json_as_i64_checked(json_get(root, "big"), &big) == JSON_NUM_RANGE, "big overflows i64");
+    var bigf: f64 = 0.0;
+    check(json_as_f64(json_get(root, "big"), &bigf) && bigf > 1.2e19, "big as f64");
+    check(streq(json_number_text(json_get(root, "big")), "12345678901234567890"), "lexeme kept");
+
+    var flag: bool = false;
+    check(json_as_bool(json_get(root, "ok"), &flag) && flag, "ok true");
+    check(json_is_null(json_get(root, "nothing")), "nothing null");
+    check(json_has(root, "nothing") && !json_has(root, "absent"), "has");
+
+    var missing: Json = json_get(json_get(json_get(root, "absent"), "x"), "y");
+    check(!json_is_valid(missing) && json_type(missing) == JSON_INVALID, "missing chain invalid");
+    check(json_i64_or(missing, 42) == 42, "default on missing");
+    check(streq(json_str_or(json_get(root, "ok"), "dflt"), "dflt"), "str_or wrong type");
+    check(json_str_is_null(json_as_str(json_get(root, "ok"))), "as_str on bool is null");
+
+    check(streq(json_as_str(json_get(root, "text")), "line\nnext \xC3\xA9\xF0\x9F\x98\x80"), "unicode escapes decoded");
+    check(json_len(json_get(root, "text")) == 16, "decoded byte length");
+    check(json_node_count(doc) > 15, "node count");
+
+    json_free(&doc);
+    json_free(&doc);  // double free is a no-op
+    check(!json_is_valid(json_root(doc)), "freed doc has no root");
+}
+
+fun test_pointer_and_path() {
+    var doc: JsonDoc = json_parse(SAMPLE);
+    var root: Json = json_root(doc);
+
+    check(json_i64_or(json_pointer(root, "/nested/list/0/id"), -1) == 7, "pointer id");
+    check(json_i64_or(json_pointer(root, "/a~1b"), -1) == 1, "pointer ~1");
+    check(json_i64_or(json_pointer(root, "/m~0n"), -1) == 2, "pointer ~0");
+    check(json_type(json_pointer(root, "")) == JSON_OBJECT, "empty pointer = self");
+    check(!json_is_valid(json_pointer(root, "/version/01")), "pointer leading zero");
+    check(!json_is_valid(json_pointer(root, "nested")), "pointer needs slash");
+
+    check(json_path_i64(root, "nested.list[0].id", -1) == 7, "path id");
+    check(json_path_i64(root, "$.nested.list[0].id", -1) == 7, "path with $");
+    check(json_path_i64(root, "version[2]", -1) == 0, "path index");
+    check(streq(json_path_str(root, "nested.list[0][\"tag\"]", ""), "a.b"), "path quoted key");
+    check(json_path_i64(root, "[\"a/b\"]", -1) == 1, "path quoted root key");
+    check(json_path_f64(root, "ratio", 0.0) == 0.75, "path f64");
+    check(json_type(json_path(root, "nested.empty")) == JSON_OBJECT, "path empty object");
+    check(json_type(json_path(root, "")) == JSON_OBJECT, "empty path = self");
+    check(!json_is_valid(json_path(root, "version[3]")), "path index out of range");
+    check(!json_is_valid(json_path(root, "nested..list")), "path empty segment");
+    check(!json_is_valid(json_path(root, "version[x]")), "path bad index");
+    check(!json_is_valid(json_path(root, "version[1")), "path unclosed bracket");
+    check(!json_is_valid(json_path(root, "name.x")), "path through string");
+    check(json_path_i64(root, "nope.deeper[3]", 9) == 9, "path default");
+
+    json_free(&doc);
+}
+
+fun test_errors() {
+    var doc: JsonDoc = json_parse("{\n  \"a\": [1, 2,]\n}");
+    check(!json_ok(doc), "trailing comma rejected");
+    var err: JsonError = json_error(doc);
+    check(err.code == JSON_ERR_UNEXPECTED_CHAR, "error code");
+    check(err.line == 2 && err.column == 14, "error line/column");
+    check(streq(err.message, "unexpected character"), "error message");
+    check(!json_is_valid(json_root(doc)), "no root on error");
+    json_free(&doc);
+
+    var relaxed: JsonDoc = json_parse_with("// cfg\n{\"a\": [1, 2,], /* x */ }", 0, JSON_RELAXED);
+    check(json_ok(relaxed), "relaxed parse");
+    json_free(&relaxed);
+
+    var empty: JsonDoc = json_parse("   ");
+    check(json_error(empty).code == JSON_ERR_EMPTY, "empty input");
+    json_free(&empty);
+
+    var deep: JsonDoc = json_parse_with("[[[[[1]]]]]", 3, JSON_ALLOW_COMMENTS);
+    check(json_error(deep).code == JSON_ERR_TOO_DEEP, "depth limit");
+    json_free(&deep);
+
+    var ok: JsonDoc = json_parse("[[[[[1]]]]]");
+    check(json_depth(json_root(ok)) == 5, "depth of nested arrays");
+    json_free(&ok);
+}
+
+fun test_writer() {
+    var w: JsonWriter = json_writer_new(0);
+    json_begin_object(&w);
+    json_field_str(&w, "name", "wave \"lang\"\n");
+    json_field_i64(&w, "count", -42);
+    json_field_f64(&w, "pi", 3.14159);
+    json_field_bool(&w, "on", true);
+    json_key(&w, "list");
+    json_begin_array(&w);
+    json_write_i64(&w, 1);
+    json_write_f64(&w, 0.1);
+    json_write_null(&w);
+    json_begin_object(&w);
+    json_end_object(&w);
+    json_begin_array(&w);
+    json_end_array(&w);
+    json_end_array(&w);
+    json_key(&w, "price");
+    json_write_f64_fixed(&w, 19.5, 2);
+    json_end_object(&w);
+    var compact: str = json_writer_finish(&w);
+    check(streq(compact, "{\"name\":\"wave \\\"lang\\\"\\n\",\"count\":-42,\"pi\":3.14159,\"on\":true,\"list\":[1,0.1,null,{},[]],\"price\":19.50}"), "compact writer output");
+
+    // What we wrote must parse back to the same structure.
+    var back: JsonDoc = json_parse(compact);
+    check(json_ok(back), "writer output parses");
+    check(json_path_i64(json_root(back), "count", 0) == -42, "round trip count");
+    json_free(&back);
+    json_writer_free(&w);
+
+    var p: JsonWriter = json_writer_new(2);
+    json_begin_object(&p);
+    json_field_i64(&p, "a", 1);
+    json_key(&p, "b");
+    json_begin_array(&p);
+    json_write_bool(&p, false);
+    json_write_str(&p, "x");
+    json_end_array(&p);
+    json_end_object(&p);
+    check(streq(json_writer_finish(&p), "{\n  \"a\": 1,\n  \"b\": [\n    false,\n    \"x\"\n  ]\n}"), "pretty writer output");
+    json_writer_free(&p);
+
+    var e: JsonWriter = json_writer_new(0);
+    json_writer_set_escape(&e, JSON_ESCAPE_ASCII | JSON_ESCAPE_HTML);
+    json_write_str(&e, "<\xC3\xA9>");
+    check(streq(json_writer_finish(&e), "\"\\u003c\\u00e9\\u003e\""), "ascii+html escaping");
+    json_writer_free(&e);
+}
+
+fun test_writer_errors() {
+    var w: JsonWriter = json_writer_new(0);
+    json_begin_object(&w);
+    json_write_i64(&w, 1);                      // value without key
+    check(json_writer_status(&w) == JSON_WRITER_ERR_STATE, "value without key");
+    check(json_str_is_null(json_writer_finish(&w)), "finish refuses error state");
+
+    json_writer_reset(&w);
+    json_begin_array(&w);
+    json_end_object(&w);                        // mismatched close
+    check(json_writer_status(&w) == JSON_WRITER_ERR_STATE, "mismatched close");
+
+    json_writer_reset(&w);
+    json_begin_array(&w);
+    check(json_str_is_null(json_writer_finish(&w)), "incomplete document");
+    check(json_writer_status(&w) == JSON_WRITER_ERR_INCOMPLETE, "incomplete status");
+
+    json_writer_reset(&w);
+    json_write_i64(&w, 1);
+    json_write_i64(&w, 2);                      // second top-level value
+    check(json_writer_status(&w) == JSON_WRITER_ERR_STATE, "two top-level values");
+
+    json_writer_reset(&w);
+    var zero: f64 = 0.0;
+    json_write_f64(&w, 1.0 / zero);
+    check(json_writer_status(&w) == JSON_WRITER_ERR_NUMBER, "infinity rejected");
+
+    json_writer_reset(&w);
+    json_begin_object(&w);
+    json_key(&w, "k");
+    json_key(&w, "k2");                         // key after key
+    check(json_writer_status(&w) == JSON_WRITER_ERR_STATE, "key after key");
+
+    json_writer_reset(&w);
+    json_write_raw(&w, "[1, 2]");
+    check(streq(json_writer_finish(&w), "[1, 2]"), "raw fragment");
+    json_writer_free(&w);
+}
+
+fun test_tree() {
+    var doc: JsonDoc = json_parse(SAMPLE);
+    var root: Json = json_root(doc);
+
+    var compact: str = json_to_string(root, 0);
+    check(!json_str_is_null(compact), "to_string works");
+    var again: JsonDoc = json_parse(compact);
+    check(json_ok(again), "serialized text re-parses");
+    check(json_equal(root, json_root(again)), "round trip is deep-equal");
+    check(streq(json_path_str(json_root(again), "text", ""), json_path_str(root, "text", "?")), "unicode survives round trip");
+    check(streq(json_number_text(json_get(json_root(again), "big")), "12345678901234567890"), "number lexeme preserved");
+
+    var pretty: str = json_to_string(json_get(root, "version"), 4);
+    check(streq(pretty, "[\n    0,\n    1,\n    0\n]"), "pretty to_string");
+
+    var ascii: str = json_to_string_with(json_get(root, "text"), 0, JSON_ESCAPE_ASCII);
+    check(streq(ascii, "\"line\\nnext \\u00e9\\ud83d\\ude00\""), "ascii to_string");
+
+    check(json_str_is_null(json_to_string(json_get(root, "absent"), 0)), "invalid value to_string");
+
+    var a: JsonDoc = json_parse("{\"x\": [1, 2.0, {\"k\": \"v\"}], \"y\": null}");
+    var b: JsonDoc = json_parse("{\"y\": null, \"x\": [1e0, 2, {\"k\": \"v\"}]}");
+    var c: JsonDoc = json_parse("{\"y\": null, \"x\": [1, 2, {\"k\": \"w\"}]}");
+    check(json_equal(json_root(a), json_root(b)), "equal ignores member order and number spelling");
+    check(!json_equal(json_root(a), json_root(c)), "nested difference detected");
+    check(!json_equal(json_root(a), json_get(json_root(a), "nope")), "invalid never equal");
+
+    json_string_free(compact);
+    json_string_free(pretty);
+    json_string_free(ascii);
+    json_free(&again);
+    json_free(&a);
+    json_free(&b);
+    json_free(&c);
+    json_free(&doc);
+}
+
+fun test_misc() {
+    check(streq(json_version(), "0.3.0"), "core version");
+    check(streq(json_type_name(JSON_ARRAY), "array"), "type name");
+    check(streq(json_type_name(JSON_INVALID), "invalid"), "invalid type name");
+}
+
+fun main() -> i32 {
+    wjson_console_utf8();
+    test_parse_and_navigate();
+    test_pointer_and_path();
+    test_errors();
+    test_writer();
+    test_writer_errors();
+    test_tree();
+    test_misc();
+    println("wjson_test: {}/{} checks passed", CHECKS - FAILURES, CHECKS);
+    if (FAILURES != 0) {
+        return 1;
+    }
+    return 0;
+}

@@ -1,0 +1,18 @@
+# build outputs
+/build/
+/target/
+/core/target/
+/chain/target/
+*.o
+*.obj
+*.a
+*.lib
+*.exe
+*.pdb
+
+# logs written by setup-windows.ps1
+/setup-log.txt
+/run-log.txt
+
+# written by examples/survey_report.wave
+/examples/data/survey_report.json

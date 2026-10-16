@@ -1,0 +1,14 @@
+{
+  // Comments and trailing commas are accepted with JSON_RELAXED.
+  "service": "wave-gateway",
+  "server": {
+    "host": "0.0.0.0",
+    "ports": [8080, 8443],
+    "tls": true,
+  },
+  "limits": { "max_body_mb": 12.5, "timeout_ms": 3000 },
+  "routes": [
+    { "path": "/api", "upstream": "http://10.0.0.5:9000" },
+    { "path": "/static", "upstream": "file:///srv/www" },
+  ],
+}

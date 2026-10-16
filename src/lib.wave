@@ -1,0 +1,93 @@
+// SPDX-License-Identifier: MIT
+//
+// wjson — JSON for Wave.
+//
+// Parsing runs in a Rust core, number conversion and string escaping in a
+// C++ layer, and everything you call lives here in Wave:
+//
+//   import("wjson")::{JsonDoc, Json, json_parse, json_ok, json_root,
+//                     json_path, json_as_str, json_free};
+//
+// Modules:
+//   consts : type tags, parse flags, error and status codes
+//   value  : parse, inspect, navigate, read scalars
+//   path   : dotted path queries ("a.b[0]")
+//   writer : streaming JSON writer
+//   tree   : serialize parsed values, deep equality, depth
+//   edit   : create values, modify objects/arrays, build documents
+//   stream : incremental pull parser and file streaming for huge inputs
+
+pub import("./consts")::{
+    JSON_INVALID, JSON_NULL, JSON_BOOL, JSON_NUMBER, JSON_STRING, JSON_ARRAY, JSON_OBJECT,
+    JSON_STRICT, JSON_ALLOW_TRAILING_COMMAS, JSON_ALLOW_COMMENTS, JSON_RELAXED,
+    JSON_OK, JSON_ERR_EMPTY, JSON_ERR_UNEXPECTED_CHAR, JSON_ERR_UNEXPECTED_END,
+    JSON_ERR_INVALID_NUMBER, JSON_ERR_INVALID_STRING, JSON_ERR_INVALID_ESCAPE,
+    JSON_ERR_INVALID_UNICODE, JSON_ERR_CONTROL_CHAR, JSON_ERR_INVALID_UTF8,
+    JSON_ERR_TRAILING_DATA, JSON_ERR_TOO_DEEP, JSON_ERR_TOO_LARGE, JSON_ERR_INVALID_ARGUMENT,
+    JSON_NUM_OK, JSON_NUM_INVALID, JSON_NUM_RANGE, JSON_NUM_NONFINITE,
+    JSON_ESCAPE_DEFAULT, JSON_ESCAPE_ASCII, JSON_ESCAPE_HTML,
+    JSON_EV_ERROR, JSON_EV_NEED_MORE, JSON_EV_OBJECT_START, JSON_EV_OBJECT_END,
+    JSON_EV_ARRAY_START, JSON_EV_ARRAY_END, JSON_EV_KEY, JSON_EV_STRING, JSON_EV_NUMBER,
+    JSON_EV_TRUE, JSON_EV_FALSE, JSON_EV_NULL, JSON_EV_END, JSON_STREAM_MULTI,
+    JSON_EDIT_OK, JSON_EDIT_INVALID, JSON_EDIT_ATTACHED, JSON_EDIT_CYCLE,
+    JSON_EDIT_NOT_FOUND, JSON_EDIT_WRONG_TYPE, JSON_EDIT_BAD_VALUE,
+    JSON_WRITER_OK, JSON_WRITER_ERR_STATE, JSON_WRITER_ERR_ALLOC, JSON_WRITER_ERR_NUMBER,
+    JSON_WRITER_ERR_UTF8, JSON_WRITER_ERR_INCOMPLETE,
+    json_type_name, json_null_str, json_str_is_null, wjson_console_utf8,
+};
+
+pub import("./value")::{
+    JsonDoc, Json, JsonError,
+    json_version, json_parse, json_parse_with, json_parse_bytes, json_ok, json_error,
+    json_root, json_node_count, json_free,
+    json_type, json_is_valid, json_is_null, json_is_bool, json_is_number, json_is_string,
+    json_is_array, json_is_object, json_is_integer, json_len,
+    json_get, json_get_bytes, json_at, json_key_at, json_has, json_pointer,
+    json_as_bool, json_as_str, json_as_bytes, json_number_text,
+    json_as_i64, json_as_i64_checked, json_as_f64, json_as_f64_checked,
+    json_i64_or, json_f64_or, json_bool_or, json_str_or, json_str_eq,
+};
+
+pub import("./path")::{
+    json_path, json_path_i64, json_path_f64, json_path_bool, json_path_str,
+};
+
+pub import("./writer")::{
+    JsonWriter, json_writer_new, json_writer_set_escape, json_writer_status,
+    json_writer_len, json_writer_reset, json_writer_free, json_writer_finish,
+    json_begin_object, json_end_object, json_begin_array, json_end_array,
+    json_key, json_key_bytes,
+    json_write_null, json_write_bool, json_write_i64, json_write_f64, json_write_f64_fixed,
+    json_write_str, json_write_str_bytes, json_write_raw, json_write_raw_bytes,
+    json_field_str, json_field_i64, json_field_f64, json_field_bool, json_field_null,
+};
+
+pub import("./tree")::{
+    json_write_value, json_to_string, json_to_string_with, json_string_free,
+    json_equal, json_depth,
+};
+
+pub import("./edit")::{
+    json_new_document, json_set_root, json_edit_error,
+    json_new_null, json_new_bool, json_new_i64, json_new_f64, json_new_number_text, json_new_number_bytes, json_new_f64_fixed,
+    json_new_str, json_new_str_bytes, json_new_array, json_new_object, json_copy,
+    json_parent, json_is_attached,
+    json_set, json_set_bytes, json_set_null, json_set_bool, json_set_i64, json_set_f64,
+    json_set_str, json_set_object, json_set_array, json_remove,
+    json_push, json_push_null, json_push_bool, json_push_i64, json_push_f64, json_push_str,
+    json_push_object, json_push_array, json_insert, json_replace, json_remove_at, json_clear,
+    json_set_path, json_set_path_i64, json_set_path_f64, json_set_path_str, json_set_path_bool,
+    json_remove_path,
+};
+
+pub import("./stream")::{
+    JsonReader, JsonStream,
+    json_reader_new, json_reader_new_with, json_reader_free, json_reader_feed,
+    json_reader_feed_str, json_reader_finish, json_reader_next, json_reader_text,
+    json_reader_text_bytes, json_reader_text_eq, json_reader_i64, json_reader_f64,
+    json_reader_depth, json_reader_documents, json_reader_buffered, json_reader_error,
+    json_stream_open, json_stream_open_with, json_stream_next, json_stream_skip,
+    json_stream_text, json_stream_text_bytes, json_stream_text_eq, json_stream_i64,
+    json_stream_f64, json_stream_depth, json_stream_documents, json_stream_bytes_read,
+    json_stream_buffered, json_stream_error, json_stream_io_error, json_stream_close,
+};

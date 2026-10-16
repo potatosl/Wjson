@@ -1,0 +1,130 @@
+// SPDX-License-Identifier: MIT
+//
+// Dotted path queries over parsed values — friendlier than JSON Pointer for
+// hand-written lookups:
+//
+//   json_path(root, "server.ports[0]")
+//   json_path(root, "$.users[2].name")       // optional leading "$"
+//   json_path(root, "headers[\"x.trace-id\"]") // quoted key with '.' or '['
+//
+// Grammar:  path    := ["$"] [key] segment*
+//           segment := "." key | "[" digits "]" | "[\"" chars "\"]"
+//           key     := one or more bytes other than '.', '[' and NUL
+// Quoted keys end at the next '"' (no escapes). Any syntax error, missing
+// key or out-of-range index yields an invalid Json.
+
+import("./value")::{
+    Json, json_get_bytes, json_at, json_is_valid,
+    json_i64_or, json_f64_or, json_bool_or, json_str_or,
+};
+
+fun _invalid(v: Json) -> Json {
+    return Json { doc: v.doc, node: -1 };
+}
+
+fun _is_digit(c: u8) -> bool {
+    return c >= 48 && c <= 57;
+}
+
+// Reads a bare key starting at p[start]; returns the index one past its end.
+fun _key_end(p: ptr<u8>, start: i64) -> i64 {
+    var i: i64 = start;
+    while (p[i] != 0 && p[i] != 46 && p[i] != 91) {   // '.', '['
+        i += 1;
+    }
+    return i;
+}
+
+pub fun json_path(v: Json, path: str) -> Json {
+    var p: ptr<u8> = path as ptr<u8>;
+    var cur: Json = v;
+    var i: i64 = 0;
+
+    if (p == null) {
+        return _invalid(v);
+    }
+    if (p[0] == 36) {           // '$'
+        i = 1;
+    }
+
+    // Optional leading bare key: "a.b" == ".a.b".
+    if (p[i] != 0 && p[i] != 46 && p[i] != 91) {
+        var end0: i64 = _key_end(p, i);
+        cur = json_get_bytes(cur, p + i, end0 - i);
+        i = end0;
+    }
+
+    while (p[i] != 0) {
+        if (!json_is_valid(cur)) {
+            return cur;
+        }
+
+        if (p[i] == 46) {       // '.' key
+            var end: i64 = _key_end(p, i + 1);
+            if (end == i + 1) {
+                return _invalid(v);
+            }
+            cur = json_get_bytes(cur, p + i + 1, end - i - 1);
+            i = end;
+            continue;
+        }
+
+        if (p[i] != 91) {       // must be '['
+            return _invalid(v);
+        }
+        i += 1;
+
+        if (p[i] == 34) {       // ["quoted key"]
+            var qs: i64 = i + 1;
+            var qe: i64 = qs;
+            while (p[qe] != 0 && p[qe] != 34) {
+                qe += 1;
+            }
+            if (p[qe] != 34 || p[qe + 1] != 93) {
+                return _invalid(v);
+            }
+            cur = json_get_bytes(cur, p + qs, qe - qs);
+            i = qe + 2;
+            continue;
+        }
+
+        // [index]
+        if (!_is_digit(p[i])) {
+            return _invalid(v);
+        }
+        var index: i64 = 0;
+        var digits: i32 = 0;
+        while (_is_digit(p[i])) {
+            if (digits >= 18) {
+                return _invalid(v);
+            }
+            index = index * 10 + (p[i] - 48) as i64;
+            digits += 1;
+            i += 1;
+        }
+        if (p[i] != 93) {       // ']'
+            return _invalid(v);
+        }
+        i += 1;
+        cur = json_at(cur, index);
+    }
+    return cur;
+}
+
+// json_path, then a typed default — the common "read a config value" case.
+
+pub fun json_path_i64(v: Json, path: str, fallback: i64) -> i64 {
+    return json_i64_or(json_path(v, path), fallback);
+}
+
+pub fun json_path_f64(v: Json, path: str, fallback: f64) -> f64 {
+    return json_f64_or(json_path(v, path), fallback);
+}
+
+pub fun json_path_bool(v: Json, path: str, fallback: bool) -> bool {
+    return json_bool_or(json_path(v, path), fallback);
+}
+
+pub fun json_path_str(v: Json, path: str, fallback: str) -> str {
+    return json_str_or(json_path(v, path), fallback);
+}

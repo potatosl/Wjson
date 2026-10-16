@@ -1,0 +1,326 @@
+// SPDX-License-Identifier: MIT
+//
+// Streaming (pull) parsing for inputs too big to hold in memory.
+//
+// Two layers:
+//
+//  * JsonReader — you feed bytes, it hands back events. When a token is cut by
+//    a chunk boundary it returns JSON_EV_NEED_MORE; feed more (or call
+//    json_reader_finish) and ask again.
+//
+//  * JsonStream — a JsonReader bound to a file. It reads the file in chunks
+//    by itself, so json_stream_next never returns NEED_MORE:
+//
+//      var s: JsonStream = json_stream_open("big.json", 0);
+//      var ev: i32 = json_stream_next(&s);
+//      while (ev != JSON_EV_END && ev != JSON_EV_ERROR) {
+//          if (ev == JSON_EV_KEY && json_stream_text_eq(&s, "id")) { ... }
+//          ev = json_stream_next(&s);
+//      }
+//      json_stream_close(&s);
+//
+// Memory use is bounded by the chunk size plus the largest single token
+// (one string or number), not by the size of the input.
+//
+// Events: JSON_EV_OBJECT_START/END, ARRAY_START/END, KEY, STRING, NUMBER,
+// TRUE, FALSE, NULL, END (input exhausted) and ERROR. The text of the last
+// KEY/STRING (decoded) or NUMBER (as written) is available until the next
+// call. Flags: JSON_ALLOW_TRAILING_COMMAS, JSON_ALLOW_COMMENTS and
+// JSON_STREAM_MULTI (a sequence of top-level values, e.g. JSON Lines).
+
+import("std::fs::file")::{open_read};
+import("std::io::fd")::{io_read, io_close};
+import("std::mem::alloc")::{mem_alloc, mem_free};
+import("./ffi")::{
+    ffi_reader_new, ffi_reader_free, ffi_reader_feed, ffi_reader_finish, ffi_reader_next,
+    ffi_reader_text, ffi_reader_depth, ffi_reader_documents, ffi_reader_buffered,
+    ffi_reader_error_code, ffi_reader_error_message, ffi_reader_error_offset,
+    ffi_reader_error_line, ffi_reader_error_column, ffi_parse_i64, ffi_parse_f64,
+};
+import("./consts")::{
+    JSON_EV_ERROR, JSON_EV_NEED_MORE, JSON_EV_OBJECT_START, JSON_EV_OBJECT_END,
+    JSON_EV_ARRAY_START, JSON_EV_ARRAY_END, JSON_EV_END, JSON_NUM_OK, JSON_ERR_INVALID_ARGUMENT,
+};
+import("./value")::{JsonError};
+
+pub struct JsonReader {
+    handle: ptr<u8>;
+}
+
+fun _len(p: ptr<u8>) -> i64 {
+    if (p == null) {
+        return 0;
+    }
+    var n: i64 = 0;
+    while (p[n] != 0) {
+        n += 1;
+    }
+    return n;
+}
+
+fun _bytes_eq_str(p: ptr<u8>, n: i64, text: str) -> bool {
+    var t: ptr<u8> = text as ptr<u8>;
+    var i: i64 = 0;
+    while (i < n) {
+        if (t[i] == 0 || t[i] != p[i]) {
+            return false;
+        }
+        i += 1;
+    }
+    return t[n] == 0;
+}
+
+// ---- JsonReader --------------------------------------------------------------
+
+pub fun json_reader_new(flags: u32) -> JsonReader {
+    return JsonReader { handle: ffi_reader_new(0, flags) };
+}
+
+pub fun json_reader_new_with(max_depth: i32, flags: u32) -> JsonReader {
+    return JsonReader { handle: ffi_reader_new(max_depth, flags) };
+}
+
+pub fun json_reader_free(r: ptr<JsonReader>) {
+    if (r == null) {
+        return;
+    }
+    ffi_reader_free(deref r.handle);
+    deref r.handle = null;
+}
+
+// Appends input; false after json_reader_finish.
+pub fun json_reader_feed(r: JsonReader, data: ptr<u8>, n: i64) -> bool {
+    return ffi_reader_feed(r.handle, data, n) == 0;
+}
+
+pub fun json_reader_feed_str(r: JsonReader, text: str) -> bool {
+    var p: ptr<u8> = text as ptr<u8>;
+    return ffi_reader_feed(r.handle, p, _len(p)) == 0;
+}
+
+// No more input will come.
+pub fun json_reader_finish(r: JsonReader) {
+    ffi_reader_finish(r.handle);
+}
+
+pub fun json_reader_next(r: JsonReader) -> i32 {
+    return ffi_reader_next(r.handle);
+}
+
+// Text of the last KEY/STRING/NUMBER event (valid until the next call).
+pub fun json_reader_text(r: JsonReader) -> str {
+    var n: i64 = 0;
+    return ffi_reader_text(r.handle, &n) as str;
+}
+
+pub fun json_reader_text_bytes(r: JsonReader, len_out: ptr<i64>) -> ptr<u8> {
+    return ffi_reader_text(r.handle, len_out);
+}
+
+pub fun json_reader_text_eq(r: JsonReader, text: str) -> bool {
+    var n: i64 = 0;
+    var p: ptr<u8> = ffi_reader_text(r.handle, &n);
+    return _bytes_eq_str(p, n, text);
+}
+
+// Value of the last NUMBER event; false if it is not an integer that fits.
+pub fun json_reader_i64(r: JsonReader, result: ptr<i64>) -> bool {
+    var n: i64 = 0;
+    var p: ptr<u8> = ffi_reader_text(r.handle, &n);
+    return ffi_parse_i64(p, n, result) == JSON_NUM_OK;
+}
+
+pub fun json_reader_f64(r: JsonReader, result: ptr<f64>) -> bool {
+    var n: i64 = 0;
+    var p: ptr<u8> = ffi_reader_text(r.handle, &n);
+    return ffi_parse_f64(p, n, result) == JSON_NUM_OK;
+}
+
+// Current nesting depth (1 right after the outermost '{' or '[').
+pub fun json_reader_depth(r: JsonReader) -> i32 {
+    return ffi_reader_depth(r.handle);
+}
+
+// Number of complete top-level values read so far.
+pub fun json_reader_documents(r: JsonReader) -> i64 {
+    return ffi_reader_documents(r.handle);
+}
+
+// Bytes of input currently held by the reader.
+pub fun json_reader_buffered(r: JsonReader) -> i64 {
+    return ffi_reader_buffered(r.handle);
+}
+
+pub fun json_reader_error(r: JsonReader) -> JsonError {
+    return JsonError {
+        code: ffi_reader_error_code(r.handle),
+        message: ffi_reader_error_message(r.handle) as str,
+        offset: ffi_reader_error_offset(r.handle),
+        line: ffi_reader_error_line(r.handle),
+        column: ffi_reader_error_column(r.handle),
+    };
+}
+
+// ---- JsonStream ----------------------------------------------------------------
+
+pub struct JsonStream {
+    reader: JsonReader;
+    fd: i64;
+    chunk: ptr<u8>;
+    chunk_size: i64;
+    finished: bool;
+    io_error: i64;
+    bytes_read: i64;
+}
+
+const DEFAULT_CHUNK: i64 = 65536;
+
+// Opens `path` for streaming. On failure the stream reports JSON_EV_ERROR
+// immediately and json_stream_io_error() gives the OS error code.
+pub fun json_stream_open(path: str, flags: u32) -> JsonStream {
+    return json_stream_open_with(path, flags, DEFAULT_CHUNK);
+}
+
+pub fun json_stream_open_with(path: str, flags: u32, chunk_size: i64) -> JsonStream {
+    var size: i64 = chunk_size;
+    if (size < 16) {
+        size = 16;
+    }
+    var fd: i64 = open_read(path);
+    var s: JsonStream = JsonStream {
+        reader: json_reader_new(flags),
+        fd: fd,
+        chunk: null,
+        chunk_size: size,
+        finished: false,
+        io_error: 0,
+        bytes_read: 0,
+    };
+    if (fd < 0) {
+        s.io_error = fd;
+        s.finished = true;
+        return s;
+    }
+    s.chunk = mem_alloc(size);
+    return s;
+}
+
+// Next event; reads more of the file whenever the reader needs it.
+pub fun json_stream_next(s: ptr<JsonStream>) -> i32 {
+    if (deref s.io_error != 0) {
+        return JSON_EV_ERROR;
+    }
+    var r: JsonReader = deref s.reader;
+    var ev: i32 = ffi_reader_next(r.handle);
+    while (ev == JSON_EV_NEED_MORE) {
+        if (deref s.finished) {
+            ffi_reader_finish(r.handle);
+        } else {
+            var n: i64 = io_read(deref s.fd, deref s.chunk, deref s.chunk_size);
+            if (n < 0) {
+                deref s.io_error = n;
+                return JSON_EV_ERROR;
+            }
+            if (n == 0) {
+                deref s.finished = true;
+                ffi_reader_finish(r.handle);
+            } else {
+                deref s.bytes_read = deref s.bytes_read + n;
+                ffi_reader_feed(r.handle, deref s.chunk, n);
+            }
+        }
+        ev = ffi_reader_next(r.handle);
+    }
+    return ev;
+}
+
+// After an OBJECT_START or ARRAY_START, skips the rest of that container
+// (everything up to and including its matching END). Returns the END event,
+// or JSON_EV_ERROR / JSON_EV_END if the input breaks off.
+pub fun json_stream_skip(s: ptr<JsonStream>) -> i32 {
+    var r: JsonReader = deref s.reader;
+    var target: i32 = ffi_reader_depth(r.handle) - 1;
+    var ev: i32 = 0;
+    while (true) {
+        ev = json_stream_next(s);
+        if (ev == JSON_EV_ERROR || ev == JSON_EV_END) {
+            return ev;
+        }
+        if ((ev == JSON_EV_OBJECT_END || ev == JSON_EV_ARRAY_END) && ffi_reader_depth(r.handle) == target) {
+            return ev;
+        }
+    }
+    return ev;
+}
+
+pub fun json_stream_text(s: ptr<JsonStream>) -> str {
+    return json_reader_text(deref s.reader);
+}
+
+pub fun json_stream_text_bytes(s: ptr<JsonStream>, len_out: ptr<i64>) -> ptr<u8> {
+    return json_reader_text_bytes(deref s.reader, len_out);
+}
+
+pub fun json_stream_text_eq(s: ptr<JsonStream>, text: str) -> bool {
+    return json_reader_text_eq(deref s.reader, text);
+}
+
+pub fun json_stream_i64(s: ptr<JsonStream>, result: ptr<i64>) -> bool {
+    return json_reader_i64(deref s.reader, result);
+}
+
+pub fun json_stream_f64(s: ptr<JsonStream>, result: ptr<f64>) -> bool {
+    return json_reader_f64(deref s.reader, result);
+}
+
+pub fun json_stream_depth(s: ptr<JsonStream>) -> i32 {
+    return json_reader_depth(deref s.reader);
+}
+
+pub fun json_stream_documents(s: ptr<JsonStream>) -> i64 {
+    return json_reader_documents(deref s.reader);
+}
+
+// Bytes read from the file so far.
+pub fun json_stream_bytes_read(s: ptr<JsonStream>) -> i64 {
+    return deref s.bytes_read;
+}
+
+// Bytes the reader currently holds (stays small for any file size).
+pub fun json_stream_buffered(s: ptr<JsonStream>) -> i64 {
+    return json_reader_buffered(deref s.reader);
+}
+
+// Parse error details (code 0 when the error was an I/O failure; see
+// json_stream_io_error).
+pub fun json_stream_error(s: ptr<JsonStream>) -> JsonError {
+    if (deref s.io_error != 0) {
+        return JsonError {
+            code: JSON_ERR_INVALID_ARGUMENT,
+            message: "cannot read input file",
+            offset: deref s.bytes_read,
+            line: 0,
+            column: 0,
+        };
+    }
+    return json_reader_error(deref s.reader);
+}
+
+// OS error code of a failed open/read (0 when none).
+pub fun json_stream_io_error(s: ptr<JsonStream>) -> i64 {
+    return deref s.io_error;
+}
+
+pub fun json_stream_close(s: ptr<JsonStream>) {
+    if (deref s.fd >= 0) {
+        io_close(deref s.fd);
+        deref s.fd = -1;
+    }
+    if (deref s.chunk != null) {
+        mem_free(deref s.chunk, deref s.chunk_size);
+        deref s.chunk = null;
+    }
+    var r: JsonReader = deref s.reader;
+    ffi_reader_free(r.handle);
+    deref s.reader = JsonReader { handle: null };
+}

@@ -1,0 +1,81 @@
+// SPDX-License-Identifier: MIT
+//
+// Reads examples/config.json (comments + trailing commas) and pulls typed
+// settings out with path queries.
+//
+//   WJSON_RUN=examples/config.wave wavec run build.wave   (run from the repo root;
+//                                                  the file is resolved
+//                                                  relative to examples/)
+
+import("std::fs::file")::{fs_read_all, fs_file_size};
+import("std::mem::alloc")::{mem_alloc, mem_free};
+import("wjson")::{
+    wjson_console_utf8,
+    JsonDoc, Json, JsonError, JSON_RELAXED,
+    json_parse_bytes, json_ok, json_error, json_root, json_free, json_len,
+    json_path, json_path_str, json_path_i64, json_path_f64, json_path_bool, json_at,
+    json_as_str, json_i64_or, json_get,
+};
+
+fun load(path: str, doc: ptr<JsonDoc>) -> bool {
+    var size: i64 = fs_file_size(path);
+    if (size < 0) {
+        println("cannot stat {} (error {})", path, size);
+        return false;
+    }
+    var data: ptr<u8> = mem_alloc(size + 1);
+    var n: i64 = fs_read_all(path, data, size);
+    if (n < 0) {
+        println("cannot read {} (error {})", path, n);
+        mem_free(data, size + 1);
+        return false;
+    }
+    // The parser copies what it keeps, so the file buffer can go right away.
+    deref doc = json_parse_bytes(data, n, 0, JSON_RELAXED);
+    mem_free(data, size + 1);
+
+    if (!json_ok(deref doc)) {
+        var err: JsonError = json_error(deref doc);
+        println("{}:{}:{}: {}", path, err.line, err.column, err.message);
+        return false;
+    }
+    return true;
+}
+
+fun yes_no(b: bool) -> str {
+    if (b) {
+        return "yes";
+    }
+    return "no";
+}
+
+fun main() -> i32 {
+    wjson_console_utf8();
+    var doc: JsonDoc = JsonDoc { handle: null };
+    if (!load("config.json", &doc)) {
+        json_free(&doc);
+        return 1;
+    }
+    var cfg: Json = json_root(doc);
+
+    println("service      : {}", json_path_str(cfg, "service", "?"));
+    println("listen       : {}:{}", json_path_str(cfg, "server.host", "127.0.0.1"),
+            json_path_i64(cfg, "server.ports[0]", 80));
+    println("tls port     : {}", json_path_i64(cfg, "server.ports[1]", -1));
+    println("tls enabled  : {}", yes_no(json_path_bool(cfg, "server.tls", false)));
+    println("max body MB  : {}", json_path_f64(cfg, "limits.max_body_mb", 1.0));
+    println("timeout ms   : {}", json_path_i64(cfg, "limits.timeout_ms", 1000));
+    println("retries      : {} (default, not in file)", json_path_i64(cfg, "limits.retries", 3));
+
+    var routes: Json = json_path(cfg, "routes");
+    var i: i64 = 0;
+    while (i < json_len(routes)) {
+        var r: Json = json_at(routes, i);
+        println("route        : {} -> {}", json_as_str(json_get(r, "path")),
+                json_as_str(json_get(r, "upstream")));
+        i += 1;
+    }
+
+    json_free(&doc);
+    return 0;
+}

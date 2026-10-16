@@ -1,0 +1,235 @@
+// SPDX-License-Identifier: MIT
+//
+// Whole-tree operations on parsed values: serialization back to text,
+// deep equality, and structural statistics.
+//
+//   var text: str = json_to_string(root, 2);   // pretty, 2-space indent
+//   println("{}", text);
+//   json_string_free(text);
+
+import("std::mem::alloc")::{mem_alloc, mem_free};
+import("./ffi")::{ffi_num};
+import("./consts")::{
+    JSON_NULL, JSON_BOOL, JSON_NUMBER, JSON_STRING, JSON_ARRAY, JSON_OBJECT,
+    JSON_ESCAPE_DEFAULT, json_null_str, json_str_is_null,
+};
+import("./value")::{
+    Json, json_type, json_len, json_at, json_key_at, json_get_bytes,
+    json_as_bool, json_as_bytes, json_as_f64, json_is_valid,
+};
+import("./writer")::{
+    JsonWriter, json_writer_new, json_writer_set_escape, json_writer_finish,
+    json_writer_free, json_writer_len, json_writer_status, json_begin_object,
+    json_end_object, json_begin_array, json_end_array, json_key_bytes,
+    json_write_null, json_write_bool, json_write_str_bytes, json_write_raw_bytes,
+};
+
+fun _key_bytes(v: Json, index: i64, key_len: ptr<i64>) -> ptr<u8> {
+    var key: ptr<u8> = json_key_at(v, index) as ptr<u8>;
+    var n: i64 = 0;
+    // Keys are NUL-terminated by the core; embedded "\u0000" in keys is
+    // truncated here, which only affects pathological documents.
+    if (key != null) {
+        while (key[n] != 0) {
+            n += 1;
+        }
+    }
+    deref key_len = n;
+    return key;
+}
+
+// Appends v (recursively) to a writer, in the writer's current position.
+// Numbers are copied as their original lexemes, so no precision is lost.
+pub fun json_write_value(w: ptr<JsonWriter>, v: Json) -> bool {
+    var kind: i32 = json_type(v);
+
+    if (kind == JSON_NULL) {
+        return json_write_null(w);
+    }
+    if (kind == JSON_BOOL) {
+        var b: bool = false;
+        json_as_bool(v, &b);
+        return json_write_bool(w, b);
+    }
+    if (kind == JSON_NUMBER) {
+        var nlen: i64 = 0;
+        var text: ptr<u8> = ffi_num(v.doc, v.node, &nlen);
+        return json_write_raw_bytes(w, text, nlen);
+    }
+    if (kind == JSON_STRING) {
+        var slen: i64 = 0;
+        var s: ptr<u8> = json_as_bytes(v, &slen);
+        return json_write_str_bytes(w, s, slen);
+    }
+    if (kind == JSON_ARRAY) {
+        if (!json_begin_array(w)) {
+            return false;
+        }
+        var count: i64 = json_len(v);
+        var i: i64 = 0;
+        while (i < count) {
+            if (!json_write_value(w, json_at(v, i))) {
+                return false;
+            }
+            i += 1;
+        }
+        return json_end_array(w);
+    }
+    if (kind == JSON_OBJECT) {
+        if (!json_begin_object(w)) {
+            return false;
+        }
+        var members: i64 = json_len(v);
+        var j: i64 = 0;
+        while (j < members) {
+            var klen: i64 = 0;
+            var key: ptr<u8> = _key_bytes(v, j, &klen);
+            if (!json_key_bytes(w, key, klen) || !json_write_value(w, json_at(v, j))) {
+                return false;
+            }
+            j += 1;
+        }
+        return json_end_object(w);
+    }
+    return false;  // invalid value
+}
+
+// Serializes v into a new heap string (free with json_string_free).
+// indent 0 = compact. escape_flags: JSON_ESCAPE_ASCII / JSON_ESCAPE_HTML.
+// Returns null for an invalid value.
+pub fun json_to_string_with(v: Json, indent: i32, escape_flags: u32) -> str {
+    if (!json_is_valid(v)) {
+        return json_null_str();
+    }
+    var w: JsonWriter = json_writer_new(indent);
+    json_writer_set_escape(&w, escape_flags);
+    json_write_value(&w, v);
+    var text: str = json_writer_finish(&w);
+    if (json_str_is_null(text)) {
+        json_writer_free(&w);
+        return json_null_str();
+    }
+    var n: i64 = json_writer_len(&w);
+    var copy: ptr<u8> = mem_alloc(n + 1);
+    if (copy != null) {
+        var src: ptr<u8> = text as ptr<u8>;
+        var i: i64 = 0;
+        while (i <= n) {
+            deref copy[i] = src[i];
+            i += 1;
+        }
+    }
+    json_writer_free(&w);
+    return copy as str;
+}
+
+pub fun json_to_string(v: Json, indent: i32) -> str {
+    return json_to_string_with(v, indent, JSON_ESCAPE_DEFAULT);
+}
+
+// Frees a string returned by json_to_string / json_to_string_with.
+pub fun json_string_free(s: str) {
+    var p: ptr<u8> = s as ptr<u8>;
+    if (p == null) {
+        return;
+    }
+    var n: i64 = 0;
+    while (p[n] != 0) {
+        n += 1;
+    }
+    mem_free(p, n + 1);
+}
+
+// Deep structural equality. Numbers compare by value (1 == 1.0 == 1e0);
+// objects compare as key sets regardless of member order. Invalid values
+// are never equal to anything.
+pub fun json_equal(a: Json, b: Json) -> bool {
+    var ka: i32 = json_type(a);
+    var kb: i32 = json_type(b);
+    if (ka != kb || ka < 0) {
+        return false;
+    }
+    if (ka == JSON_NULL) {
+        return true;
+    }
+    if (ka == JSON_BOOL) {
+        var ba: bool = false;
+        var bb: bool = false;
+        json_as_bool(a, &ba);
+        json_as_bool(b, &bb);
+        if (ba) {
+            return bb;
+        }
+        return !bb;
+    }
+    if (ka == JSON_NUMBER) {
+        var fa: f64 = 0.0;
+        var fb: f64 = 0.0;
+        json_as_f64(a, &fa);
+        json_as_f64(b, &fb);
+        return fa == fb;
+    }
+    if (ka == JSON_STRING) {
+        var la: i64 = 0;
+        var lb: i64 = 0;
+        var sa: ptr<u8> = json_as_bytes(a, &la);
+        var sb: ptr<u8> = json_as_bytes(b, &lb);
+        if (la != lb) {
+            return false;
+        }
+        var i: i64 = 0;
+        while (i < la) {
+            if (sa[i] != sb[i]) {
+                return false;
+            }
+            i += 1;
+        }
+        return true;
+    }
+    var n: i64 = json_len(a);
+    if (n != json_len(b)) {
+        return false;
+    }
+    if (ka == JSON_ARRAY) {
+        var k: i64 = 0;
+        while (k < n) {
+            if (!json_equal(json_at(a, k), json_at(b, k))) {
+                return false;
+            }
+            k += 1;
+        }
+        return true;
+    }
+    // Objects: every key of a must exist in b with an equal value. Equal
+    // member counts make this symmetric unless a has duplicate keys.
+    var m: i64 = 0;
+    while (m < n) {
+        var klen: i64 = 0;
+        var key: ptr<u8> = _key_bytes(a, m, &klen);
+        var other: Json = json_get_bytes(b, key, klen);
+        if (!json_equal(json_get_bytes(a, key, klen), other)) {
+            return false;
+        }
+        m += 1;
+    }
+    return true;
+}
+
+// Maximum nesting depth below v (scalars = 0, "[]" = 1, "[[1]]" = 2).
+pub fun json_depth(v: Json) -> i64 {
+    var kind: i32 = json_type(v);
+    if (kind != JSON_ARRAY && kind != JSON_OBJECT) {
+        return 0;
+    }
+    var deepest: i64 = 0;
+    var n: i64 = json_len(v);
+    var i: i64 = 0;
+    while (i < n) {
+        var d: i64 = json_depth(json_at(v, i));
+        if (d > deepest) {
+            deepest = d;
+        }
+        i += 1;
+    }
+    return deepest + 1;
+}

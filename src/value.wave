@@ -1,0 +1,298 @@
+// SPDX-License-Identifier: MIT
+//
+// Parsing entry points and read access to parsed values.
+//
+//   var doc: JsonDoc = json_parse("{\"name\": \"wave\", \"tags\": [1, 2]}");
+//   if (!json_ok(doc)) { ... json_error(doc) ... }
+//   var root: Json = json_root(doc);
+//   var name: str = json_as_str(json_get(root, "name"));
+//   json_free(&doc);
+//
+// A `Json` is a small value (document handle + node id) that stays valid
+// until its document is freed. Lookups on missing keys, wrong types or
+// invalid values return an invalid `Json` instead of failing, so chains like
+// json_get(json_get(root, "a"), "b") are always safe; check the end result
+// with json_is_valid().
+
+import("./ffi")::{
+    ffi_version, ffi_parse, ffi_free, ffi_ok, ffi_error_code, ffi_error_message,
+    ffi_error_offset, ffi_error_line, ffi_error_column, ffi_root, ffi_node_count,
+    ffi_type, ffi_bool, ffi_len, ffi_at, ffi_key, ffi_get, ffi_pointer, ffi_str,
+    ffi_num, ffi_num_is_int, ffi_parse_f64, ffi_parse_i64,
+};
+import("./consts")::{
+    JSON_INVALID, JSON_NULL, JSON_BOOL, JSON_NUMBER, JSON_STRING, JSON_ARRAY,
+    JSON_OBJECT, JSON_STRICT, JSON_NUM_OK,
+};
+
+pub struct JsonDoc {
+    handle: ptr<u8>;
+}
+
+pub struct Json {
+    doc: ptr<u8>;
+    node: i32;
+}
+
+pub struct JsonError {
+    code: i32;
+    message: str;
+    offset: i64;
+    line: i64;
+    column: i64;
+}
+
+fun _cstr_len(s: ptr<u8>) -> i64 {
+    if (s == null) {
+        return 0;
+    }
+    var i: i64 = 0;
+    while (s[i] != 0) {
+        i += 1;
+    }
+    return i;
+}
+
+fun _make(doc: ptr<u8>, node: i32) -> Json {
+    return Json { doc: doc, node: node };
+}
+
+// ---- documents --------------------------------------------------------------
+
+pub fun json_version() -> str {
+    return ffi_version() as str;
+}
+
+// Parses NUL-terminated JSON text with strict RFC 8259 rules.
+pub fun json_parse(text: str) -> JsonDoc {
+    return json_parse_with(text, 0, JSON_STRICT);
+}
+
+// max_depth 0 selects the default (512). flags: JSON_ALLOW_TRAILING_COMMAS,
+// JSON_ALLOW_COMMENTS, or JSON_RELAXED for both.
+pub fun json_parse_with(text: str, max_depth: i32, flags: u32) -> JsonDoc {
+    var p: ptr<u8> = text as ptr<u8>;
+    return JsonDoc { handle: ffi_parse(p, _cstr_len(p), max_depth, flags) };
+}
+
+// Parses an explicit byte range (need not be NUL-terminated), e.g. a file
+// read into a std::buffer::Buffer.
+pub fun json_parse_bytes(data: ptr<u8>, len: i64, max_depth: i32, flags: u32) -> JsonDoc {
+    return JsonDoc { handle: ffi_parse(data, len, max_depth, flags) };
+}
+
+pub fun json_ok(doc: JsonDoc) -> bool {
+    return ffi_ok(doc.handle) == 1;
+}
+
+pub fun json_error(doc: JsonDoc) -> JsonError {
+    return JsonError {
+        code: ffi_error_code(doc.handle),
+        message: ffi_error_message(doc.handle) as str,
+        offset: ffi_error_offset(doc.handle),
+        line: ffi_error_line(doc.handle),
+        column: ffi_error_column(doc.handle),
+    };
+}
+
+// Root value; invalid when the parse failed.
+pub fun json_root(doc: JsonDoc) -> Json {
+    return _make(doc.handle, ffi_root(doc.handle));
+}
+
+pub fun json_node_count(doc: JsonDoc) -> i64 {
+    return ffi_node_count(doc.handle);
+}
+
+// Releases the document. Every Json taken from it becomes invalid to use.
+// Safe to call twice.
+pub fun json_free(doc: ptr<JsonDoc>) {
+    if (doc == null) {
+        return;
+    }
+    ffi_free(deref doc.handle);
+    deref doc.handle = null;
+}
+
+// ---- type queries -------------------------------------------------------------
+
+pub fun json_type(v: Json) -> i32 { return ffi_type(v.doc, v.node); }
+pub fun json_is_valid(v: Json) -> bool { return json_type(v) != JSON_INVALID; }
+pub fun json_is_null(v: Json) -> bool { return json_type(v) == JSON_NULL; }
+pub fun json_is_bool(v: Json) -> bool { return json_type(v) == JSON_BOOL; }
+pub fun json_is_number(v: Json) -> bool { return json_type(v) == JSON_NUMBER; }
+pub fun json_is_string(v: Json) -> bool { return json_type(v) == JSON_STRING; }
+pub fun json_is_array(v: Json) -> bool { return json_type(v) == JSON_ARRAY; }
+pub fun json_is_object(v: Json) -> bool { return json_type(v) == JSON_OBJECT; }
+
+// True for numbers written without fraction or exponent ("12", "-3").
+pub fun json_is_integer(v: Json) -> bool { return ffi_num_is_int(v.doc, v.node) == 1; }
+
+// Elements (array), members (object) or bytes (string); 0 for anything else.
+pub fun json_len(v: Json) -> i64 {
+    var n: i64 = ffi_len(v.doc, v.node);
+    if (n < 0) {
+        return 0;
+    }
+    return n;
+}
+
+// ---- navigation ---------------------------------------------------------------
+
+// Object member by key. Duplicate keys resolve to the last occurrence.
+pub fun json_get(v: Json, key: str) -> Json {
+    var k: ptr<u8> = key as ptr<u8>;
+    return _make(v.doc, ffi_get(v.doc, v.node, k, _cstr_len(k)));
+}
+
+// Object member by an explicit key byte range.
+pub fun json_get_bytes(v: Json, key: ptr<u8>, key_len: i64) -> Json {
+    return _make(v.doc, ffi_get(v.doc, v.node, key, key_len));
+}
+
+// Array element, or object member value, at index.
+pub fun json_at(v: Json, index: i64) -> Json {
+    return _make(v.doc, ffi_at(v.doc, v.node, index));
+}
+
+// Object key at index, or null when out of range / not an object.
+pub fun json_key_at(v: Json, index: i64) -> str {
+    var len: i64 = 0;
+    return ffi_key(v.doc, v.node, index, &len) as str;
+}
+
+pub fun json_has(v: Json, key: str) -> bool {
+    return json_is_valid(json_get(v, key));
+}
+
+// RFC 6901 JSON Pointer, e.g. "/users/0/name" ("~1" = '/', "~0" = '~').
+pub fun json_pointer(v: Json, pointer: str) -> Json {
+    var p: ptr<u8> = pointer as ptr<u8>;
+    return _make(v.doc, ffi_pointer(v.doc, v.node, p, _cstr_len(p)));
+}
+
+// ---- scalar access --------------------------------------------------------------
+
+// Writes the bool into result and returns true when v is a bool.
+pub fun json_as_bool(v: Json, result: ptr<bool>) -> bool {
+    var b: i32 = ffi_bool(v.doc, v.node);
+    if (b < 0) {
+        return false;
+    }
+    if (result != null) {
+        deref result = b == 1;
+    }
+    return true;
+}
+
+// Decoded string (NUL-terminated), or null when v is not a string. The text
+// lives inside the document; copy it if it must outlive json_free().
+pub fun json_as_str(v: Json) -> str {
+    var len: i64 = 0;
+    return ffi_str(v.doc, v.node, &len) as str;
+}
+
+// Decoded string as a byte range; use when the string may contain "\u0000".
+pub fun json_as_bytes(v: Json, result_len: ptr<i64>) -> ptr<u8> {
+    return ffi_str(v.doc, v.node, result_len);
+}
+
+// Number exactly as written in the source text, or null.
+pub fun json_number_text(v: Json) -> str {
+    var len: i64 = 0;
+    return ffi_num(v.doc, v.node, &len) as str;
+}
+
+// Integer value. Returns a JSON_NUM_* code: JSON_NUM_INVALID for non-numbers
+// and for numbers with a fraction/exponent, JSON_NUM_RANGE when it does not
+// fit in i64.
+pub fun json_as_i64_checked(v: Json, result: ptr<i64>) -> i32 {
+    var len: i64 = 0;
+    var text: ptr<u8> = ffi_num(v.doc, v.node, &len);
+    if (text == null) {
+        return -1;
+    }
+    var value: i64 = 0;
+    var rc: i32 = ffi_parse_i64(text, len, &value);
+    if (rc == JSON_NUM_OK && result != null) {
+        deref result = value;
+    }
+    return rc;
+}
+
+pub fun json_as_i64(v: Json, result: ptr<i64>) -> bool {
+    return json_as_i64_checked(v, result) == JSON_NUM_OK;
+}
+
+// Floating value, correctly rounded. Works for every JSON number;
+// out-of-range magnitudes give +-inf / 0 with JSON_NUM_RANGE.
+pub fun json_as_f64_checked(v: Json, result: ptr<f64>) -> i32 {
+    var len: i64 = 0;
+    var text: ptr<u8> = ffi_num(v.doc, v.node, &len);
+    if (text == null) {
+        return -1;
+    }
+    var value: f64 = 0.0;
+    var rc: i32 = ffi_parse_f64(text, len, &value);
+    if (rc == JSON_NUM_OK || rc == -2) {
+        if (result != null) {
+            deref result = value;
+        }
+    }
+    return rc;
+}
+
+pub fun json_as_f64(v: Json, result: ptr<f64>) -> bool {
+    return json_as_f64_checked(v, result) == JSON_NUM_OK;
+}
+
+// ---- convenience getters with defaults --------------------------------------------
+
+pub fun json_i64_or(v: Json, fallback: i64) -> i64 {
+    var value: i64 = 0;
+    if (json_as_i64(v, &value)) {
+        return value;
+    }
+    return fallback;
+}
+
+pub fun json_f64_or(v: Json, fallback: f64) -> f64 {
+    var value: f64 = 0.0;
+    if (json_as_f64(v, &value)) {
+        return value;
+    }
+    return fallback;
+}
+
+pub fun json_bool_or(v: Json, fallback: bool) -> bool {
+    var value: bool = false;
+    if (json_as_bool(v, &value)) {
+        return value;
+    }
+    return fallback;
+}
+
+pub fun json_str_or(v: Json, fallback: str) -> str {
+    if (json_is_string(v)) {
+        return json_as_str(v);
+    }
+    return fallback;
+}
+
+// Byte-exact comparison of a string value with text.
+pub fun json_str_eq(v: Json, text: str) -> bool {
+    var len: i64 = 0;
+    var s: ptr<u8> = ffi_str(v.doc, v.node, &len);
+    if (s == null) {
+        return false;
+    }
+    var t: ptr<u8> = text as ptr<u8>;
+    var i: i64 = 0;
+    while (i < len) {
+        if (t[i] == 0 || t[i] != s[i]) {
+            return false;
+        }
+        i += 1;
+    }
+    return t[len] == 0;
+}

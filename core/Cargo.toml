@@ -1,0 +1,22 @@
+[package]
+name = "wjson_core"
+authors = ["panda"]
+version = "0.3.0"
+edition = "2021"
+description = "JSON parser core for the wjson Wave library (C ABI staticlib)"
+license = "MIT"
+
+[lib]
+name = "wjson_core"
+crate-type = ["staticlib", "rlib"]
+path = "src/lib.rs"
+
+[profile.release]
+panic = "abort"
+lto = true
+codegen-units = 1
+opt-level = 3
+
+[profile.dev]
+panic = "abort"
+

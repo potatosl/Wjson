@@ -1,0 +1,332 @@
+// SPDX-License-Identifier: MIT
+//
+// Tests for streaming parsing (src/stream.wave over the Rust core).
+// Run from the repository root:  wavec run build.wave
+
+import("std::fs::file")::{append, remove};
+import("std::buffer::types")::{Buffer};
+import("std::buffer::alloc")::{buffer_new, buffer_free, buffer_clear};
+import("std::buffer::write")::{buffer_append_str, buffer_push};
+import("std::buffer::read")::{buffer_as_ptr, buffer_len};
+import("wjson")::{
+    wjson_console_utf8,
+    JsonDoc, Json, JsonReader, JsonStream, JsonError,
+    JSON_EV_ERROR, JSON_EV_NEED_MORE, JSON_EV_OBJECT_START, JSON_EV_OBJECT_END,
+    JSON_EV_ARRAY_START, JSON_EV_ARRAY_END, JSON_EV_KEY, JSON_EV_STRING, JSON_EV_NUMBER,
+    JSON_EV_TRUE, JSON_EV_FALSE, JSON_EV_NULL, JSON_EV_END, JSON_STREAM_MULTI,
+    JSON_RELAXED, JSON_ERR_UNEXPECTED_CHAR, JSON_ERR_TRAILING_DATA,
+    json_parse_bytes, json_ok, json_root, json_free, json_len, json_at, json_get,
+    json_type, json_as_f64, json_key_at, json_number_text,
+    JSON_NUMBER, JSON_ARRAY, JSON_OBJECT,
+    json_reader_new, json_reader_free, json_reader_feed, json_reader_feed_str,
+    json_reader_finish, json_reader_next, json_reader_text, json_reader_text_eq,
+    json_reader_i64, json_reader_f64, json_reader_depth, json_reader_documents,
+    json_reader_error,
+    json_stream_open, json_stream_open_with, json_stream_next, json_stream_skip,
+    json_stream_text_eq, json_stream_i64, json_stream_f64, json_stream_depth,
+    json_stream_documents, json_stream_bytes_read, json_stream_buffered,
+    json_stream_error, json_stream_io_error, json_stream_close,
+};
+import("std::fs::file")::{fs_read_all, fs_file_size};
+import("std::mem::alloc")::{mem_alloc, mem_free};
+
+static CHECKS: i32 = 0;
+static FAILURES: i32 = 0;
+
+fun check(cond: bool, label: str) {
+    CHECKS += 1;
+    if (!cond) {
+        FAILURES += 1;
+        println("FAIL: {}", label);
+    }
+}
+
+fun streq(a: str, b: str) -> bool {
+    var pa: ptr<u8> = a as ptr<u8>;
+    var pb: ptr<u8> = b as ptr<u8>;
+    if (pa == null || pb == null) {
+        return pa == pb;
+    }
+    var i: i64 = 0;
+    while (pa[i] != 0 && pa[i] == pb[i]) {
+        i += 1;
+    }
+    return pa[i] == pb[i];
+}
+
+// Appends a one-letter-per-event log of what the reader produces when the
+// input is fed `chunk` bytes at a time.
+fun event_log(source: str, chunk: i64, flags: u32, log: ptr<Buffer>) -> i32 {
+    var r: JsonReader = json_reader_new(flags);
+    var p: ptr<u8> = source as ptr<u8>;
+    var total: i64 = 0;
+    while (p[total] != 0) {
+        total += 1;
+    }
+    var fed: i64 = 0;
+    var ev: i32 = 0;
+    while (true) {
+        ev = json_reader_next(r);
+        if (ev == JSON_EV_NEED_MORE) {
+            if (fed >= total) {
+                json_reader_finish(r);
+            } else {
+                var n: i64 = chunk;
+                if (fed + n > total) {
+                    n = total - fed;
+                }
+                json_reader_feed(r, p + fed, n);
+                fed += n;
+            }
+            continue;
+        }
+        if (ev == JSON_EV_END || ev == JSON_EV_ERROR) {
+            break;
+        }
+        if (ev == JSON_EV_OBJECT_START) { buffer_append_str(log, "{"); }
+        if (ev == JSON_EV_OBJECT_END) { buffer_append_str(log, "}"); }
+        if (ev == JSON_EV_ARRAY_START) { buffer_append_str(log, "["); }
+        if (ev == JSON_EV_ARRAY_END) { buffer_append_str(log, "]"); }
+        if (ev == JSON_EV_TRUE) { buffer_append_str(log, "T"); }
+        if (ev == JSON_EV_FALSE) { buffer_append_str(log, "F"); }
+        if (ev == JSON_EV_NULL) { buffer_append_str(log, "N"); }
+        if (ev == JSON_EV_KEY) {
+            buffer_append_str(log, json_reader_text(r));
+            buffer_append_str(log, ":");
+        }
+        if (ev == JSON_EV_STRING) {
+            buffer_append_str(log, "'");
+            buffer_append_str(log, json_reader_text(r));
+            buffer_append_str(log, "'");
+        }
+        if (ev == JSON_EV_NUMBER) {
+            buffer_append_str(log, json_reader_text(r));
+        }
+        buffer_append_str(log, " ");
+    }
+    json_reader_free(&r);
+    buffer_push(log, 0);
+    return ev;
+}
+
+fun test_reader_chunking() {
+    var sample: str = "{\"name\":\"w\\u00e9ve\",\"list\":[1,-2.5e3,true,false,null,{\"x\":[]}],\"q\":\"a\\\"b\"}";
+    var expected: str = "{ name: 'w\xC3\xA9ve' list: [ 1 -2.5e3 T F N { x: [ ] } ] q: 'a\"b' } ";
+    var chunk: i64 = 1;
+    var all_same: bool = true;
+    while (chunk <= 20) {
+        var log: Buffer = buffer_new(256);
+        var ev: i32 = event_log(sample, chunk, 0, &log);
+        if (ev != JSON_EV_END || !streq(buffer_as_ptr(&log) as str, expected)) {
+            all_same = false;
+            println("  chunk {}: {}", chunk, buffer_as_ptr(&log) as str);
+        }
+        buffer_free(&log);
+        chunk += 1;
+    }
+    check(all_same, "same events for chunk sizes 1..20");
+}
+
+fun test_reader_values_and_errors() {
+    var r: JsonReader = json_reader_new(0);
+    json_reader_feed_str(r, "[12, 3.5, 99999999999999999999]");
+    json_reader_finish(r);
+    check(json_reader_next(r) == JSON_EV_ARRAY_START, "array start");
+    check(json_reader_depth(r) == 1, "depth 1");
+    var i: i64 = 0;
+    var f: f64 = 0.0;
+    check(json_reader_next(r) == JSON_EV_NUMBER && json_reader_i64(r, &i) && i == 12, "i64 value");
+    check(json_reader_next(r) == JSON_EV_NUMBER && !json_reader_i64(r, &i) && json_reader_f64(r, &f) && f == 3.5, "f64 value");
+    check(json_reader_next(r) == JSON_EV_NUMBER && !json_reader_i64(r, &i) && json_reader_text_eq(r, "99999999999999999999"), "big number text");
+    check(json_reader_next(r) == JSON_EV_ARRAY_END && json_reader_depth(r) == 0, "array end");
+    check(json_reader_next(r) == JSON_EV_END, "end");
+    json_reader_free(&r);
+
+    var bad: Buffer = buffer_new(64);
+    check(event_log("{\n  \"a\": [1, 2,]\n}", 3, 0, &bad) == JSON_EV_ERROR, "error event");
+    buffer_free(&bad);
+    var e: JsonReader = json_reader_new(0);
+    json_reader_feed_str(e, "{\n  \"a\": [1, 2,]\n}");
+    json_reader_finish(e);
+    var ev: i32 = json_reader_next(e);
+    while (ev != JSON_EV_ERROR && ev != JSON_EV_END) {
+        ev = json_reader_next(e);
+    }
+    var err: JsonError = json_reader_error(e);
+    check(err.code == JSON_ERR_UNEXPECTED_CHAR && err.line == 2 && err.column == 14, "error position like the DOM parser");
+    json_reader_free(&e);
+
+    var relaxed: Buffer = buffer_new(64);
+    check(event_log("// c\n{\"a\": [1,],}", 2, JSON_RELAXED, &relaxed) == JSON_EV_END, "relaxed stream");
+    check(streq(buffer_as_ptr(&relaxed) as str, "{ a: [ 1 ] } "), "relaxed events");
+    buffer_free(&relaxed);
+
+    var lines: Buffer = buffer_new(64);
+    check(event_log("{\"n\":1}\n{\"n\":2}\n[3]\n", 4, JSON_STREAM_MULTI, &lines) == JSON_EV_END, "json lines");
+    check(streq(buffer_as_ptr(&lines) as str, "{ n: 1 } { n: 2 } [ 3 ] "), "json lines events");
+    buffer_free(&lines);
+    var single: Buffer = buffer_new(64);
+    check(event_log("{\"n\":1}\n{\"n\":2}", 4, 0, &single) == JSON_EV_ERROR, "second value rejected without MULTI");
+    buffer_free(&single);
+}
+
+// Adds every number of a parsed tree to *total in document order — the same
+// order the stream sees them, so the floating-point sums match exactly.
+fun dom_sum(v: Json, total: ptr<f64>) {
+    var kind: i32 = json_type(v);
+    if (kind == JSON_NUMBER) {
+        var f: f64 = 0.0;
+        json_as_f64(v, &f);
+        deref total = deref total + f;
+        return;
+    }
+    if (kind == JSON_ARRAY || kind == JSON_OBJECT) {
+        var i: i64 = 0;
+        while (i < json_len(v)) {
+            dom_sum(json_at(v, i), total);
+            i += 1;
+        }
+    }
+}
+
+fun test_stream_matches_dom() {
+    var path: str = "examples/data/survey_sample.json";
+    // DOM reference
+    var size: i64 = fs_file_size(path);
+    check(size > 0, "sample json present (run from repo root)");
+    var data: ptr<u8> = mem_alloc(size);
+    var n: i64 = fs_read_all(path, data, size);
+    var doc: JsonDoc = json_parse_bytes(data, n, 0, 0);
+    mem_free(data, size);
+    var dom_total: f64 = 0.0;
+    dom_sum(json_root(doc), &dom_total);
+    var dom_rows: i64 = json_len(json_get(json_root(doc), "rows"));
+    json_free(&doc);
+
+    // Streaming with a tiny chunk size to cross many token boundaries.
+    var s: JsonStream = json_stream_open_with(path, 0, 37);
+    var total: f64 = 0.0;
+    var rows: i64 = 0;
+    var in_rows: bool = false;
+    var ev: i32 = json_stream_next(&s);
+    while (ev != JSON_EV_END && ev != JSON_EV_ERROR) {
+        if (ev == JSON_EV_NUMBER) {
+            var f: f64 = 0.0;
+            json_stream_f64(&s, &f);
+            total = total + f;
+        }
+        if (ev == JSON_EV_KEY && json_stream_depth(&s) == 1) {
+            in_rows = json_stream_text_eq(&s, "rows");
+        }
+        if (ev == JSON_EV_OBJECT_START && in_rows && json_stream_depth(&s) == 3) {
+            rows += 1;
+        }
+        ev = json_stream_next(&s);
+    }
+    check(ev == JSON_EV_END, "stream reaches end");
+    check(rows == dom_rows, "stream counts the same rows as the DOM");
+    check(total == dom_total, "stream sums the same numbers as the DOM");
+    check(json_stream_bytes_read(&s) == n, "stream read the whole file");
+    json_stream_close(&s);
+
+    // skip: jump over "dimensions" and "measures" without looking inside.
+    var k: JsonStream = json_stream_open(path, 0);
+    var skipped: i32 = 0;
+    var keys_at_top: i32 = 0;
+    ev = json_stream_next(&k);
+    while (ev != JSON_EV_END && ev != JSON_EV_ERROR) {
+        if (ev == JSON_EV_KEY && json_stream_depth(&k) == 1) {
+            keys_at_top += 1;
+        }
+        if ((ev == JSON_EV_OBJECT_START || ev == JSON_EV_ARRAY_START) && json_stream_depth(&k) == 2) {
+            json_stream_skip(&k);
+            skipped += 1;
+        }
+        ev = json_stream_next(&k);
+    }
+    check(ev == JSON_EV_END && skipped == 3 && keys_at_top == 5, "skip whole containers");
+    json_stream_close(&k);
+
+    var missing: JsonStream = json_stream_open("no/such/file.json", 0);
+    check(json_stream_next(&missing) == JSON_EV_ERROR && json_stream_io_error(&missing) != 0, "missing file reported");
+    json_stream_close(&missing);
+}
+
+// Writes `lines` JSON Lines records, then streams them back with a small
+// buffer and checks every record arrives while memory stays bounded.
+fun test_large_json_lines() {
+    var path: str = "build/stream_test.jsonl";
+    remove(path);
+    var batch: Buffer = buffer_new(65536);
+    var lines: i64 = 100000;
+    var id: i64 = 0;
+    var expect_sum: i64 = 0;
+    while (id < lines) {
+        buffer_append_str(&batch, "{\"id\":");
+        var digits: array<u8, 24>;
+        var d: i64 = 0;
+        var v: i64 = id;
+        while (true) {
+            digits[d] = (48 + v % 10) as u8;
+            d += 1;
+            v = v / 10;
+            if (v == 0) {
+                break;
+            }
+        }
+        while (d > 0) {
+            d -= 1;
+            buffer_push(&batch, digits[d]);
+        }
+        buffer_append_str(&batch, ",\"name\":\"user\",\"tags\":[\"a\",\"b\"],\"ok\":true}\n");
+        expect_sum += id;
+        id += 1;
+        if (buffer_len(&batch) > 60000 || id == lines) {
+            append(path, buffer_as_ptr(&batch), buffer_len(&batch));
+            buffer_clear(&batch);
+        }
+    }
+    buffer_free(&batch);
+
+    var s: JsonStream = json_stream_open_with(path, JSON_STREAM_MULTI, 4096);
+    var sum: i64 = 0;
+    var count: i64 = 0;
+    var max_buffered: i64 = 0;
+    var want_id: bool = false;
+    var ev: i32 = json_stream_next(&s);
+    while (ev != JSON_EV_END && ev != JSON_EV_ERROR) {
+        if (ev == JSON_EV_KEY) {
+            want_id = json_stream_text_eq(&s, "id");
+        } else if (ev == JSON_EV_NUMBER && want_id) {
+            var x: i64 = 0;
+            json_stream_i64(&s, &x);
+            sum += x;
+            count += 1;
+            want_id = false;
+        }
+        if (json_stream_buffered(&s) > max_buffered) {
+            max_buffered = json_stream_buffered(&s);
+        }
+        ev = json_stream_next(&s);
+    }
+    check(ev == JSON_EV_END, "jsonl stream ends cleanly");
+    check(count == lines && json_stream_documents(&s) == lines, "every record streamed");
+    check(sum == expect_sum, "record contents intact");
+    check(max_buffered <= 8192, "reader memory stays bounded");
+    println("  streamed {} records ({} bytes) holding at most {} bytes", count, json_stream_bytes_read(&s), max_buffered);
+    json_stream_close(&s);
+    remove(path);
+}
+
+fun main() -> i32 {
+    wjson_console_utf8();
+    test_reader_chunking();
+    test_reader_values_and_errors();
+    test_stream_matches_dom();
+    test_large_json_lines();
+    println("stream_test: {}/{} checks passed", CHECKS - FAILURES, CHECKS);
+    if (FAILURES != 0) {
+        return 1;
+    }
+    return 0;
+}

@@ -1,0 +1,112 @@
+// SPDX-License-Identifier: MIT
+//
+// Public constants shared by every wjson module. Values mirror
+// include/wjson.h and native/include/wjson_native.h.
+
+import("./ffi")::{ffi_console_utf8};
+
+// Value types returned by json_type().
+pub const JSON_INVALID: i32 = -1;
+pub const JSON_NULL: i32 = 0;
+pub const JSON_BOOL: i32 = 1;
+pub const JSON_NUMBER: i32 = 2;
+pub const JSON_STRING: i32 = 3;
+pub const JSON_ARRAY: i32 = 4;
+pub const JSON_OBJECT: i32 = 5;
+
+// Parse flags for json_parse_with().
+pub const JSON_STRICT: u32 = 0;
+pub const JSON_ALLOW_TRAILING_COMMAS: u32 = 1;
+pub const JSON_ALLOW_COMMENTS: u32 = 2;
+pub const JSON_RELAXED: u32 = 3;
+
+// Parse error codes reported by json_error().
+pub const JSON_OK: i32 = 0;
+pub const JSON_ERR_EMPTY: i32 = 1;
+pub const JSON_ERR_UNEXPECTED_CHAR: i32 = 2;
+pub const JSON_ERR_UNEXPECTED_END: i32 = 3;
+pub const JSON_ERR_INVALID_NUMBER: i32 = 4;
+pub const JSON_ERR_INVALID_STRING: i32 = 5;
+pub const JSON_ERR_INVALID_ESCAPE: i32 = 6;
+pub const JSON_ERR_INVALID_UNICODE: i32 = 7;
+pub const JSON_ERR_CONTROL_CHAR: i32 = 8;
+pub const JSON_ERR_INVALID_UTF8: i32 = 9;
+pub const JSON_ERR_TRAILING_DATA: i32 = 10;
+pub const JSON_ERR_TOO_DEEP: i32 = 11;
+pub const JSON_ERR_TOO_LARGE: i32 = 12;
+pub const JSON_ERR_INVALID_ARGUMENT: i32 = 13;
+
+// Conversion results from the native layer.
+pub const JSON_NUM_OK: i32 = 0;
+pub const JSON_NUM_INVALID: i32 = -1;
+pub const JSON_NUM_RANGE: i32 = -2;
+pub const JSON_NUM_NONFINITE: i32 = -3;
+
+// Writer escape flags (combine with |).
+pub const JSON_ESCAPE_DEFAULT: u32 = 0;
+pub const JSON_ESCAPE_ASCII: u32 = 1;
+pub const JSON_ESCAPE_HTML: u32 = 2;
+pub const JSON_ESCAPE_QUOTES: u32 = 4; // used internally by the writer
+
+// Streaming events returned by json_reader_next / json_stream_next.
+pub const JSON_EV_ERROR: i32 = -1;
+pub const JSON_EV_NEED_MORE: i32 = 0;      // reader only: feed more input
+pub const JSON_EV_OBJECT_START: i32 = 1;
+pub const JSON_EV_OBJECT_END: i32 = 2;
+pub const JSON_EV_ARRAY_START: i32 = 3;
+pub const JSON_EV_ARRAY_END: i32 = 4;
+pub const JSON_EV_KEY: i32 = 5;
+pub const JSON_EV_STRING: i32 = 6;
+pub const JSON_EV_NUMBER: i32 = 7;
+pub const JSON_EV_TRUE: i32 = 8;
+pub const JSON_EV_FALSE: i32 = 9;
+pub const JSON_EV_NULL: i32 = 10;
+pub const JSON_EV_END: i32 = 11;
+
+// Extra streaming flag: accept several top-level values (JSON Lines).
+pub const JSON_STREAM_MULTI: u32 = 4;
+
+// Edit result codes (json_set, json_push, ...). Negative = failure.
+pub const JSON_EDIT_OK: i32 = 0;
+pub const JSON_EDIT_INVALID: i32 = -1;      // invalid value/handle
+pub const JSON_EDIT_ATTACHED: i32 = -2;     // value already has a parent: json_copy it
+pub const JSON_EDIT_CYCLE: i32 = -3;        // value would contain itself
+pub const JSON_EDIT_NOT_FOUND: i32 = -4;    // no such key / index
+pub const JSON_EDIT_WRONG_TYPE: i32 = -5;   // object op on array or vice versa
+pub const JSON_EDIT_BAD_VALUE: i32 = -6;    // NaN/inf, bad number text, bad UTF-8
+
+// Writer status codes.
+pub const JSON_WRITER_OK: i32 = 0;
+pub const JSON_WRITER_ERR_STATE: i32 = 1;    // value/key/end out of place
+pub const JSON_WRITER_ERR_ALLOC: i32 = 2;    // allocation failed
+pub const JSON_WRITER_ERR_NUMBER: i32 = 3;   // NaN or infinity
+pub const JSON_WRITER_ERR_UTF8: i32 = 4;     // string is not valid UTF-8
+pub const JSON_WRITER_ERR_INCOMPLETE: i32 = 5; // finished with open containers
+
+// Makes Korean/emoji output from println readable in a Windows console
+// (switches it to UTF-8). Harmless no-op on Linux and macOS.
+pub fun wjson_console_utf8() {
+    ffi_console_utf8();
+}
+
+pub fun json_type_name(kind: i32) -> str {
+    if (kind == JSON_NULL) { return "null"; }
+    if (kind == JSON_BOOL) { return "bool"; }
+    if (kind == JSON_NUMBER) { return "number"; }
+    if (kind == JSON_STRING) { return "string"; }
+    if (kind == JSON_ARRAY) { return "array"; }
+    if (kind == JSON_OBJECT) { return "object"; }
+    return "invalid";
+}
+
+// `str` is not nullable in Wave, but several wjson functions return "no
+// string" (missing key, writer error). They return a str whose pointer is
+// null; test for it with json_str_is_null().
+pub fun json_null_str() -> str {
+    var p: ptr<u8> = null;
+    return p as str;
+}
+
+pub fun json_str_is_null(s: str) -> bool {
+    return (s as ptr<u8>) == null;
+}

@@ -1,0 +1,57 @@
+// SPDX-License-Identifier: MIT
+//
+// Editing example: load config.json, change it in place, add new settings,
+// remove one, and print the result.
+//
+//   WJSON_RUN=examples/edit_config.wave wavec run build.wave
+
+import("std::fs::file")::{fs_read_all, fs_file_size};
+import("std::mem::alloc")::{mem_alloc, mem_free};
+import("wjson")::{
+    wjson_console_utf8,
+    JsonDoc, Json, JSON_RELAXED, JSON_EDIT_OK,
+    json_parse_bytes, json_ok, json_root, json_free, json_get, json_path,
+    json_to_string, json_string_free,
+    json_set_i64, json_set_str, json_set_path_i64, json_set_path_bool, json_remove,
+    json_push_object, json_set_object, json_new_str, json_set,
+};
+
+fun main() -> i32 {
+    wjson_console_utf8();
+    var size: i64 = fs_file_size("config.json");
+    if (size < 0) {
+        println("config.json not found (run from examples/)");
+        return 1;
+    }
+    var data: ptr<u8> = mem_alloc(size);
+    var n: i64 = fs_read_all("config.json", data, size);
+    var doc: JsonDoc = json_parse_bytes(data, n, 0, JSON_RELAXED);
+    mem_free(data, size);
+    if (!json_ok(doc)) {
+        println("config.json does not parse");
+        return 1;
+    }
+    var cfg: Json = json_root(doc);
+
+    // Change existing values.
+    json_set_str(cfg, "service", "wave-gateway-v2");
+    json_set_path_i64(cfg, "limits.timeout_ms", 5000);
+
+    // Add new settings; intermediate objects are created on the way.
+    json_set_path_i64(cfg, "limits.retries", 3);
+    json_set_path_bool(cfg, "observability.tracing.enabled", true);
+
+    // Append a route object.
+    var route: Json = json_push_object(json_path(cfg, "routes"));
+    json_set_str(route, "path", "/metrics");
+    json_set_str(route, "upstream", "http://10.0.0.9:9100");
+
+    // Drop TLS from the server block.
+    json_remove(json_get(cfg, "server"), "tls");
+
+    var text: str = json_to_string(cfg, 2);
+    println("{}", text);
+    json_string_free(text);
+    json_free(&doc);
+    return 0;
+}

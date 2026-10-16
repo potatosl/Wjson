@@ -1,0 +1,645 @@
+// SPDX-License-Identifier: MIT
+//
+// wjson build driver, written in Wave. Run from the repository root:
+//
+//   wavec run build.wave                         build everything, run all tests + examples
+//   WJSON_RUN=examples/show_data.wave wavec run build.wave     build and run one program
+//   WJSON_TASK=libs wavec run build.wave         only build the Rust + C++ libraries
+//   WJSON_TASK=bench wavec run build.wave        run the Rust and C++ benchmarks
+//   WJSON_DRY_RUN=1 wavec run build.wave         print the commands without running them
+//
+// Windows (PowerShell; no Visual Studio / MSVC needed):
+//   $env:WJSON_RUN="examples/show_data.wave"; wavec run build.wave
+//
+// On Windows nothing from MSVC is used. The first step builds wjlink
+// (chain/, Rust), which generates import libraries from the system DLLs and
+// links through rust-lld; it is the linker for cargo, wavec and the C++ test.
+// C++ is compiled by clang in freestanding mode (no SDK or STL headers).
+//
+// Wave's `main` takes no arguments, so the task is picked by environment
+// variables. Other knobs: WAVEC (default "wavec"), WAVE_STD (explicit std
+// root), CARGO (default "cargo"), RUSTC (default "rustc"), CXX (default
+// "c++", or "clang++" on Windows).
+//
+// std::process cannot spawn on Windows yet, so commands go through the C
+// library's system(), which exists on every hosted target.
+
+import("std::buffer::types")::{Buffer};
+import("std::buffer::alloc")::{buffer_new, buffer_free, buffer_clear};
+import("std::buffer::write")::{buffer_push, buffer_append, buffer_append_str, buffer_append_buffer};
+import("std::buffer::read")::{buffer_as_ptr, buffer_len};
+import("std::fs::file")::{fs_read_all, fs_file_size, create_dir};
+import("std::mem::alloc")::{mem_alloc, mem_free};
+
+extern(c, "system") fun c_system(command: ptr<u8>) -> i32;
+extern(c, "getenv") fun c_getenv(name: ptr<u8>) -> ptr<u8>;
+extern(c, "fflush") fun c_fflush(stream: ptr<u8>) -> i32;
+
+const BUILD: str = "build";
+const LIBS_FILE: str = "build/native-static-libs.txt";
+const SYSROOT_FILE: str = "build/rust-sysroot.txt";
+const GCC_PATH_FILE: str = "build/gcc-runtime-path.txt";
+// wjlink and the libraries it generates (in lib/ next to the executable).
+const WJLINK: str = "build/chain/release/wjlink.exe";
+const WJLINK_LIB: str = "build/chain/release/lib";
+
+static WINDOWS: bool = false;
+static DRY: bool = false;
+static FAILED: i32 = 0;
+static TOOLCHAIN_READY: bool = false;
+
+// ---- small string helpers ----------------------------------------------------------
+
+fun streq(a: str, b: str) -> bool {
+    var pa: ptr<u8> = a as ptr<u8>;
+    var pb: ptr<u8> = b as ptr<u8>;
+    if (pa == null || pb == null) {
+        return pa == pb;
+    }
+    var i: i64 = 0;
+    while (pa[i] != 0 && pa[i] == pb[i]) {
+        i += 1;
+    }
+    return pa[i] == pb[i];
+}
+
+fun env_or(name: str, fallback: str) -> str {
+    var v: ptr<u8> = c_getenv(name as ptr<u8>);
+    if (v == null || v[0] == 0) {
+        return fallback;
+    }
+    return v as str;
+}
+
+fun env_set(name: str) -> bool {
+    var v: ptr<u8> = c_getenv(name as ptr<u8>);
+    return v != null && v[0] != 0;
+}
+
+fun add(b: ptr<Buffer>, text: str) {
+    buffer_append_str(b, text);
+}
+
+fun add_bytes(b: ptr<Buffer>, p: ptr<u8>, n: i64) {
+    buffer_append(b, p, n);
+}
+
+// Path for the current shell (cmd.exe needs backslashes to execute).
+fun add_path(b: ptr<Buffer>, path: str) {
+    var p: ptr<u8> = path as ptr<u8>;
+    var i: i64 = 0;
+    while (p[i] != 0) {
+        if (WINDOWS && p[i] == 47) {
+            buffer_push(b, 92);
+        } else {
+            buffer_push(b, p[i]);
+        }
+        i += 1;
+    }
+}
+
+fun add_exe(b: ptr<Buffer>, path: str) {
+    add_path(b, path);
+    if (WINDOWS) {
+        add(b, ".exe");
+    }
+}
+
+// Runs the command collected in b, then clears b. Returns the exit status.
+fun sh(b: ptr<Buffer>) -> i32 {
+    buffer_push(b, 0);
+    var text: ptr<u8> = buffer_as_ptr(b);
+    println("    $ {}", text as str);
+    if (DRY) {
+        buffer_clear(b);
+        return 0;
+    }
+    c_fflush(null);                         // keep our output ordered with the child's
+    var rc: i32 = c_system(text);
+    buffer_clear(b);
+    return rc;
+}
+
+fun step(title: str) {
+    println("\x1b[36m==>\x1b[0m {}", title);
+}
+
+fun must(b: ptr<Buffer>) -> bool {
+    if (sh(b) != 0) {
+        FAILED += 1;
+        println("\x1b[31mcommand failed\x1b[0m");
+        return false;
+    }
+    return true;
+}
+
+// Reads a small text file into a fresh NUL-terminated allocation.
+fun read_text(path: str, size_out: ptr<i64>) -> ptr<u8> {
+    var size: i64 = fs_file_size(path);
+    if (size < 0) {
+        return null;
+    }
+    var data: ptr<u8> = mem_alloc(size + 1);
+    var n: i64 = fs_read_all(path, data, size);
+    if (n < 0) {
+        mem_free(data, size + 1);
+        return null;
+    }
+    deref data[n] = 0;
+    deref size_out = size + 1;
+    return data;
+}
+
+// ---- Windows toolchain (no MSVC) --------------------------------------------------------
+
+// The `--config` arguments that make cargo link with the given linker.
+fun add_cargo_linker(b: ptr<Buffer>, linker: str) {
+    add(b, " --config \"target.x86_64-pc-windows-msvc.linker='");
+    add(b, linker);
+    add(b, "'\"");
+}
+
+// Builds wjlink with rust-lld (it needs no import libraries: raw-dylib) and
+// lets it generate the system import libraries and runtime object.
+fun build_toolchain(b: ptr<Buffer>) -> bool {
+    step("wjlink: MSVC-free linker (Rust)");
+    add(b, env_or("CARGO", "cargo"));
+    add(b, " build --release --quiet --manifest-path chain/Cargo.toml --target-dir build/chain");
+    add_cargo_linker(b, "rust-lld");
+    add(b, " --config \"target.x86_64-pc-windows-msvc.rustflags=['-Clink-arg=/NODEFAULTLIB']\"");
+    if (!must(b)) {
+        return false;
+    }
+    // rust-lld ships with every rustup toolchain, next to rustc's std.
+    add(b, env_or("RUSTC", "rustc"));
+    add(b, " --print sysroot > ");
+    add_path(b, SYSROOT_FILE);
+    if (!must(b)) {
+        return false;
+    }
+    var size: i64 = 0;
+    var root: ptr<u8> = read_text(SYSROOT_FILE, &size);
+    if (root == null && !DRY) {
+        println("cannot read {}", SYSROOT_FILE);
+        return false;
+    }
+    add_path(b, WJLINK);
+    add(b, " init --lld \"");
+    if (root != null) {
+        var n: i64 = 0;
+        while (root[n] != 0 && root[n] != 10 && root[n] != 13) {
+            n += 1;
+        }
+        add_bytes(b, root, n);
+        mem_free(root, size);
+    }
+    add(b, "\\lib\\rustlib\\x86_64-pc-windows-msvc\\bin\\rust-lld.exe\"");
+    return must(b);
+}
+
+// clang flags for the C++ sources: freestanding, so neither MSVC's nor the
+// Windows SDK's headers are needed; dynamic CRT naming (msvcrt.lib).
+fun add_win_cxx(b: ptr<Buffer>) {
+    add(b, env_or("CXX", "clang++"));
+    add(b, " --target=x86_64-pc-windows-msvc -std=c++17 -ffreestanding -nostdlibinc -fno-exceptions -fno-rtti -fms-runtime-lib=dll -Wall -Wextra");
+}
+
+// ---- library builds -----------------------------------------------------------------
+
+fun core_lib() -> str {
+    if (WINDOWS) {
+        return "build/cargo/release/wjson_core.lib";
+    }
+    return "build/cargo/release/libwjson_core.a";
+}
+
+fun native_lib() -> str {
+    if (WINDOWS) {
+        return "build/native/wjson_native.lib";
+    }
+    return "build/native/libwjson_native.a";
+}
+
+fun build_core(b: ptr<Buffer>) -> bool {
+    step("Rust core (wjson_core)");
+    add(b, env_or("CARGO", "cargo"));
+    add(b, " rustc --release --quiet --lib --crate-type staticlib --manifest-path core/Cargo.toml");
+    add(b, " --target-dir build/cargo -- --print native-static-libs 2> ");
+    add_path(b, LIBS_FILE);
+    return must(b);
+}
+
+fun build_native(b: ptr<Buffer>) -> bool {
+    step("C++ native (wjson_native)");
+    create_dir("build/native");
+    var srcs: array<str, 3> = ["number", "escape", "console"];
+    if (WINDOWS) {
+        var w: i32 = 0;
+        while (w < 3) {
+            add_win_cxx(b);
+            add(b, " -O2 -Inative\\include -c native\\src\\");
+            add(b, srcs[w]);
+            add(b, ".cpp -o build\\native\\");
+            add(b, srcs[w]);
+            add(b, ".obj");
+            if (!must(b)) {
+                return false;
+            }
+            w += 1;
+        }
+        add_path(b, WJLINK);                    // wjlink's archiver replaces lib.exe
+        add(b, " lib /OUT:build\\native\\wjson_native.lib build\\native\\number.obj build\\native\\escape.obj build\\native\\console.obj");
+        return must(b);
+    }
+    var cxx: str = env_or("CXX", "c++");
+    var i: i32 = 0;
+    while (i < 3) {
+        add(b, cxx);
+        add(b, " -std=c++17 -O2 -fPIC -Wall -Wextra -fno-exceptions -fno-rtti -Inative/include -c native/src/");
+        add(b, srcs[i]);
+        add(b, ".cpp -o build/native/");
+        add(b, srcs[i]);
+        add(b, ".o");
+        if (!must(b)) {
+            return false;
+        }
+        i += 1;
+    }
+    add(b, "rm -f build/native/libwjson_native.a && ar rcs build/native/libwjson_native.a build/native/number.o build/native/escape.o build/native/console.o");
+    return must(b);
+}
+
+fun is_space(c: u8) -> bool {
+    return c == 32 || c == 9 || c == 10 || c == 13;
+}
+
+// Turns rustc's "native-static-libs: -lfoo bar.lib ..." note into wavec
+// --link flags. The C++ half is freestanding, so it needs no C++ runtime.
+// On Windows wavec links through wjlink and its generated libraries.
+fun collect_link_flags(b: ptr<Buffer>, flags: ptr<Buffer>) -> bool {
+    var size: i64 = 0;
+    var text: ptr<u8> = read_text(LIBS_FILE, &size);
+    if (text == null) {
+        if (DRY) {
+            add(flags, " --link=<rust-system-libs>");
+            return true;
+        }
+        println("cannot read {}", LIBS_FILE);
+        return false;
+    }
+    if (WINDOWS) {
+        add(flags, " -Clinker=");
+        add_path(flags, WJLINK);
+        add(flags, " -L ");
+        add_path(flags, WJLINK_LIB);
+    }
+    var marker: str = "native-static-libs:";
+    var m: ptr<u8> = marker as ptr<u8>;
+    var i: i64 = 0;
+    var found: i64 = -1;
+    while (text[i] != 0 && found < 0) {
+        var k: i64 = 0;
+        while (m[k] != 0 && text[i + k] == m[k]) {
+            k += 1;
+        }
+        if (m[k] == 0) {
+            found = i + k;
+        }
+        i += 1;
+    }
+    if (found >= 0) {
+        var p: i64 = found;
+        // Stop at the end of the line ("\n" or Windows "\r\n").
+        while (text[p] != 0 && text[p] != 10 && text[p] != 13) {
+            while (text[p] == 32 || text[p] == 9) {
+                p += 1;
+            }
+            var start: i64 = p;
+            while (text[p] != 0 && !is_space(text[p])) {
+                p += 1;
+            }
+            var n: i64 = p - start;
+            if (n == 0) {
+                break;
+            }
+            if (n > 2 && text[start] == 45 && text[start + 1] == 108) {          // -lname
+                add(flags, " --link=");
+                add_bytes(flags, text + start + 2, n - 2);
+            } else if (n > 4 && text[p - 4] == 46 && text[p - 3] == 108 && text[p - 2] == 105 && text[p - 1] == 98) {
+                add(flags, " --link=");                                         // name.lib
+                add_bytes(flags, text + start, n - 4);
+            }
+        }
+    }
+    mem_free(text, size);
+
+    // Rust's std needs libgcc_s; wavec links with lld, which does not search
+    // the C compiler's private library directory, so pass it along.
+    if (!WINDOWS) {
+        add(b, env_or("CXX", "c++"));
+        add(b, " -print-file-name=libgcc_s.so > ");
+        add(b, GCC_PATH_FILE);
+        if (sh(b) == 0) {
+            var psize: i64 = 0;
+            var path: ptr<u8> = read_text(GCC_PATH_FILE, &psize);
+            if (path != null) {
+                var last: i64 = -1;
+                var j: i64 = 0;
+                while (path[j] != 0 && path[j] != 10) {
+                    if (path[j] == 47) {
+                        last = j;
+                    }
+                    j += 1;
+                }
+                if (last > 0 && path[0] == 47) {
+                    add(flags, " -L ");
+                    add_bytes(flags, path, last);
+                }
+                mem_free(path, psize);
+            }
+        }
+    }
+    return true;
+}
+
+fun build_libs(b: ptr<Buffer>, flags: ptr<Buffer>) -> bool {
+    create_dir(BUILD);
+    if (WINDOWS && !TOOLCHAIN_READY) {
+        if (!build_toolchain(b)) {
+            return false;
+        }
+        TOOLCHAIN_READY = true;
+    }
+    return build_core(b) && build_native(b) && collect_link_flags(b, flags);
+}
+
+// ---- Wave programs -------------------------------------------------------------------
+
+// wavec build <src> <native> <core> --dep=wjson=. <link flags> -o <output>
+fun wave_build(b: ptr<Buffer>, flags: ptr<Buffer>, source: str, output: str) -> bool {
+    step(source);
+    add(b, env_or("WAVEC", "wavec"));
+    if (env_set("WAVE_STD")) {
+        add(b, " --std-root=");
+        add(b, env_or("WAVE_STD", ""));
+    }
+    add(b, " build ");
+    add(b, source);
+    add(b, " ");
+    add(b, native_lib());
+    add(b, " ");
+    add(b, core_lib());
+    add(b, " --dep=wjson=.");
+    buffer_append_buffer(b, flags);
+    add(b, " -o ");
+    add(b, output);
+    if (WINDOWS) {
+        add(b, ".exe");                     // wavec keeps an explicit -o name as given
+    }
+    return must(b);
+}
+
+// Runs build/<output> with `dir` as the working directory.
+fun run_in(b: ptr<Buffer>, dir: str, output: str) -> bool {
+    if (streq(dir, ".")) {
+        add_exe(b, output);
+        return must(b);
+    }
+    add(b, "cd ");
+    add(b, dir);
+    add(b, " && ");
+    // One "../" per path segment of dir climbs back to the repo root.
+    var p: ptr<u8> = dir as ptr<u8>;
+    add_path(b, "../");
+    var i: i64 = 0;
+    while (p[i] != 0) {
+        if (p[i] == 47 || p[i] == 92) {
+            add_path(b, "../");
+        }
+        i += 1;
+    }
+    add_exe(b, output);
+    return must(b);
+}
+
+
+// " --link=foo --link=bar" -> " foo.lib bar.lib" for a link.exe-style command.
+fun add_cl_libs(b: ptr<Buffer>, flags: ptr<Buffer>) {
+    var f: ptr<u8> = buffer_as_ptr(flags);
+    var n: i64 = buffer_len(flags);
+    var tag: str = " --link=";
+    var t: ptr<u8> = tag as ptr<u8>;
+    var i: i64 = 0;
+    while (i < n) {
+        var k: i64 = 0;
+        while (t[k] != 0 && i + k < n && f[i + k] == t[k]) {
+            k += 1;
+        }
+        if (t[k] == 0) {
+            var start: i64 = i + k;
+            var end: i64 = start;
+            while (end < n && f[end] != 32) {
+                end += 1;
+            }
+            add(b, " ");
+            add_bytes(b, f + start, end - start);
+            add(b, ".lib");
+            i = end;
+        } else {
+            i += 1;
+        }
+    }
+}
+
+fun cxx_test(b: ptr<Buffer>, flags: ptr<Buffer>) -> bool {
+    step("C++ tests (native + wjson.hpp over the Rust core)");
+    if (WINDOWS) {
+        add_win_cxx(b);
+        add(b, " -O1 -Iinclude -Inative\\include -c native\\tests\\native_test.cpp -o build\\native_test.obj");
+        if (!must(b)) {
+            return false;
+        }
+        add_path(b, WJLINK);
+        add(b, " /NOLOGO /SUBSYSTEM:CONSOLE /OUT:build\\native_test.exe build\\native_test.obj build\\native\\wjson_native.lib build\\cargo\\release\\wjson_core.lib");
+        add_cl_libs(b, flags);                  // Rust's system libraries as X.lib
+    } else {
+        add(b, env_or("CXX", "c++"));
+        add(b, " -std=c++17 -O1 -Iinclude -Inative/include native/tests/native_test.cpp build/native/libwjson_native.a build/cargo/release/libwjson_core.a -lpthread -ldl -o build/native_test");
+    }
+    if (!must(b)) {
+        return false;
+    }
+    return run_in(b, ".", "build/native_test");
+}
+
+fun task_test(b: ptr<Buffer>, flags: ptr<Buffer>) {
+    if (WINDOWS) {
+        create_dir(BUILD);
+        if (!build_toolchain(b)) {
+            return;
+        }
+        TOOLCHAIN_READY = true;
+    }
+    step("Rust unit tests");
+    add(b, env_or("CARGO", "cargo"));
+    add(b, " test --quiet --manifest-path core/Cargo.toml --target-dir build/cargo");
+    if (WINDOWS) {
+        add_cargo_linker(b, WJLINK);
+    }
+    must(b);
+
+    if (!build_libs(b, flags)) {
+        return;
+    }
+    cxx_test(b, flags);
+
+    var tests: array<str, 3> = ["wjson_test", "edit_test", "stream_test"];
+    var t: i32 = 0;
+    while (t < 3) {
+        var tsrc: Buffer = buffer_new(64);
+        add(&tsrc, "tests/");
+        add(&tsrc, tests[t]);
+        add(&tsrc, ".wave");
+        buffer_push(&tsrc, 0);
+        var tbin: Buffer = buffer_new(64);
+        add(&tbin, "build/");
+        add(&tbin, tests[t]);
+        buffer_push(&tbin, 0);
+        if (wave_build(b, flags, buffer_as_ptr(&tsrc) as str, buffer_as_ptr(&tbin) as str)) {
+            run_in(b, ".", buffer_as_ptr(&tbin) as str);
+        }
+        buffer_free(&tsrc);
+        buffer_free(&tbin);
+        t += 1;
+    }
+
+    create_dir("build/examples");
+    // csv2json writes data/survey_sample.json, which later examples read.
+    var examples: array<str, 7> = ["config", "csv2json", "edit_config", "show_data", "stream_rows", "survey_report", "transform"];
+    var i: i32 = 0;
+    while (i < 7) {
+        var src: Buffer = buffer_new(64);
+        add(&src, "examples/");
+        add(&src, examples[i]);
+        add(&src, ".wave");
+        buffer_push(&src, 0);
+        var bin: Buffer = buffer_new(64);
+        add(&bin, "build/examples/");
+        add(&bin, examples[i]);
+        buffer_push(&bin, 0);
+        if (wave_build(b, flags, buffer_as_ptr(&src) as str, buffer_as_ptr(&bin) as str)) {
+            run_in(b, "examples", buffer_as_ptr(&bin) as str);
+        }
+        buffer_free(&src);
+        buffer_free(&bin);
+        i += 1;
+    }
+}
+
+fun task_bench(b: ptr<Buffer>) {
+    create_dir(BUILD);
+    if (WINDOWS && !build_toolchain(b)) {
+        return;
+    }
+    step("Rust core benchmark");
+    add(b, env_or("CARGO", "cargo"));
+    add(b, " run --quiet --release --example bench --manifest-path core/Cargo.toml --target-dir build/cargo");
+    if (WINDOWS) {
+        add_cargo_linker(b, WJLINK);
+    }
+    must(b);
+
+    step("C++ native benchmark");
+    if (WINDOWS) {
+        create_dir("build/native");
+        add_win_cxx(b);
+        add(b, " -O2 -Inative\\include -c native\\tests\\native_bench.cpp -o build\\native_bench.obj");
+        if (!must(b) || !build_native(b)) {
+            return;
+        }
+        add_path(b, WJLINK);
+        add(b, " /NOLOGO /SUBSYSTEM:CONSOLE /OUT:build\\native_bench.exe build\\native_bench.obj build\\native\\wjson_native.lib");
+    } else {
+        add(b, env_or("CXX", "c++"));
+        add(b, " -std=c++17 -O2 -Inative/include native/src/number.cpp native/src/escape.cpp native/src/console.cpp native/tests/native_bench.cpp -o build/native_bench");
+    }
+    if (must(b)) {
+        run_in(b, ".", "build/native_bench");
+    }
+}
+
+// WJSON_RUN=dir/name.wave -> build/run/name, executed inside dir/.
+fun task_run(b: ptr<Buffer>, flags: ptr<Buffer>, source: str) {
+    if (!build_libs(b, flags)) {
+        return;
+    }
+    var p: ptr<u8> = source as ptr<u8>;
+    var slash: i64 = -1;
+    var dot: i64 = -1;
+    var i: i64 = 0;
+    while (p[i] != 0) {
+        if (p[i] == 47 || p[i] == 92) {
+            slash = i;
+        }
+        if (p[i] == 46) {
+            dot = i;
+        }
+        i += 1;
+    }
+    if (dot <= slash) {
+        dot = i;
+    }
+    create_dir("build/run");
+    var bin: Buffer = buffer_new(64);
+    add(&bin, "build/run/");
+    add_bytes(&bin, p + slash + 1, dot - slash - 1);
+    buffer_push(&bin, 0);
+    var dir: Buffer = buffer_new(64);
+    if (slash > 0) {
+        add_bytes(&dir, p, slash);
+    } else {
+        add(&dir, ".");
+    }
+    buffer_push(&dir, 0);
+
+    if (wave_build(b, flags, source, buffer_as_ptr(&bin) as str)) {
+        step("run");
+        run_in(b, buffer_as_ptr(&dir) as str, buffer_as_ptr(&bin) as str);
+    }
+    buffer_free(&bin);
+    buffer_free(&dir);
+}
+
+fun main() -> i32 {
+    WINDOWS = streq(env_or("OS", ""), "Windows_NT");
+    DRY = env_set("WJSON_DRY_RUN");
+    var b: Buffer = buffer_new(512);
+    var flags: Buffer = buffer_new(256);
+
+    if (env_set("WJSON_RUN")) {
+        task_run(&b, &flags, env_or("WJSON_RUN", ""));
+    } else if (streq(env_or("WJSON_TASK", "test"), "bench")) {
+        task_bench(&b);
+    } else if (streq(env_or("WJSON_TASK", "test"), "libs")) {
+        if (build_libs(&b, &flags)) {
+            buffer_push(&flags, 0);
+            println("");
+            println("core   : {}", core_lib());
+            println("native : {}", native_lib());
+            println("link   :{}", buffer_as_ptr(&flags) as str);
+        }
+    } else {
+        task_test(&b, &flags);
+        if (FAILED == 0) {
+            step("all tests passed");
+        }
+    }
+
+    buffer_free(&b);
+    buffer_free(&flags);
+    if (FAILED != 0) {
+        println("\x1b[31m{} step(s) failed\x1b[0m", FAILED);
+        return 1;
+    }
+    return 0;
+}
