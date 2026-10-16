@@ -82,6 +82,9 @@ try {
     # 3. Wave ---------------------------------------------------------------------
     Step 'Wave compiler'
     if (-not (Have 'wavec')) {
+        # The installer exits immediately ("older versions: install manually") when
+        # WAVE_VERSION or VEX_VERSION is set, even to the version it installs anyway.
+        Remove-Item Env:WAVE_VERSION, Env:VEX_VERSION -ErrorAction SilentlyContinue
         $installer = Join-Path $env:TEMP 'wave-install.ps1'
         Invoke-RestMethod 'https://wave-lang.dev/install.ps1' -OutFile $installer
         # The installer runs with ExecutionPolicy Bypass, so refuse anything but
