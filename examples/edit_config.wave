@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: MPL-2.0
 //
 // Editing example: load config.json, change it in place, add new settings,
 // remove one, and print the result.

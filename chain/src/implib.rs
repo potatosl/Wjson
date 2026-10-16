@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: MPL-2.0
 //! Writes Microsoft "short import" libraries (the format of kernel32.lib and
 //! friends): an archive with two linker members, an import descriptor, a null
 //! descriptor, a null thunk, and one 20-byte import header per export.
@@ -9,6 +9,9 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
+
+/// One archive member: (member name, object bytes, symbols it defines).
+pub type ArchiveMember<'a> = (&'a str, &'a [u8], &'a [Vec<u8>]);
 
 pub struct Import {
     pub name: String,
@@ -145,7 +148,7 @@ fn padded(n: usize) -> usize {
 
 /// Writes a COFF archive whose members are all named after `dll`.
 fn write_archive(dll: &str, members: &[(Vec<u8>, Vec<Vec<u8>>)]) -> Vec<u8> {
-    let named: Vec<(&str, &[u8], &[Vec<u8>])> =
+    let named: Vec<ArchiveMember> =
         members.iter().map(|(data, syms)| (dll, data.as_slice(), syms.as_slice())).collect();
     archive(&named)
 }
@@ -153,7 +156,7 @@ fn write_archive(dll: &str, members: &[(Vec<u8>, Vec<Vec<u8>>)]) -> Vec<u8> {
 /// Writes a COFF archive (`!<arch>`) with the first (big-endian) and second
 /// (sorted, little-endian) linker members, a longnames member when a name
 /// does not fit in 16 bytes, and the given members with their symbols.
-pub fn archive(members: &[(&str, &[u8], &[Vec<u8>])]) -> Vec<u8> {
+pub fn archive(members: &[ArchiveMember]) -> Vec<u8> {
     // Member names: "name/" when it fits in 16 bytes, else "/<offset>" into "//".
     let mut longnames: Vec<u8> = Vec::new();
     let mut member_names: Vec<Vec<u8>> = Vec::with_capacity(members.len());

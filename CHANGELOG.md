@@ -4,6 +4,69 @@ All notable changes are listed here. The project follows
 [Semantic Versioning](https://semver.org); before 1.0 the API may change in
 minor releases.
 
+## 0.4.0 — 2026-10-17
+
+### License
+- Relicensed from MIT to the Mozilla Public License 2.0. Version 0.3.0 was
+  published under the MIT License and stays available under it; this and later
+  versions are MPL-2.0. Every source file now carries
+  `SPDX-License-Identifier: MPL-2.0`.
+
+### Security
+- Streaming reader: an incomplete string or comment is no longer rescanned
+  from its first byte on every chunk (quadratic time when fed in small
+  pieces), and the bytes held for one token are capped (`wj_reader_set_max_token`,
+  default 256 MiB, `json_reader_set_max_token` / `json_stream_set_max_token`).
+  Number lexemes over 64 KiB are refused with `TOO_LARGE`.
+- `max_depth` is clamped to `JSON_MAX_DEPTH_LIMIT` (2048); deeper requests used
+  to overflow the stack. `json_copy` returns the new `JSON_EDIT_TOO_DEEP` (-7)
+  past that depth, the writer fails with `JSON_WRITER_ERR_DEPTH`, and
+  `json_equal` / `json_depth` stop recursing.
+- Lookups in large objects no longer mutate an unsynchronized cache: reading a
+  document from several threads is safe (the key index sits behind a mutex).
+- Wave: `json_as_str_checked`, `json_str_has_nul` and `json_key_at_bytes`
+  expose strings that contain `\u0000`. Serializing and `json_equal` no longer
+  cut object keys at an embedded NUL.
+- `wjn_utf8_check` reports a null pointer or negative length as invalid
+  instead of valid; `wjson.hpp` `escape()` checks its allocation in
+  freestanding builds.
+- CI: actions pinned to a commit, Wave tarball SHA-256 verified, read-only
+  token. `setup-windows.ps1` pins the Wave installer's SHA-256.
+- wjlink: the PE export-table reader no longer trusts the image (a header
+  claiming billions of names sized an allocation; RVA arithmetic could wrap).
+  `rust-lld` is resolved through PATH only, never the current directory, where
+  Windows would look first; a PATH or executable path longer than the old fixed
+  buffers is handled; a short read is an error instead of a silently smaller
+  file; the temporary `link-<pid>.rsp` is deleted after each link.
+- `JsonWriter` refuses absurd buffer sizes instead of overflowing while
+  doubling; `json_write_raw*` documents that it must never receive untrusted
+  text.
+- `json_clear` on an object is linear (new `wj_obj_clear`) instead of quadratic.
+- Examples: `csvlib` bounds-checks every cell and `csv_check_header` rejects
+  files whose header rows are missing or ragged (the examples used to index
+  past the field tables); missing keys print `?` instead of a null string.
+
+### Toolchain
+- Rust edition 2021 -> 2024 for `core/` and `chain/` (`rust-version = "1.99"`,
+  the version everything is tested with). C ABI entry points use
+  `#[unsafe(no_mangle)]`; wjlink's Win32 and CRT declarations are
+  `unsafe extern`. Windows code is now also type-checked and linked from
+  Linux (`--target x86_64-pc-windows-msvc`).
+- C++17 -> C++20 for the native layer, its tests and `wjson.hpp`.
+- Wave stays at v0.2.1-pre-beta, the newest stable release (LLVM 21).
+- CI: `ubuntu-26.04` and `windows-2025` runners, `actions/checkout` v7.0.1
+  (pinned to its commit), Rust updated to stable before building.
+
+### Added
+- `WJSON_TASK=sanitize`: the C++ tests under ASan + UBSan, then the C++ and
+  Rust tests under valgrind. CI runs it, and runs `clippy -D warnings` on both
+  crates (wjlink also for the Windows target).
+
+### Changed
+- Version 0.4.0 (core, `vex.ws`); wjlink 0.2.0.
+- Clippy-clean core and wjlink; the shared safety contract of the C ABI is documented once
+  at the top of `core/src/lib.rs`.
+
 ## 0.3.0 — 2026-10-16
 
 First public release, under the MIT License.

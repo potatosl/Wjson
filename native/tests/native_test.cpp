@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: MPL-2.0
 // Tests for wjson_native and the wjson.hpp wrapper over the Rust core.
 //
 // Builds hosted (with a C++ standard library) or freestanding (no library
@@ -480,6 +480,11 @@ static void test_escape() {
 
     CHECK(wjn_utf8_check("ok", 2) == -1);
     CHECK(wjn_utf8_check("ab\xe2\x82", 4) == 2);
+    CHECK(wjn_utf8_check("", 0) == -1);          // empty is valid
+    CHECK(wjn_utf8_check(nullptr, 0) == -1);
+    CHECK(wjn_utf8_check(nullptr, 4) == 0);      // bad arguments are not "valid"
+    CHECK(wjn_utf8_check("ok", -1) == 0);
+    CHECK(wjn_utf8_count(nullptr, 4) == WJN_ERR_INVALID);
     CHECK(wjn_utf8_count("héllo😀", text_len("héllo😀")) == 6);
 }
 

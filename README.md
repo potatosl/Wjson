@@ -9,7 +9,7 @@ each do the part they are best at.
 | --- | --- | --- | --- |
 | API | **Wave** | navigation, path queries, document editing (incl. by path), writer, serialization, deep equality, file streaming | `src/*.wave` |
 | Core | **Rust** | RFC 8259 parser, index-based DOM and edit operations, hash index for large objects, incremental (pull) parser, JSON Pointer, error positions | `core/` |
-| Native | **C++17** (freestanding) | number conversion (own implementation: correctly rounded parsing, shortest round-trip output), string escaping, UTF-8 validation; compiles without any standard-library or SDK headers | `native/` |
+| Native | **C++20** (freestanding) | number conversion (own implementation: correctly rounded parsing, shortest round-trip output), string escaping, UTF-8 validation; compiles without any standard-library or SDK headers | `native/` |
 | Toolchain | **Rust** | `wjlink`: the Windows link driver used instead of MSVC — generates import libraries from system DLLs, emits the startup object, archives objects, drives rust-lld | `chain/` |
 
 Every boundary between Wave and Rust/C++ is a C ABI (`extern(c)`). C and C++
@@ -99,7 +99,7 @@ The example data is **synthetic** — generated for this repository
 
 The build driver is itself written in Wave (`build.wave`). Requirements:
 [wavec](https://wave-lang.dev/docs/getting-started/install) 0.2.1-pre-beta
-(LLVM 21), Rust (cargo), and a C++17 compiler (clang on Windows).
+(LLVM 21), Rust 1.99 or newer (cargo), and a C++20 compiler (clang on Windows).
 
 ```sh
 wavec run build.wave                                   # Rust + C++ + Wave tests, all examples
@@ -222,8 +222,9 @@ Everything is imported with `import("wjson")::{...}`.
 
 - flags: `JSON_STRICT` (default), `JSON_ALLOW_TRAILING_COMMAS`,
   `JSON_ALLOW_COMMENTS`, `JSON_RELAXED` (both)
-- default maximum nesting depth 512; a UTF-8 BOM is accepted; invalid UTF-8
-  and lone surrogates are rejected
+- default maximum nesting depth 512, and no `max_depth` can exceed
+  `JSON_MAX_DEPTH_LIMIT` (2048) because parsing recurses; a UTF-8 BOM is
+  accepted; invalid UTF-8 and lone surrogates are rejected
 
 **Navigation** — `json_get(v, key)`, `json_at(v, i)`, `json_key_at(v, i)`,
 `json_len(v)`, `json_has(v, key)`, `json_pointer(v, "/a/0/b")`,
@@ -235,7 +236,8 @@ Everything is imported with `import("wjson")::{...}`.
 - with duplicate keys the last one wins (like JavaScript's `JSON.parse`)
 
 **Reading values** — `json_type`, `json_is_*`, `json_as_bool`, `json_as_str`,
-`json_as_bytes`, `json_as_i64`, `json_as_f64` (+ `_checked` variants),
+`json_as_bytes`, `json_as_str_checked`, `json_str_has_nul`, `json_as_i64`,
+`json_as_f64` (+ `_checked` variants),
 `json_number_text` (the source lexeme), with defaults `json_i64_or` /
 `json_f64_or` / `json_bool_or` / `json_str_or`, path + default
 `json_path_i64` etc., `json_str_eq`
@@ -280,11 +282,13 @@ Structure: `json_parent(v)`, `json_is_attached(v)`, `json_edit_error(v)`.
 
 **Streaming** — low level: `json_reader_new(flags)`,
 `json_reader_feed/feed_str/finish/next`, `json_reader_text/text_eq/i64/f64`,
-`json_reader_depth/documents/buffered/error`, `json_reader_free`.
+`json_reader_depth/documents/buffered/error`, `json_reader_set_max_token`,
+`json_reader_free`.
 Files: `json_stream_open(path, flags)`, `json_stream_open_with(path, flags, chunk)`,
 `json_stream_next(&s)`, `json_stream_skip(&s)` (skip the current container),
 `json_stream_text/text_eq/i64/f64`,
 `json_stream_depth/documents/bytes_read/buffered/error/io_error`,
+`json_stream_set_max_token`,
 `json_stream_close(&s)`.
 
 - events: `JSON_EV_OBJECT_START/END`, `ARRAY_START/END`, `KEY`, `STRING`,
@@ -306,6 +310,18 @@ a `str` whose pointer is null. Test it with `json_str_is_null(s)`.
   edited** — parsed text is never rewritten, and text created by edits is
   allocated separately and never moves. Passing a string from the same
   document (`json_set_str(v, "new", json_as_str(json_get(v, "old")))`) is safe.
+- **Embedded NULs.** JSON strings may contain `\u0000`, and a `str` ends at the
+  first NUL, so `"admin\u0000.txt"` reads as `admin` through `json_as_str` or
+  `json_key_at`. For untrusted documents use `json_as_str_checked` (null when
+  the text has a NUL), `json_str_has_nul`, or the exact-length
+  `json_as_bytes` / `json_key_at_bytes` / `json_str_eq`.
+- **Threads.** Reading a document nobody is editing (`json_get`, `json_at`,
+  `json_path`, ...) is safe from several threads. Edits need exclusive access.
+  A reader/stream belongs to one thread.
+- **Streaming limits.** A reader buffers at most `json_reader_set_max_token`
+  bytes (default 256 MiB) while one string or comment is incomplete, and
+  rejects numbers longer than 64 KiB, with `JSON_ERR_TOO_LARGE`. Set a small
+  cap when the input comes from an untrusted peer.
 - `json_writer_finish` returns writer-owned text (valid until the next write,
   reset or free).
 - `json_to_string*` results belong to the caller → `json_string_free`.
@@ -346,4 +362,6 @@ See `CONTRIBUTING.md`; report vulnerabilities as described in `SECURITY.md`.
 
 ## License
 
-MIT License — see `LICENSE`.
+Mozilla Public License 2.0 (MPL-2.0) — see `LICENSE`. Copyright (c) 2026 panda and the
+wjson contributors. Modified copies of the files in this repository must stay under the
+MPL-2.0; programs that merely use wjson may use any license.

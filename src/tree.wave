@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: MPL-2.0
 //
 // Whole-tree operations on parsed values: serialization back to text,
 // deep equality, and structural statistics.
@@ -8,13 +8,13 @@
 //   json_string_free(text);
 
 import("std::mem::alloc")::{mem_alloc, mem_free};
-import("./ffi")::{ffi_num};
+import("./ffi")::{ffi_num, ffi_key};
 import("./consts")::{
     JSON_NULL, JSON_BOOL, JSON_NUMBER, JSON_STRING, JSON_ARRAY, JSON_OBJECT,
-    JSON_ESCAPE_DEFAULT, json_null_str, json_str_is_null,
+    JSON_ESCAPE_DEFAULT, JSON_MAX_DEPTH_LIMIT, json_null_str, json_str_is_null,
 };
 import("./value")::{
-    Json, json_type, json_len, json_at, json_key_at, json_get_bytes,
+    Json, json_type, json_len, json_at, json_get_bytes,
     json_as_bool, json_as_bytes, json_as_f64, json_is_valid,
 };
 import("./writer")::{
@@ -24,18 +24,10 @@ import("./writer")::{
     json_write_null, json_write_bool, json_write_str_bytes, json_write_raw_bytes,
 };
 
+// Key bytes with their exact length, so a key containing "\u0000" is neither
+// truncated when written out nor confused with a shorter key when comparing.
 fun _key_bytes(v: Json, index: i64, key_len: ptr<i64>) -> ptr<u8> {
-    var key: ptr<u8> = json_key_at(v, index) as ptr<u8>;
-    var n: i64 = 0;
-    // Keys are NUL-terminated by the core; embedded "\u0000" in keys is
-    // truncated here, which only affects pathological documents.
-    if (key != null) {
-        while (key[n] != 0) {
-            n += 1;
-        }
-    }
-    deref key_len = n;
-    return key;
+    return ffi_key(v.doc, v.node, index, key_len);
 }
 
 // Appends v (recursively) to a writer, in the writer's current position.
@@ -144,6 +136,16 @@ pub fun json_string_free(s: str) {
 // objects compare as key sets regardless of member order. Invalid values
 // are never equal to anything.
 pub fun json_equal(a: Json, b: Json) -> bool {
+    return _equal(a, b, 0);
+}
+
+// `level` counts the containers entered so far; past JSON_MAX_DEPTH_LIMIT the
+// answer is false rather than recursing further (such documents can only come
+// from the editing API, never from the parser).
+fun _equal(a: Json, b: Json, level: i32) -> bool {
+    if (level > JSON_MAX_DEPTH_LIMIT) {
+        return false;
+    }
     var ka: i32 = json_type(a);
     var kb: i32 = json_type(b);
     if (ka != kb || ka < 0) {
@@ -193,7 +195,7 @@ pub fun json_equal(a: Json, b: Json) -> bool {
     if (ka == JSON_ARRAY) {
         var k: i64 = 0;
         while (k < n) {
-            if (!json_equal(json_at(a, k), json_at(b, k))) {
+            if (!_equal(json_at(a, k), json_at(b, k), level + 1)) {
                 return false;
             }
             k += 1;
@@ -207,7 +209,7 @@ pub fun json_equal(a: Json, b: Json) -> bool {
         var klen: i64 = 0;
         var key: ptr<u8> = _key_bytes(a, m, &klen);
         var other: Json = json_get_bytes(b, key, klen);
-        if (!json_equal(json_get_bytes(a, key, klen), other)) {
+        if (!_equal(json_get_bytes(a, key, klen), other, level + 1)) {
             return false;
         }
         m += 1;
@@ -215,8 +217,17 @@ pub fun json_equal(a: Json, b: Json) -> bool {
     return true;
 }
 
-// Maximum nesting depth below v (scalars = 0, "[]" = 1, "[[1]]" = 2).
+// Maximum nesting depth below v (scalars = 0, "[]" = 1, "[[1]]" = 2). The count
+// saturates a little above JSON_MAX_DEPTH_LIMIT.
 pub fun json_depth(v: Json) -> i64 {
+    return _depth(v, 0);
+}
+
+// Stops counting at JSON_MAX_DEPTH_LIMIT + 1 instead of recursing further.
+fun _depth(v: Json, level: i32) -> i64 {
+    if (level > JSON_MAX_DEPTH_LIMIT) {
+        return 0;
+    }
     var kind: i32 = json_type(v);
     if (kind != JSON_ARRAY && kind != JSON_OBJECT) {
         return 0;
@@ -225,7 +236,7 @@ pub fun json_depth(v: Json) -> i64 {
     var n: i64 = json_len(v);
     var i: i64 = 0;
     while (i < n) {
-        var d: i64 = json_depth(json_at(v, i));
+        var d: i64 = _depth(json_at(v, i), level + 1);
         if (d > deepest) {
             deepest = d;
         }

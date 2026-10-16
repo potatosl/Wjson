@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: MPL-2.0
 //
 // CSV -> document -> analysis, using the editing API end to end on the
 // survey data (data/survey_sample.csv):
@@ -15,12 +15,12 @@
 
 import("std::fs::file")::{fs_read_all, fs_file_size, write};
 import("std::mem::alloc")::{mem_alloc, mem_free};
-import("./csvlib")::{Csv, csv_empty, csv_load, csv_free, csv_rows, row_width, cell_ptr, cell_len, cells_eq, is_json_number};
+import("./csvlib")::{Csv, csv_empty, csv_load, csv_free, csv_check_header, csv_rows, row_width, cell_ptr, cell_len, cells_eq, is_json_number};
 import("wjson")::{
     wjson_console_utf8,
     JsonDoc, Json, JSON_EDIT_OK,
     json_parse_bytes, json_ok, json_root, json_free, json_len, json_at, json_get, json_get_bytes,
-    json_as_str, json_str_eq, json_f64_or, json_i64_or, json_path_f64, json_equal, json_number_text,
+    json_as_str, json_str_or, json_str_is_null, json_str_eq, json_f64_or, json_i64_or, json_path_f64, json_equal, json_number_text,
     json_to_string, json_string_free,
     json_new_document, json_set_root, json_new_object, json_new_array, json_new_null,
     json_new_str, json_new_str_bytes, json_new_number_bytes, json_new_i64, json_new_f64, json_new_f64_fixed,
@@ -137,6 +137,9 @@ fun spaces(n: i64) {
 // Terminal width: Hangul counts as 2 columns.
 fun width(s: str) -> i64 {
     var p: ptr<u8> = s as ptr<u8>;
+    if (p == null) {
+        return 0;
+    }
     var i: i64 = 0;
     var w: i64 = 0;
     while (p[i] != 0) {
@@ -161,7 +164,7 @@ fun width(s: str) -> i64 {
 }
 
 fun print_row(item: Json) {
-    var name: str = json_as_str(json_get(item, "업종"));
+    var name: str = json_str_or(json_get(item, "업종"), "?");
     print("  {}위  ", json_i64_or(json_get(item, "순위"), 0));
     if (json_i64_or(json_get(item, "순위"), 0) < 10) {
         print(" ");
@@ -169,6 +172,9 @@ fun print_row(item: Json) {
     print("{}", name);
     spaces(34 - width(name));
     var pct: str = json_number_text(json_get(json_get(item, GROWTH), "소계"));
+    if (json_str_is_null(pct)) {
+        pct = "-";
+    }
     print("{}%", pct);
     spaces(8 - width(pct));
     println("기업 {}개", firms_of(item));
@@ -181,7 +187,8 @@ fun main() -> i32 {
 
     // 1. CSV -> document
     var csv: Csv = csv_empty();
-    if (!csv_load(CSV_PATH, &csv)) {
+    if (!csv_load(CSV_PATH, &csv) || !csv_check_header(&csv, HEADER_ROWS, DIM_COLS)) {
+        csv_free(&csv);
         return 1;
     }
     var survey: JsonDoc = build_from_csv(&csv);
@@ -302,14 +309,18 @@ fun main() -> i32 {
     }
 
     println("");
-    println("상위 5개 업종");
+    var shown: i64 = 5;
+    if (n < shown) {
+        shown = n;                                  // fewer industries than a top/bottom 5
+    }
+    println("상위 {}개 업종", shown);
     i = 0;
-    while (i < 5) {
+    while (i < shown) {
         print_row(json_at(industries, i));
         i += 1;
     }
-    println("하위 5개 업종");
-    i = n - 5;
+    println("하위 {}개 업종", shown);
+    i = n - shown;
     while (i < n) {
         print_row(json_at(industries, i));
         i += 1;

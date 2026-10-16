@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: MPL-2.0
 //! Flat, index-based document model.
 //!
 //! Every value is a `Node` addressed by a `u32` id. Containers keep their
@@ -50,6 +50,11 @@ pub const EXTRA_BIT: u32 = 1 << 31;
 /// Objects with at least this many members get a lazily built hash index.
 pub const INDEX_THRESHOLD: u32 = 16;
 
+/// Key -> member position for one object.
+pub type KeyIndex = std::collections::HashMap<Box<[u8]>, u32>;
+/// Node id of an object -> its key index.
+pub type IndexCache = std::collections::HashMap<u32, KeyIndex>;
+
 #[derive(Debug)]
 pub struct Dom {
     pub nodes: Vec<Node>,
@@ -66,9 +71,10 @@ pub struct Dom {
     pub root: u32,
     /// Parent node of every node (PARENT_ROOT / PARENT_NONE for the rest).
     pub parent: Vec<i32>,
-    /// Lazily built key -> member position maps for large objects.
-    /// Interior mutability: lookups take `&self`.
-    pub index: std::cell::RefCell<std::collections::HashMap<u32, std::collections::HashMap<Box<[u8]>, u32>>>,
+    /// Lazily built key -> member position maps for large objects. Lookups
+    /// take `&self`, so the cache sits behind a mutex: a document that is not
+    /// being edited may be read from several threads at once.
+    pub index: std::sync::Mutex<IndexCache>,
 }
 
 impl Default for Dom {
@@ -177,7 +183,7 @@ impl Dom {
                 .rposition(|m| self.slice(m.key_start, m.key_len) == key)
                 .map(|p| p as u32);
         }
-        let mut index = self.index.borrow_mut();
+        let mut index = self.index.lock().unwrap_or_else(|e| e.into_inner());
         let map = index.entry(id).or_insert_with(|| {
             let mut map = std::collections::HashMap::with_capacity(members.len());
             for (pos, m) in members.iter().enumerate() {
@@ -191,7 +197,7 @@ impl Dom {
 
     /// Drops the cached key index of one object (after its keys changed).
     pub fn invalidate_index(&self, id: u32) {
-        self.index.borrow_mut().remove(&id);
+        self.index.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
     }
 
     /// Object lookup. Duplicate keys resolve to the *last* occurrence,

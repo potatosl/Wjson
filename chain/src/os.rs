@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: MPL-2.0
 //! The little operating-system surface wjlink needs.
 //!
 //! Windows: direct Win32 calls declared with `raw-dylib`, so rustc writes the
@@ -54,6 +54,41 @@ pub fn join_path(dir: &str, name: &str) -> String {
     s
 }
 
+/// Absolute on the host platform: a drive or UNC path on Windows, `/...` elsewhere.
+fn is_absolute(path: &str) -> bool {
+    if cfg!(windows) {
+        let b = path.as_bytes();
+        (b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b[2] == b'\\' || b[2] == b'/'))
+            || path.starts_with("\\\\")
+    } else {
+        path.starts_with('/')
+    }
+}
+
+/// Finds `name` in a PATH-style list of directories. Only absolute entries are
+/// searched: empty and relative ones (including ".") mean "the current
+/// directory", and running a tool from there would let a file planted next to
+/// the source tree stand in for the real linker.
+pub fn search_path(path_var: &str, name: &str, exists: &dyn Fn(&str) -> bool) -> Option<String> {
+    let sep = if cfg!(windows) { ';' } else { ':' };
+    for dir in path_var.split(sep) {
+        let dir = dir.trim().trim_matches('"');
+        if dir.is_empty() || !is_absolute(dir) {
+            continue;
+        }
+        let candidate = join_path(dir, name);
+        if exists(&candidate) {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// `search_path` over the PATH environment variable.
+pub fn find_in_path(name: &str) -> Option<String> {
+    search_path(&env("PATH")?, name, &exists)
+}
+
 #[allow(dead_code)]
 fn parent(path: &str) -> &str {
     match path.rfind(['/', '\\']) {
@@ -83,6 +118,9 @@ mod imp {
     }
     pub fn exists(path: &str) -> bool {
         std::path::Path::new(path).exists()
+    }
+    pub fn remove(path: &str) {
+        let _ = std::fs::remove_file(path);
     }
     pub fn exe_dir() -> String {
         std::env::current_exe()
@@ -124,6 +162,10 @@ mod imp {
     use alloc::format;
     use core::ffi::c_void;
     use core::ptr::{null, null_mut};
+    use alloc::vec;
+
+    /// Largest file `read` accepts (DLLs, objects and libraries are far smaller).
+    const MAX_READ: i64 = 1 << 31;
 
     type Handle = isize;
     const INVALID_HANDLE: Handle = -1;
@@ -138,7 +180,7 @@ mod imp {
     const INVALID_FILE_ATTRIBUTES: u32 = 0xFFFF_FFFF;
 
     #[link(name = "kernel32", kind = "raw-dylib")]
-    extern "system" {
+    unsafe extern "system" {
         fn GetCommandLineW() -> *const u16;
         fn LocalFree(mem: *mut c_void) -> *mut c_void;
         fn CreateFileW(
@@ -156,6 +198,7 @@ mod imp {
         fn GetFileSizeEx(file: Handle, size: *mut i64) -> i32;
         fn CreateDirectoryW(name: *const u16, security: *mut c_void) -> i32;
         fn GetFileAttributesW(name: *const u16) -> u32;
+        fn DeleteFileW(name: *const u16) -> i32;
         fn GetStdHandle(which: u32) -> Handle;
         fn GetModuleFileNameW(module: *mut c_void, buf: *mut u16, len: u32) -> u32;
         fn GetEnvironmentVariableW(name: *const u16, buf: *mut u16, len: u32) -> u32;
@@ -180,7 +223,7 @@ mod imp {
     }
 
     #[link(name = "shell32", kind = "raw-dylib")]
-    extern "system" {
+    unsafe extern "system" {
         fn CommandLineToArgvW(command: *const u16, count: *mut i32) -> *mut *mut u16;
     }
 
@@ -232,8 +275,11 @@ mod imp {
                 return Err(format!("cannot open {path} (error {})", GetLastError()));
             }
             let mut size = 0i64;
-            GetFileSizeEx(h, &mut size);
-            let mut data: Vec<u8> = Vec::with_capacity(size.max(0) as usize);
+            if GetFileSizeEx(h, &mut size) == 0 || !(0..=MAX_READ).contains(&size) {
+                CloseHandle(h);
+                return Err(format!("cannot size {path} (error {})", GetLastError()));
+            }
+            let mut data: Vec<u8> = Vec::with_capacity(size as usize);
             let mut done = 0usize;
             while done < size as usize {
                 let want = ((size as usize - done).min(1 << 30)) as u32;
@@ -243,8 +289,13 @@ mod imp {
                 }
                 done += got as usize;
             }
-            data.set_len(done);
             CloseHandle(h);
+            // A short read is an error, not a smaller file: callers would
+            // otherwise parse a silently truncated image.
+            if done != size as usize {
+                return Err(format!("cannot read {path} (error {})", GetLastError()));
+            }
+            data.set_len(done);
             Ok(data)
         }
     }
@@ -276,6 +327,13 @@ mod imp {
         unsafe { GetFileAttributesW(name.as_ptr()) != INVALID_FILE_ATTRIBUTES }
     }
 
+    pub fn remove(path: &str) {
+        let name = wide(path);
+        unsafe {
+            DeleteFileW(name.as_ptr());
+        }
+    }
+
     pub fn mkdir_all(path: &str) -> Result<(), String> {
         if path.is_empty() || exists(path) {
             return Ok(());
@@ -294,17 +352,37 @@ mod imp {
     }
 
     pub fn exe_dir() -> String {
-        let mut buf = [0u16; 1024];
-        let n = unsafe { GetModuleFileNameW(null_mut(), buf.as_mut_ptr(), buf.len() as u32) } as usize;
-        let path = String::from_utf16_lossy(&buf[..n]);
+        // A path longer than the buffer comes back truncated (n == len): grow.
+        let mut buf = vec![0u16; 1024];
+        let mut n;
+        loop {
+            n = unsafe { GetModuleFileNameW(null_mut(), buf.as_mut_ptr(), buf.len() as u32) } as usize;
+            if n < buf.len() || buf.len() >= 1 << 16 {
+                break;
+            }
+            let bigger = buf.len() * 2;
+            buf.resize(bigger, 0);
+        }
+        let path = String::from_utf16_lossy(&buf[..n.min(buf.len())]);
         String::from(parent(&path))
     }
 
     pub fn env(name: &str) -> Option<String> {
+        // PATH is routinely longer than any fixed buffer. When the buffer is
+        // too small the call returns the size needed (with the NUL).
         let key = wide(name);
-        let mut buf = [0u16; 2048];
-        let n = unsafe { GetEnvironmentVariableW(key.as_ptr(), buf.as_mut_ptr(), buf.len() as u32) } as usize;
-        (n > 0 && n < buf.len()).then(|| String::from_utf16_lossy(&buf[..n]))
+        let mut buf = vec![0u16; 512];
+        for _ in 0..4 {
+            let n = unsafe { GetEnvironmentVariableW(key.as_ptr(), buf.as_mut_ptr(), buf.len() as u32) } as usize;
+            if n == 0 {
+                return None;
+            }
+            if n < buf.len() {
+                return Some(String::from_utf16_lossy(&buf[..n]));
+            }
+            buf.resize(n + 1, 0);
+        }
+        None
     }
 
     pub fn system_dir() -> String {

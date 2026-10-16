@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: MIT
+# SPDX-License-Identifier: MPL-2.0
 #
 # One-shot Windows setup + build for wjson. No Visual Studio / MSVC needed.
 #
@@ -55,6 +55,14 @@ try {
         Refresh-Path
         if (-not (Have 'cargo')) { throw 'cargo still not found after installing rustup.' }
     }
+    # Cargo.toml asks for Rust 1.99 or newer; bring an older rustup install up to date.
+    # No 2>&1 here: rustup reports progress on stderr, and Windows PowerShell 5.1
+    # turns redirected native stderr into a terminating error under 'Stop'. A
+    # failed update is not fatal; cargo itself says if the version is too old.
+    if (Have 'rustup') {
+        & rustup update stable --no-self-update
+        if ($LASTEXITCODE -ne 0) { Write-Host '    note: rustup update failed; continuing with the installed Rust' }
+    }
     & cargo --version 2>&1 | Out-String | Write-Host
     $sysroot = (& rustc --print sysroot).Trim()
     $lld = Join-Path $sysroot 'lib\rustlib\x86_64-pc-windows-msvc\bin\rust-lld.exe'
@@ -76,6 +84,16 @@ try {
     if (-not (Have 'wavec')) {
         $installer = Join-Path $env:TEMP 'wave-install.ps1'
         Invoke-RestMethod 'https://wave-lang.dev/install.ps1' -OutFile $installer
+        # The installer runs with ExecutionPolicy Bypass, so refuse anything but
+        # the exact script that was reviewed. (It installs Wave v0.2.1-pre-beta
+        # and checks the GitHub-published SHA-256 of what it downloads.) If the
+        # hash changes, read the new script, then update the value below.
+        $expectedInstaller = '7d8c9f28ecc9ca05bafec8a036b0efac1694644484d48368bd28d3943bd477aa'
+        $actualInstaller = (Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash
+        if ($actualInstaller -ine $expectedInstaller) {
+            Remove-Item -LiteralPath $installer -Force -ErrorAction SilentlyContinue
+            throw "wave-lang.dev/install.ps1 does not match the pinned SHA-256 (got $actualInstaller). Review the new installer, then update `$expectedInstaller in setup-windows.ps1, or install Wave by hand from https://github.com/wavefnd/Wave/releases."
+        }
         & powershell -NoProfile -ExecutionPolicy Bypass -File $installer -WithoutVex
         if ($LASTEXITCODE -ne 0) { throw "Wave installer failed (exit code $LASTEXITCODE)" }
         $env:Path = "$env:Path;$env:LOCALAPPDATA\Wave\bin"

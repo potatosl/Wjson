@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: MPL-2.0
 //
 // Data test: converts a statistics-style CSV (synthetic sample data, see
 // examples/data/README.md) with a 3-row header into nested
@@ -24,8 +24,8 @@
 import("std::fs::file")::{fs_read_all, fs_file_size, write};
 import("std::mem::alloc")::{mem_alloc, mem_free};
 import("./csvlib")::{
-    Csv, csv_from_bytes, csv_free, row_width, cell_ptr, cell_len, bytes_eq, cells_eq,
-    is_json_number,
+    Csv, csv_from_bytes, csv_free, csv_check_header, row_width, cell_ptr, cell_len, bytes_eq,
+    cells_eq, is_json_number,
 };
 import("wjson")::{
     wjson_console_utf8,
@@ -283,13 +283,16 @@ fun main() -> i32 {
     var n: i64 = fs_read_all(INPUT, data, size);
     if (n < 0) {
         println("cannot read {}", INPUT);
+        mem_free(data, size + 1);
         return 1;
     }
     var csv: Csv = Csv {
         data: null, size: 0, data_cap: 0, starts: null, lens: null, row_first: null,
         rows: 0, fields: 0, field_cap: 0,
     };
-    if (!csv_from_bytes(&csv, data, n)) {
+    if (!csv_from_bytes(&csv, data, n) || !csv_check_header(&csv, HEADER_ROWS, DIM_COLS)) {
+        csv_free(&csv);
+        mem_free(data, size + 1);
         return 1;
     }
     println("[1] CSV  : {} bytes, {} rows x {} columns ({} header rows)",

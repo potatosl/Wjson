@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: MIT
+# SPDX-License-Identifier: MPL-2.0
 # Full build and test on Linux and Windows (Windows without MSVC).
 name: CI
 
@@ -7,29 +7,70 @@ on:
   pull_request:
   workflow_dispatch:
 
+# The workflow only reads the repository; nothing here needs a write token.
+permissions:
+  contents: read
+
 env:
   WAVE_VERSION: v0.2.1-pre-beta
+  # SHA-256 of the release tarball, as published by GitHub for that tag.
+  # Update both together when bumping WAVE_VERSION.
+  WAVE_LINUX_SHA256: 4e5daf46a93414e00b8ea073eda09e4b7aa7d248cc03f2aeb965a36fc9b0fef0
 
 jobs:
   linux:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     steps:
-      - uses: actions/checkout@v4
+      # Actions are pinned to a commit, not a movable tag (v7.0.1).
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      # Cargo.toml asks for Rust 1.99+; make sure the runner has it.
+      - name: Rust toolchain
+        run: |
+          rustup update stable --no-self-update
+          rustup component add clippy
+          rustup target add x86_64-pc-windows-msvc
+          rustc --version
       - name: Install wavec
         run: |
           curl -sSfL -o wave.tar.gz \
             "https://github.com/wavefnd/Wave/releases/download/${WAVE_VERSION}/wave-${WAVE_VERSION}-x86_64-linux-gnu.tar.gz"
+          echo "${WAVE_LINUX_SHA256}  wave.tar.gz" | sha256sum --check --strict -
           mkdir -p "$HOME/wave" && tar -xzf wave.tar.gz -C "$HOME/wave" --strip-components=1
           echo "$HOME/wave" >> "$GITHUB_PATH"
           echo "WAVE_STD=$HOME/wave/std" >> "$GITHUB_ENV"
+      # Warnings are errors, so the clippy-clean state cannot quietly regress.
+      - name: Lint (clippy -D warnings)
+        run: |
+          cargo clippy --manifest-path core/Cargo.toml --all-targets -- -D warnings
+          cargo clippy --manifest-path chain/Cargo.toml --all-targets -- -D warnings
+      # wjlink's Windows-only code is not compiled by the Linux checks above.
+      - name: Lint wjlink for Windows (cross)
+        run: |
+          cargo clippy --manifest-path chain/Cargo.toml --target x86_64-pc-windows-msvc -- -D warnings
+          cargo check --manifest-path core/Cargo.toml --target x86_64-pc-windows-msvc
       - name: Build and test
         run: wavec --std-root="$WAVE_STD" run build.wave
+      - name: Sanitizers and valgrind
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends valgrind
+          WJSON_TASK=sanitize wavec --std-root="$WAVE_STD" run build.wave
 
   windows:
-    runs-on: windows-2022
+    runs-on: windows-2025
     steps:
-      - uses: actions/checkout@v4
-      # The runner already has Rust and LLVM (clang); the script installs
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      # Cargo.toml asks for Rust 1.99+; make sure the runner has it.
+      - name: Rust toolchain
+        shell: pwsh
+        run: |
+          rustup update stable --no-self-update
+          rustc --version
+      # The runner already has LLVM (clang); the script installs
       # Wave, clears every MSVC environment variable and runs build.wave.
       - name: Build and test (no MSVC)
         shell: pwsh

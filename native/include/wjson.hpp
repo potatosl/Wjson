@@ -1,6 +1,6 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: MPL-2.0
 //
-// wjson.hpp — header-only C++17 view over the wjson C ABI, so C++ programs
+// wjson.hpp — header-only C++20 view over the wjson C ABI, so C++ programs
 // can use the same parser (Rust core) and conversions (native) as Wave.
 //
 //   auto doc = wjson::Document::parse(R"({"a":[1,2,3]})");
@@ -336,6 +336,7 @@ inline String escape(Str s, uint32_t flags = WJN_ESCAPE_QUOTES) {
     String out(static_cast<size_t>(need), '\0');
 #else
     String out(static_cast<size_t>(need));
+    if (out.size() != static_cast<size_t>(need)) return String();  // malloc failed
 #endif
     wjn_escape(s.data(), static_cast<int64_t>(s.size()), out.data(), need + 1, flags);
     return out;

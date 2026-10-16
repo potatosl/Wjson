@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: MPL-2.0
 //! Throughput benchmark for wjson_core (no external dependencies).
 //!   cargo run --release --example bench
 //!

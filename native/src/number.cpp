@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: MPL-2.0
 // Number conversion for wjson. Freestanding: no C or C++ library headers,
 // so it builds with a bare compiler (clang -ffreestanding -nostdlibinc).
 //

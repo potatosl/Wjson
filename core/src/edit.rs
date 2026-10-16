@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: MPL-2.0
 //! In-place editing of a parsed (or freshly created) document.
 //!
 //! Model:
@@ -14,6 +14,7 @@
 //!   is reclaimed when the document is freed.
 
 use crate::dom::*;
+use crate::parser::MAX_DEPTH_LIMIT;
 use std::collections::HashMap;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -31,6 +32,8 @@ pub enum EditError {
     WrongType = -5,
     /// Not a valid JSON number lexeme / not valid UTF-8.
     BadValue = -6,
+    /// Copying would nest deeper than `MAX_DEPTH_LIMIT`.
+    TooDeep = -7,
 }
 
 pub type EditResult<T> = Result<T, EditError>;
@@ -326,7 +329,7 @@ impl Dom {
         self.nodes[obj as usize].len += 1;
         self.parent[value as usize] = obj as i32;
         // The cached index (if any) stays valid: append the new key to it.
-        if let Some(map) = self.index.borrow_mut().get_mut(&obj) {
+        if let Some(map) = self.index.lock().unwrap_or_else(|e| e.into_inner()).get_mut(&obj) {
             map.insert(key.into(), n.len);
         }
         Ok(())
@@ -359,10 +362,32 @@ impl Dom {
         Ok(removed.len() as u32)
     }
 
+    /// Removes every member of an object at once; returns how many there were.
+    /// (Removing keys one by one rescans the member list each time.)
+    pub fn obj_clear(&mut self, obj: i64) -> EditResult<u32> {
+        let obj = self.check_kind(obj, KIND_OBJECT)?;
+        let n = self.nodes[obj as usize];
+        let (start, len) = (n.start as usize, n.len as usize);
+        for i in 0..len {
+            let value = self.members[start + i].value;
+            self.detach(value);
+        }
+        self.nodes[obj as usize].len = 0;
+        self.invalidate_index(obj);
+        Ok(len as u32)
+    }
+
     // ---- copying ----------------------------------------------------------------
 
     /// Deep-copies `src_node` of `src` into this document as a detached value.
     pub fn copy_from(&mut self, slack: &mut Slack, src: &Dom, src_node: i64) -> EditResult<u32> {
+        self.copy_nested(slack, src, src_node, 0)
+    }
+
+    fn copy_nested(&mut self, slack: &mut Slack, src: &Dom, src_node: i64, depth: u32) -> EditResult<u32> {
+        if depth > MAX_DEPTH_LIMIT {
+            return Err(EditError::TooDeep);
+        }
         let id = src.check(src_node)?;
         let n = src.nodes[id as usize];
         Ok(match n.kind {
@@ -380,7 +405,7 @@ impl Dom {
                 let arr = self.new_array();
                 for i in 0..n.len as i64 {
                     let child = src.child(id as i64, i).ok_or(EditError::Invalid)?;
-                    let copy = self.copy_from(slack, src, child as i64)?;
+                    let copy = self.copy_nested(slack, src, child as i64, depth + 1)?;
                     self.arr_push(slack, arr as i64, copy as i64)?;
                 }
                 arr
@@ -389,7 +414,7 @@ impl Dom {
                 let obj = self.new_object();
                 for i in 0..n.len as i64 {
                     let m = *src.member(id as i64, i).ok_or(EditError::Invalid)?;
-                    let copy = self.copy_from(slack, src, m.value as i64)?;
+                    let copy = self.copy_nested(slack, src, m.value as i64, depth + 1)?;
                     // Append directly so duplicate keys survive the copy.
                     let key = src.slice(m.key_start, m.key_len).to_vec();
                     let (key_start, key_len) = self.push_text(&key);

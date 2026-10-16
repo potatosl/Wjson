@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: MPL-2.0
 //
 // Small CSV reader shared by the CSV examples (csv2json.wave,
 // survey_report.wave). Not part of wjson itself.
@@ -74,6 +74,10 @@ pub fun csv_parse(c: ptr<Csv>) -> bool {
     deref c.starts = mem_alloc(bound * 8) as ptr<i64>;
     deref c.lens = mem_alloc(bound * 8) as ptr<i64>;
     deref c.row_first = mem_alloc((bound + 1) * 8) as ptr<i64>;
+    if (deref c.starts == null || deref c.lens == null || deref c.row_first == null) {
+        println("csv: out of memory for {} fields", bound);
+        return false;
+    }
     deref c.rows = 0;
     deref c.fields = 0;
 
@@ -156,31 +160,73 @@ pub fun csv_free(c: ptr<Csv>) {
         mem_free(deref c.data, deref c.data_cap);
         deref c.data_cap = 0;
     }
-    if (deref c.starts == null) {
-        return;
+    if (deref c.starts != null) {
+        mem_free(deref c.starts as ptr<u8>, deref c.field_cap * 8);
+        deref c.starts = null;
     }
-    var cap: i64 = deref c.field_cap;
-    mem_free(deref c.starts as ptr<u8>, cap * 8);
-    mem_free(deref c.lens as ptr<u8>, cap * 8);
-    mem_free(deref c.row_first as ptr<u8>, (cap + 1) * 8);
+    if (deref c.lens != null) {
+        mem_free(deref c.lens as ptr<u8>, deref c.field_cap * 8);
+        deref c.lens = null;
+    }
+    if (deref c.row_first != null) {
+        mem_free(deref c.row_first as ptr<u8>, (deref c.field_cap + 1) * 8);
+        deref c.row_first = null;
+    }
+    deref c.rows = 0;
 }
 
+// Number of fields in `row`; 0 for a row that does not exist.
 pub fun row_width(c: ptr<Csv>, row: i64) -> i64 {
+    if (row < 0 || row >= deref c.rows) {
+        return 0;
+    }
     var rf: ptr<i64> = deref c.row_first;
     return rf[row + 1] - rf[row];
 }
 
+// Cells are bounds-checked: a row or column that is not there reads as an
+// empty cell (length 0), so a ragged or truncated file cannot make the
+// accessors run off the field tables.
 pub fun cell_ptr(c: ptr<Csv>, row: i64, col: i64) -> ptr<u8> {
+    var d: ptr<u8> = deref c.data;
+    if (col < 0 || col >= row_width(c, row)) {
+        return d;
+    }
     var rf: ptr<i64> = deref c.row_first;
     var starts: ptr<i64> = deref c.starts;
-    var d: ptr<u8> = deref c.data;
     return d + starts[rf[row] + col];
 }
 
 pub fun cell_len(c: ptr<Csv>, row: i64, col: i64) -> i64 {
+    if (col < 0 || col >= row_width(c, row)) {
+        return 0;
+    }
     var rf: ptr<i64> = deref c.row_first;
     var lens: ptr<i64> = deref c.lens;
     return lens[rf[row] + col];
+}
+
+// Checks the shape the examples assume: `header_rows` header rows of equal
+// width, with more than `dim_cols` columns. Prints why when it does not hold.
+pub fun csv_check_header(c: ptr<Csv>, header_rows: i64, dim_cols: i64) -> bool {
+    if (deref c.rows < header_rows) {
+        println("csv: {} rows, but {} header rows are required", deref c.rows, header_rows);
+        return false;
+    }
+    var cols: i64 = row_width(c, 0);
+    if (cols <= dim_cols) {
+        println("csv: {} columns, but more than {} are required", cols, dim_cols);
+        return false;
+    }
+    var r: i64 = 1;
+    while (r < header_rows) {
+        if (row_width(c, r) != cols) {
+            println("csv: header row {} has {} fields, expected {}", r + 1, row_width(c, r), cols);
+            return false;
+        }
+        r += 1;
+    }
+    return true;
 }
 
 pub fun bytes_eq(a: ptr<u8>, an: i64, b: ptr<u8>, bn: i64) -> bool {

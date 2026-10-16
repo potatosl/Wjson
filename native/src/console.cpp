@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: MPL-2.0
 // Console setup: Wave's println writes UTF-8 bytes through printf. Windows
 // consoles default to a legacy code page (CP949 on Korean systems), which
 // garbles them, so switch the console to UTF-8. Elsewhere this is a no-op.

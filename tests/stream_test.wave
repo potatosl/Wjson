@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: MPL-2.0
 //
 // Tests for streaming parsing (src/stream.wave over the Rust core).
 // Run from the repository root:  wavec run build.wave
@@ -14,7 +14,8 @@ import("wjson")::{
     JSON_EV_ERROR, JSON_EV_NEED_MORE, JSON_EV_OBJECT_START, JSON_EV_OBJECT_END,
     JSON_EV_ARRAY_START, JSON_EV_ARRAY_END, JSON_EV_KEY, JSON_EV_STRING, JSON_EV_NUMBER,
     JSON_EV_TRUE, JSON_EV_FALSE, JSON_EV_NULL, JSON_EV_END, JSON_STREAM_MULTI,
-    JSON_RELAXED, JSON_ERR_UNEXPECTED_CHAR, JSON_ERR_TRAILING_DATA,
+    JSON_RELAXED, JSON_ERR_UNEXPECTED_CHAR, JSON_ERR_TRAILING_DATA, JSON_ERR_TOO_LARGE,
+    json_reader_set_max_token,
     json_parse_bytes, json_ok, json_root, json_free, json_len, json_at, json_get,
     json_type, json_as_f64, json_key_at, json_number_text,
     JSON_NUMBER, JSON_ARRAY, JSON_OBJECT,
@@ -318,8 +319,36 @@ fun test_large_json_lines() {
     remove(path);
 }
 
+fun test_token_limit() {
+    // A string that never closes may not make the reader buffer without bound.
+    var chunk: ptr<u8> = mem_alloc(64);
+    var i: i64 = 0;
+    while (i < 64) {
+        deref chunk[i] = 97;
+        i += 1;
+    }
+    var r: JsonReader = json_reader_new(0);
+    json_reader_set_max_token(r, 1000);
+    json_reader_feed_str(r, "[\"");
+    var ev: i32 = json_reader_next(r);
+    var rounds: i32 = 0;
+    while (ev == JSON_EV_NEED_MORE || ev == JSON_EV_ARRAY_START) {
+        json_reader_feed(r, chunk, 64);
+        ev = json_reader_next(r);
+        rounds += 1;
+        if (rounds > 200) {
+            break;
+        }
+    }
+    check(ev == JSON_EV_ERROR && json_reader_error(r).code == JSON_ERR_TOO_LARGE, "unterminated string hits the token limit");
+    check(rounds < 30, "refused long before the data piled up");
+    json_reader_free(&r);
+    mem_free(chunk, 64);
+}
+
 fun main() -> i32 {
     wjson_console_utf8();
+    test_token_limit();
     test_reader_chunking();
     test_reader_values_and_errors();
     test_stream_matches_dom();

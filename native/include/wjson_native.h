@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT
+/* SPDX-License-Identifier: MPL-2.0
  *
  * wjson_native: the C++ half of wjson — number conversion and string
  * escaping, exposed through a plain C ABI so Wave can call it directly.
@@ -50,7 +50,9 @@ int64_t wjn_format_i64(int64_t value, char *dst, int64_t cap) WJN_NOEXCEPT;
 /* JSON-escapes UTF-8 `src`. Returns needed length or WJN_ERR_INVALID. */
 int64_t wjn_escape(const char *src, int64_t len, char *dst, int64_t cap, uint32_t flags) WJN_NOEXCEPT;
 
-/* Returns -1 when `src` is valid UTF-8, else the offset of the first bad byte. */
+/* Returns -1 when `src` is valid UTF-8 (an empty range is valid), else the
+ * offset of the first bad byte. A negative `len`, or a null `src` with
+ * `len > 0`, is not valid input and yields 0. */
 int64_t wjn_utf8_check(const char *src, int64_t len) WJN_NOEXCEPT;
 
 /* Number of Unicode code points in valid UTF-8 `src`, or WJN_ERR_INVALID. */

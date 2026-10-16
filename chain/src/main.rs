@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: MPL-2.0
 //! wjlink — wjson's Windows link driver. It replaces the parts of MSVC a
 //! Rust + Wave build needs:
 //!
@@ -159,10 +159,10 @@ fn cmd_init(args: &[String]) -> i32 {
     if let Err(e) = os::write(&os::join_path(&dir, "wjrt.obj"), &runtime::runtime_object()) {
         return fail(&e);
     }
-    if let Some(lld) = lld {
-        if let Err(e) = os::write(&os::join_path(&dir, "lld.txt"), lld.as_bytes()) {
-            return fail(&e);
-        }
+    if let Some(lld) = lld
+        && let Err(e) = os::write(&os::join_path(&dir, "lld.txt"), lld.as_bytes())
+    {
+        return fail(&e);
     }
     say(&format!("  wjrt.obj: runtime startup object; {} empty stand-ins", EMPTY.len()));
     say(&format!("wjlink: {made} import libraries in {dir}"));
@@ -201,7 +201,7 @@ fn cmd_lib(args: &[String]) -> i32 {
         let name = path.rsplit(['/', '\\']).next().unwrap_or(path).to_string();
         objects.push((name, data, syms));
     }
-    let members: Vec<(&str, &[u8], &[Vec<u8>])> =
+    let members: Vec<implib::ArchiveMember> =
         objects.iter().map(|(n, d, s)| (n.as_str(), d.as_slice(), s.as_slice())).collect();
     match os::write(&out, &implib::archive(&members)) {
         Ok(()) => 0,
@@ -209,17 +209,28 @@ fn cmd_lib(args: &[String]) -> i32 {
     }
 }
 
-fn find_lld(dir: &str) -> String {
-    if let Some(p) = os::env("WJLINK_LLD") {
-        return p;
-    }
-    if let Ok(bytes) = os::read(&os::join_path(dir, "lld.txt")) {
+fn find_lld(dir: &str) -> Result<String, String> {
+    let mut lld = os::env("WJLINK_LLD");
+    if lld.is_none()
+        && let Ok(bytes) = os::read(&os::join_path(dir, "lld.txt"))
+    {
         let s = String::from_utf8_lossy(&bytes).trim().to_string();
         if !s.is_empty() {
-            return s;
+            lld = Some(s);
         }
     }
-    "rust-lld".into()
+    let lld = lld.unwrap_or_else(|| "rust-lld".into());
+    // A bare name would be looked up by the OS, and on Windows that search
+    // starts in the current directory: a rust-lld.exe planted in the project
+    // being built would run instead of the real one. Resolve it ourselves,
+    // through PATH only.
+    if lld.contains(['/', '\\']) {
+        return Ok(lld);
+    }
+    let file = if cfg!(windows) && !lld.to_ascii_lowercase().ends_with(".exe") { format!("{lld}.exe") } else { lld.clone() };
+    os::find_in_path(&file).ok_or_else(|| {
+        format!("{lld} not found on PATH (the current directory is not searched); set WJLINK_LLD or run `wjlink init --lld <rust-lld path>`")
+    })
 }
 
 fn cmd_link(args: &[String]) -> i32 {
@@ -228,7 +239,10 @@ fn cmd_link(args: &[String]) -> i32 {
     if !os::exists(&runtime) {
         return fail(&format!("{runtime} is missing; run `wjlink init` first"));
     }
-    let lld = find_lld(&dir);
+    let lld = match find_lld(&dir) {
+        Ok(p) => p,
+        Err(e) => return fail(&e),
+    };
     // The runtime object goes first so its definitions win over same-named
     // DLL exports that a library earlier on the line could otherwise supply.
     let mut full: Vec<String> = vec!["-flavor".into(), "link".into(), runtime];
@@ -238,6 +252,7 @@ fn cmd_link(args: &[String]) -> i32 {
 
     // Stay well below the 32767-character command-line limit.
     let length: usize = full.iter().map(|a| a.len() + 3).sum();
+    let mut response_file = None;
     if length > 30_000 {
         let mut rsp = String::new();
         for a in &full[2..] {
@@ -250,8 +265,15 @@ fn cmd_link(args: &[String]) -> i32 {
         }
         full.truncate(2);
         full.push(format!("@{path}"));
+        response_file = Some(path);
     }
-    match os::run(&lld, &full) {
+    let result = os::run(&lld, &full);
+    // The response file only exists for this one link; don't leave one behind
+    // per build.
+    if let Some(path) = response_file {
+        os::remove(&path);
+    }
+    match result {
         Ok(code) => code,
         Err(e) => fail(&format!("{e}; set WJLINK_LLD or run `wjlink init --lld <rust-lld path>`")),
     }
@@ -313,7 +335,7 @@ mod rt {
     use core::ffi::{c_char, c_void};
 
     #[link(name = "kernel32", kind = "raw-dylib")]
-    extern "system" {
+    unsafe extern "system" {
         fn GetProcessHeap() -> isize;
         fn HeapAlloc(heap: isize, flags: u32, size: usize) -> *mut u8;
         fn HeapReAlloc(heap: isize, flags: u32, mem: *mut u8, size: usize) -> *mut u8;
@@ -325,7 +347,7 @@ mod rt {
     // put them in the import table it generates.
     #[allow(dead_code)]
     #[link(name = "ntdll", kind = "raw-dylib")]
-    extern "C" {
+    unsafe extern "C" {
         fn memcpy(dst: *mut c_void, src: *const c_void, n: usize) -> *mut c_void;
         fn memmove(dst: *mut c_void, src: *const c_void, n: usize) -> *mut c_void;
         fn memset(dst: *mut c_void, c: i32, n: usize) -> *mut c_void;
@@ -343,22 +365,28 @@ mod rt {
             if layout.align() > 16 {
                 return core::ptr::null_mut();
             }
-            HeapAlloc(GetProcessHeap(), 0, layout.size())
+            // SAFETY: the process heap handle is always valid.
+            unsafe { HeapAlloc(GetProcessHeap(), 0, layout.size()) }
         }
         unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
             if layout.align() > 16 {
                 return core::ptr::null_mut();
             }
-            HeapAlloc(GetProcessHeap(), 8, layout.size()) // HEAP_ZERO_MEMORY
+            // SAFETY: as above; flag 8 is HEAP_ZERO_MEMORY.
+            unsafe { HeapAlloc(GetProcessHeap(), 8, layout.size()) }
         }
         unsafe fn dealloc(&self, ptr: *mut u8, _layout: Layout) {
-            HeapFree(GetProcessHeap(), 0, ptr);
+            // SAFETY: GlobalAlloc's contract: `ptr` came from this allocator.
+            unsafe {
+                HeapFree(GetProcessHeap(), 0, ptr);
+            }
         }
         unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, size: usize) -> *mut u8 {
             if layout.align() > 16 {
                 return core::ptr::null_mut();
             }
-            HeapReAlloc(GetProcessHeap(), 0, ptr, size)
+            // SAFETY: GlobalAlloc's contract: `ptr` came from this allocator.
+            unsafe { HeapReAlloc(GetProcessHeap(), 0, ptr, size) }
         }
     }
 
@@ -372,7 +400,7 @@ mod rt {
     }
 
     /// Entry point: rust-lld picks `mainCRTStartup` for console programs.
-    #[no_mangle]
+    #[unsafe(no_mangle)]
     pub extern "C" fn mainCRTStartup() -> ! {
         let code = crate::real_main(crate::os::args());
         crate::os::exit(code)
@@ -380,11 +408,11 @@ mod rt {
 
     // Referenced by precompiled core/alloc objects: the float marker and the
     // C++ exception personality (never called: panics abort).
-    #[no_mangle]
+    #[unsafe(no_mangle)]
     #[used]
     pub static _fltused: i32 = 0;
 
-    #[no_mangle]
+    #[unsafe(no_mangle)]
     pub extern "C" fn __CxxFrameHandler3() -> i32 {
         1 // ExceptionContinueSearch
     }

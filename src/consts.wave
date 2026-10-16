@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: MPL-2.0
 //
 // Public constants shared by every wjson module. Values mirror
 // include/wjson.h and native/include/wjson_native.h.
@@ -74,6 +74,7 @@ pub const JSON_EDIT_CYCLE: i32 = -3;        // value would contain itself
 pub const JSON_EDIT_NOT_FOUND: i32 = -4;    // no such key / index
 pub const JSON_EDIT_WRONG_TYPE: i32 = -5;   // object op on array or vice versa
 pub const JSON_EDIT_BAD_VALUE: i32 = -6;    // NaN/inf, bad number text, bad UTF-8
+pub const JSON_EDIT_TOO_DEEP: i32 = -7;     // json_copy: nested deeper than JSON_MAX_DEPTH_LIMIT
 
 // Writer status codes.
 pub const JSON_WRITER_OK: i32 = 0;
@@ -82,6 +83,12 @@ pub const JSON_WRITER_ERR_ALLOC: i32 = 2;    // allocation failed
 pub const JSON_WRITER_ERR_NUMBER: i32 = 3;   // NaN or infinity
 pub const JSON_WRITER_ERR_UTF8: i32 = 4;     // string is not valid UTF-8
 pub const JSON_WRITER_ERR_INCOMPLETE: i32 = 5; // finished with open containers
+pub const JSON_WRITER_ERR_DEPTH: i32 = 6;    // nesting beyond JSON_MAX_DEPTH_LIMIT
+
+// Deepest nesting the parser (any max_depth is clamped to it), json_copy, the
+// writer and the tree functions handle. They recurse once per level, so the
+// cap keeps hostile or runaway documents from overflowing the stack.
+pub const JSON_MAX_DEPTH_LIMIT: i32 = 2048;
 
 // Makes Korean/emoji output from println readable in a Windows console
 // (switches it to UTF-8). Harmless no-op on Linux and macOS.

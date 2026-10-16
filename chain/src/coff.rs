@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: MPL-2.0
 //! Minimal COFF object writer (x86-64): sections with relocations, a symbol
 //! table and a string table. Enough for import descriptors and the runtime
 //! object; no line numbers, no COMDATs.

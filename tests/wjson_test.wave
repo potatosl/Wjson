@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: MPL-2.0
 //
 // End-to-end tests for wjson: Wave API -> Rust core + C++ native.
 // Run with:  wavec run build.wave
@@ -24,7 +24,10 @@ import("wjson")::{
     json_field_str, json_field_i64, json_field_bool, json_field_f64,
     json_write_value, json_to_string, json_to_string_with, json_string_free,
     json_equal, json_depth,
+    JSON_MAX_DEPTH_LIMIT, json_as_str_checked, json_str_has_nul, json_key_at_bytes,
+    json_parse_bytes,
 };
+import("std::mem::alloc")::{mem_alloc, mem_free};
 
 static CHECKS: i32 = 0;
 static FAILURES: i32 = 0;
@@ -280,13 +283,76 @@ fun test_tree() {
 }
 
 fun test_misc() {
-    check(streq(json_version(), "0.3.0"), "core version");
+    check(streq(json_version(), "0.4.0"), "core version");
     check(streq(json_type_name(JSON_ARRAY), "array"), "type name");
     check(streq(json_type_name(JSON_INVALID), "invalid"), "invalid type name");
 }
 
+fun test_embedded_nul() {
+    // "\u0000" inside a string or key is legal JSON. A str stops at the NUL,
+    // so the API must make that visible instead of truncating silently.
+    var doc: JsonDoc = json_parse("{\"k\":\"admin\\u0000.txt\",\"a\\u0000b\":1,\"plain\":\"ok\"}");
+    check(json_ok(doc), "NUL document parses");
+    var root: Json = json_root(doc);
+    var k: Json = json_get(root, "k");
+    check(streq(json_as_str(k), "admin"), "str view stops at the NUL");
+    check(json_str_has_nul(k), "has_nul detects it");
+    check(json_str_is_null(json_as_str_checked(k)), "checked accessor refuses it");
+    check(!json_str_eq(k, "admin"), "exact comparison is not fooled");
+    var plain: Json = json_get(root, "plain");
+    check(!json_str_has_nul(plain) && streq(json_as_str_checked(plain), "ok"), "clean strings pass");
+    var klen: i64 = 0;
+    var key: ptr<u8> = json_key_at_bytes(root, 1, &klen);
+    check(key != null && klen == 3 && key[0] == 97 && key[1] == 0 && key[2] == 98, "key keeps its NUL and length");
+    // Serializing must not cut the key down to "a".
+    var text: str = json_to_string(root, 0);
+    check(streq(text, "{\"k\":\"admin\\u0000.txt\",\"a\\u0000b\":1,\"plain\":\"ok\"}"), "round trip keeps NUL keys");
+    json_string_free(text);
+    var again: JsonDoc = json_parse("{\"k\":\"admin\\u0000.txt\",\"a\\u0000b\":1,\"plain\":\"ok\"}");
+    check(json_equal(root, json_root(again)), "equal compares full keys");
+    var other: JsonDoc = json_parse("{\"k\":\"admin\\u0000.txt\",\"a\":1,\"plain\":\"ok\"}");
+    check(!json_equal(root, json_root(other)), "a\\u0000b is not a");
+    json_free(&other);
+    json_free(&again);
+    json_free(&doc);
+}
+
+fun nested(depth: i64) -> JsonDoc {
+    var n: i64 = depth * 2;
+    var buf: ptr<u8> = mem_alloc(n);
+    var i: i64 = 0;
+    while (i < depth) {
+        deref buf[i] = 91;
+        deref buf[n - 1 - i] = 93;
+        i += 1;
+    }
+    var doc: JsonDoc = json_parse_bytes(buf, n, 1000000, 0);
+    mem_free(buf, n);
+    return doc;
+}
+
+fun test_depth_cap() {
+    // A huge max_depth is clamped, so hostile nesting cannot blow the stack.
+    var limit: i64 = JSON_MAX_DEPTH_LIMIT as i64;
+    var fits: JsonDoc = nested(limit);
+    check(json_ok(fits), "nesting at the limit parses");
+    var root: Json = json_root(fits);
+    check(json_depth(root) == limit, "depth at the limit");
+    check(json_equal(root, root), "equal works at the limit");
+    var text: str = json_to_string(root, 0);
+    check(!json_str_is_null(text), "serializes at the limit");
+    json_string_free(text);
+    json_free(&fits);
+
+    var over: JsonDoc = nested(limit + 1);
+    check(!json_ok(over) && json_error(over).code == JSON_ERR_TOO_DEEP, "one past the limit is refused");
+    json_free(&over);
+}
+
 fun main() -> i32 {
     wjson_console_utf8();
+    test_embedded_nul();
+    test_depth_cap();
     test_parse_and_navigate();
     test_pointer_and_path();
     test_errors();

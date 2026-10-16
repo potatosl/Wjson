@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: MPL-2.0
 //! Incremental pull parser.
 //!
 //! Feed input in chunks of any size, then pull events one at a time. When a
@@ -14,6 +14,16 @@
 use crate::parser::{ErrorCode, DEFAULT_MAX_DEPTH, OPT_COMMENTS, OPT_TRAILING_COMMAS};
 
 pub const OPT_MULTI: u32 = 4;
+
+/// Default cap on the unconsumed bytes the reader will hold while it waits for
+/// the rest of one token (a string, number or comment). Without a cap, a
+/// peer that never closes a string makes the reader buffer without bound.
+pub const DEFAULT_MAX_TOKEN: usize = 256 << 20;
+
+/// Longest number lexeme the streaming reader accepts. Numbers are rescanned
+/// from their first byte whenever more input arrives, so the length is capped
+/// to keep that cost bounded (the DOM parser has no such limit).
+pub const MAX_NUMBER_LEN: usize = 1 << 16;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(i32)]
@@ -73,6 +83,13 @@ pub struct Reader {
     error: Option<StreamError>,
     documents: u64,
     started: bool,
+    /// Longest incomplete token tolerated (see `DEFAULT_MAX_TOKEN`).
+    max_token: usize,
+    /// Where the scan of an incomplete string/comment stopped, relative to
+    /// `pos`, so the next call resumes there instead of starting over (a
+    /// token fed in small chunks would otherwise be rescanned quadratically).
+    /// Reset whenever input is consumed.
+    resume: usize,
 }
 
 /// Lexing outcome for one token.
@@ -102,7 +119,15 @@ impl Reader {
             error: None,
             documents: 0,
             started: false,
+            max_token: DEFAULT_MAX_TOKEN,
+            resume: 0,
         }
+    }
+
+    /// Limits how much input may be buffered while one token is incomplete;
+    /// exceeding it yields `ErrorCode::TooLarge`. 0 restores the default.
+    pub fn set_max_token(&mut self, bytes: usize) {
+        self.max_token = if bytes == 0 { DEFAULT_MAX_TOKEN } else { bytes };
     }
 
     pub fn feed(&mut self, data: &[u8]) -> bool {
@@ -133,7 +158,7 @@ impl Reader {
     /// Same bytes followed by a NUL terminator.
     pub fn text_cstr(&self) -> *const u8 {
         if self.text.is_empty() {
-            b"\0".as_ptr()
+            c"".as_ptr() as *const u8
         } else {
             self.text.as_ptr()
         }
@@ -161,6 +186,9 @@ impl Reader {
 
     /// Consumes `n` bytes, keeping offset/line/column in step.
     fn advance(&mut self, n: usize) {
+        if n > 0 {
+            self.resume = 0;
+        }
         for &b in &self.buf[self.pos..self.pos + n] {
             if b == b'\n' {
                 self.line += 1;
@@ -204,25 +232,48 @@ impl Reader {
             }
             match rest.get(1) {
                 None if !self.eof => return Err(Event::NeedMore),
-                Some(b'/') => match rest[2..].iter().position(|&b| b == b'\n') {
-                    Some(p) => self.advance(2 + p + 1),
-                    None if self.eof => {
-                        let n = rest.len();
-                        self.advance(n);
+                Some(b'/') => {
+                    let from = self.resume.max(2);
+                    match rest.get(from..).and_then(|t| t.iter().position(|&b| b == b'\n')) {
+                        Some(p) => self.advance(from + p + 1),
+                        None if self.eof => {
+                            let n = rest.len();
+                            self.advance(n);
+                        }
+                        None => {
+                            self.resume = rest.len();
+                            return Err(Event::NeedMore);
+                        }
                     }
-                    None => return Err(Event::NeedMore),
-                },
-                Some(b'*') => match rest[2..].windows(2).position(|w| w == b"*/") {
-                    Some(p) => self.advance(2 + p + 2),
-                    None if self.eof => return Err(self.fail(ErrorCode::UnexpectedEnd, 0)),
-                    None => return Err(Event::NeedMore),
-                },
+                }
+                Some(b'*') => {
+                    let from = self.resume.max(2);
+                    match rest.get(from..).and_then(|t| t.windows(2).position(|w| w == b"*/")) {
+                        Some(p) => self.advance(from + p + 2),
+                        None if self.eof => return Err(self.fail(ErrorCode::UnexpectedEnd, 0)),
+                        None => {
+                            // Keep the last byte: it may be the '*' of "*/".
+                            self.resume = rest.len().saturating_sub(1).max(2);
+                            return Err(Event::NeedMore);
+                        }
+                    }
+                }
                 _ => return Err(self.fail(ErrorCode::UnexpectedChar, 0)),
             }
         }
     }
 
+    // Not an Iterator: `NeedMore` is a normal result, not the end.
+    #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> Event {
+        let event = self.next_event();
+        if event == Event::NeedMore && self.buffered() > self.max_token {
+            return self.fail(ErrorCode::TooLarge, 0);
+        }
+        event
+    }
+
+    fn next_event(&mut self) -> Event {
         if self.error.is_some() {
             return Event::Error;
         }
@@ -379,6 +430,14 @@ impl Reader {
     /// prefix, same error codes and offsets). Whenever the decision depends
     /// on bytes not received yet, reports Incomplete.
     fn lex_number(&mut self) -> Lex {
+        match self.lex_number_prefix() {
+            Lex::Incomplete if self.buffered() > MAX_NUMBER_LEN => Lex::Fail(ErrorCode::TooLarge, 0),
+            Lex::Token(_, n) if n > MAX_NUMBER_LEN => Lex::Fail(ErrorCode::TooLarge, 0),
+            other => other,
+        }
+    }
+
+    fn lex_number_prefix(&mut self) -> Lex {
         let rest = &self.buf[self.pos..];
         let eof = self.eof;
         let get = |i: usize| rest.get(i).copied();
@@ -453,12 +512,17 @@ impl Reader {
     /// Lexes a string at pos (which holds '"') into `text`, decoded.
     fn lex_string(&mut self) -> Lex {
         let rest = &self.buf[self.pos..];
-        // Find the closing quote, skipping escaped characters.
-        let mut i = 1;
+        // Find the closing quote, skipping escaped characters; continue where
+        // an earlier, incomplete attempt stopped.
+        let mut i = self.resume.max(1);
         loop {
             match rest.get(i) {
                 None => {
-                    return if self.eof { Lex::Fail(ErrorCode::UnexpectedEnd, 0) } else { Lex::Incomplete };
+                    if self.eof {
+                        return Lex::Fail(ErrorCode::UnexpectedEnd, 0);
+                    }
+                    self.resume = i;
+                    return Lex::Incomplete;
                 }
                 Some(b'"') => break,
                 Some(b'\\') => i += 2,
@@ -625,6 +689,102 @@ mod tests {
     }
 
     #[test]
+    fn oversized_tokens_are_refused() {
+        // An unterminated string may not grow the buffer past max_token.
+        let mut r = Reader::new(0, 0);
+        r.set_max_token(1000);
+        r.feed(b"\"");
+        let mut result = Event::NeedMore;
+        for _ in 0..100 {
+            r.feed(&[b'a'; 64]);
+            result = r.next();
+            if result != Event::NeedMore {
+                break;
+            }
+        }
+        assert_eq!(result, Event::Error);
+        assert_eq!(r.error().unwrap().code, ErrorCode::TooLarge);
+        assert!(r.buffered() < 1200);
+
+        // Same for a never-ending comment and a never-ending number.
+        for (prefix, flags) in [(&b"/*"[..], OPT_COMMENTS), (&b"//"[..], OPT_COMMENTS)] {
+            let mut r = Reader::new(0, flags);
+            r.set_max_token(1000);
+            r.feed(prefix);
+            let mut result = Event::NeedMore;
+            for _ in 0..100 {
+                r.feed(&[b'x'; 64]);
+                result = r.next();
+                if result != Event::NeedMore {
+                    break;
+                }
+            }
+            assert_eq!(r.error().map(|e| e.code), Some(ErrorCode::TooLarge), "{prefix:?}");
+            assert_eq!(result, Event::Error);
+        }
+        let mut r = Reader::new(0, 0);
+        r.feed(b"1");
+        let mut result = Event::NeedMore;
+        for _ in 0..(MAX_NUMBER_LEN / 1024 + 4) {
+            r.feed(&[b'7'; 1024]);
+            result = r.next();
+            if result != Event::NeedMore {
+                break;
+            }
+        }
+        assert_eq!(result, Event::Error);
+        assert_eq!(r.error().unwrap().code, ErrorCode::TooLarge);
+
+        // A token that fits is unaffected, however it is chunked.
+        let mut r = Reader::new(0, 0);
+        r.set_max_token(1000);
+        let long = format!("\"{}\"", "b".repeat(900));
+        for piece in long.as_bytes().chunks(7) {
+            assert_eq!(r.next(), Event::NeedMore);
+            r.feed(piece);
+        }
+        r.finish();
+        assert_eq!(r.next(), Event::String);
+        assert_eq!(r.text().len(), 900);
+    }
+
+    #[test]
+    fn long_tokens_in_tiny_chunks_are_not_rescanned() {
+        // 4 MB of string and block comment fed 64 bytes at a time. Restarting
+        // the scan on every chunk would take minutes; resuming takes a blink.
+        let started = std::time::Instant::now();
+        let body = "x\\\"y".repeat(1 << 20);
+        let doc = format!("/* {body} */ [\"{body}\"]");
+        let mut r = Reader::new(0, OPT_COMMENTS);
+        r.set_max_token(usize::MAX);
+        let mut fed = 0;
+        let bytes = doc.as_bytes();
+        let mut strings = 0;
+        loop {
+            match r.next() {
+                Event::NeedMore => {
+                    if fed >= bytes.len() {
+                        r.finish();
+                    } else {
+                        let end = (fed + 64).min(bytes.len());
+                        r.feed(&bytes[fed..end]);
+                        fed = end;
+                    }
+                }
+                Event::String => {
+                    strings += 1;
+                    assert_eq!(r.text().len(), 3 << 20);
+                }
+                Event::End => break,
+                Event::Error => panic!("{:?}", r.error()),
+                _ => {}
+            }
+        }
+        assert_eq!(strings, 1);
+        assert!(started.elapsed().as_secs() < 20, "took {:?}", started.elapsed());
+    }
+
+    #[test]
     fn json_lines_and_bom() {
         let input = b"\xEF\xBB\xBF{\"a\":1}\n{\"a\":2}\n\n[3]\n";
         for chunk in 1..5 {
@@ -668,7 +828,7 @@ mod tests {
                         }
                         sent += chunk.len();
                         r.feed(&chunk);
-                    } else if sent == total || sent > total {
+                    } else if sent >= total {
                         r.feed(b"0]");
                         r.finish();
                         sent = usize::MAX;

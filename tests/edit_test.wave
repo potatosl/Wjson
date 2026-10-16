@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: MPL-2.0
 //
 // Tests for document editing (src/edit.wave over the Rust core).
 // Run with:  wavec run build.wave
@@ -7,11 +7,11 @@ import("wjson")::{
     wjson_console_utf8,
     JsonDoc, Json,
     JSON_EDIT_OK, JSON_EDIT_INVALID, JSON_EDIT_ATTACHED, JSON_EDIT_CYCLE,
-    JSON_EDIT_NOT_FOUND, JSON_EDIT_WRONG_TYPE, JSON_EDIT_BAD_VALUE, JSON_OBJECT,
+    JSON_EDIT_NOT_FOUND, JSON_EDIT_WRONG_TYPE, JSON_EDIT_BAD_VALUE, JSON_EDIT_TOO_DEEP, JSON_OBJECT,
     json_parse, json_ok, json_root, json_free, json_len, json_get, json_at, json_type,
     json_is_valid, json_is_null, json_str_eq, json_i64_or, json_f64_or, json_bool_or,
     json_number_text, json_path, json_path_i64, json_path_str, json_has,
-    json_to_string, json_string_free, json_equal, json_str_is_null,
+    json_to_string, json_string_free, json_equal, json_depth, json_str_is_null,
     json_new_document, json_set_root, json_edit_error, json_new_null, json_new_bool,
     json_new_i64, json_new_f64, json_new_number_text, json_new_str, json_new_array,
     json_new_object, json_copy, json_parent, json_is_attached,
@@ -236,8 +236,31 @@ fun test_bulk() {
     json_free(&doc);
 }
 
+fun test_depth_limit() {
+    // The editing API can nest deeper than the parser allows; the operations
+    // that recurse refuse such documents instead of overflowing the stack.
+    var doc: JsonDoc = json_new_document();
+    var root: Json = json_new_array(doc);
+    json_set_root(doc, root);
+    var cur: Json = root;
+    var i: i32 = 0;
+    while (i < 2100) {
+        cur = json_push_array(cur);
+        i += 1;
+    }
+    check(json_depth(root) > 2000, "depth is counted without recursing forever");
+    var big: Json = json_copy(doc, root);
+    check(!json_is_valid(big) && json_edit_error(big) == JSON_EDIT_TOO_DEEP, "deep copy refused");
+    check(json_is_valid(json_copy(doc, cur)), "shallow copy still works");
+    var text: str = json_to_string(root, 0);
+    check(json_str_is_null(text), "serializing too-deep value fails cleanly");
+    check(!json_equal(root, root), "too-deep values are never equal");
+    json_free(&doc);
+}
+
 fun main() -> i32 {
     wjson_console_utf8();
+    test_depth_limit();
     test_build_from_scratch();
     test_edit_parsed();
     test_rules();

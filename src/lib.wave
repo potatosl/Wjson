@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: MPL-2.0
 //
 // wjson — JSON for Wave.
 //
@@ -30,9 +30,9 @@ pub import("./consts")::{
     JSON_EV_ARRAY_START, JSON_EV_ARRAY_END, JSON_EV_KEY, JSON_EV_STRING, JSON_EV_NUMBER,
     JSON_EV_TRUE, JSON_EV_FALSE, JSON_EV_NULL, JSON_EV_END, JSON_STREAM_MULTI,
     JSON_EDIT_OK, JSON_EDIT_INVALID, JSON_EDIT_ATTACHED, JSON_EDIT_CYCLE,
-    JSON_EDIT_NOT_FOUND, JSON_EDIT_WRONG_TYPE, JSON_EDIT_BAD_VALUE,
+    JSON_EDIT_NOT_FOUND, JSON_EDIT_WRONG_TYPE, JSON_EDIT_BAD_VALUE, JSON_EDIT_TOO_DEEP,
     JSON_WRITER_OK, JSON_WRITER_ERR_STATE, JSON_WRITER_ERR_ALLOC, JSON_WRITER_ERR_NUMBER,
-    JSON_WRITER_ERR_UTF8, JSON_WRITER_ERR_INCOMPLETE,
+    JSON_WRITER_ERR_UTF8, JSON_WRITER_ERR_INCOMPLETE, JSON_WRITER_ERR_DEPTH, JSON_MAX_DEPTH_LIMIT,
     json_type_name, json_null_str, json_str_is_null, wjson_console_utf8,
 };
 
@@ -42,8 +42,8 @@ pub import("./value")::{
     json_root, json_node_count, json_free,
     json_type, json_is_valid, json_is_null, json_is_bool, json_is_number, json_is_string,
     json_is_array, json_is_object, json_is_integer, json_len,
-    json_get, json_get_bytes, json_at, json_key_at, json_has, json_pointer,
-    json_as_bool, json_as_str, json_as_bytes, json_number_text,
+    json_get, json_get_bytes, json_at, json_key_at, json_key_at_bytes, json_has, json_pointer,
+    json_as_bool, json_as_str, json_as_str_checked, json_str_has_nul, json_as_bytes, json_number_text,
     json_as_i64, json_as_i64_checked, json_as_f64, json_as_f64_checked,
     json_i64_or, json_f64_or, json_bool_or, json_str_or, json_str_eq,
 };
@@ -81,7 +81,7 @@ pub import("./edit")::{
 };
 
 pub import("./stream")::{
-    JsonReader, JsonStream,
+    JsonReader, JsonStream, json_reader_set_max_token, json_stream_set_max_token,
     json_reader_new, json_reader_new_with, json_reader_free, json_reader_feed,
     json_reader_feed_str, json_reader_finish, json_reader_next, json_reader_text,
     json_reader_text_bytes, json_reader_text_eq, json_reader_i64, json_reader_f64,

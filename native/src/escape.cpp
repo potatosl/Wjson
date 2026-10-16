@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: MPL-2.0
 // JSON string escaping and UTF-8 utilities for wjson. Freestanding: needs
 // no C or C++ library headers.
 
@@ -130,7 +130,9 @@ extern "C" int64_t wjn_escape(const char *src, int64_t len, char *dst, int64_t c
 }
 
 extern "C" int64_t wjn_utf8_check(const char *src, int64_t len) noexcept {
-    if (len <= 0 || src == nullptr) return -1;
+    if (len == 0) return -1;
+    // A bad argument is never "valid": report it as a bad byte at offset 0.
+    if (len < 0 || src == nullptr) return 0;
     const auto *base = reinterpret_cast<const unsigned char *>(src);
     const auto *p = base;
     const auto *e = base + len;

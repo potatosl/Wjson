@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: MPL-2.0
 //
 // Streaming (pull) parsing for inputs too big to hold in memory.
 //
@@ -32,7 +32,7 @@ import("std::fs::file")::{open_read};
 import("std::io::fd")::{io_read, io_close};
 import("std::mem::alloc")::{mem_alloc, mem_free};
 import("./ffi")::{
-    ffi_reader_new, ffi_reader_free, ffi_reader_feed, ffi_reader_finish, ffi_reader_next,
+    ffi_reader_new, ffi_reader_free, ffi_reader_set_max_token, ffi_reader_feed, ffi_reader_finish, ffi_reader_next,
     ffi_reader_text, ffi_reader_depth, ffi_reader_documents, ffi_reader_buffered,
     ffi_reader_error_code, ffi_reader_error_message, ffi_reader_error_offset,
     ffi_reader_error_line, ffi_reader_error_column, ffi_parse_i64, ffi_parse_f64,
@@ -78,6 +78,14 @@ pub fun json_reader_new(flags: u32) -> JsonReader {
 
 pub fun json_reader_new_with(max_depth: i32, flags: u32) -> JsonReader {
     return JsonReader { handle: ffi_reader_new(max_depth, flags) };
+}
+
+// Caps the input the reader holds while one string or comment is incomplete
+// (default 256 MiB; 0 restores it). Past the cap json_reader_next reports
+// JSON_EV_ERROR with JSON_ERR_TOO_LARGE, so a peer that never closes a string
+// cannot make the reader buffer without bound. Numbers are limited to 64 KiB.
+pub fun json_reader_set_max_token(r: JsonReader, bytes: i64) {
+    ffi_reader_set_max_token(r.handle, bytes);
 }
 
 pub fun json_reader_free(r: ptr<JsonReader>) {
@@ -251,6 +259,11 @@ pub fun json_stream_skip(s: ptr<JsonStream>) -> i32 {
         }
     }
     return ev;
+}
+
+// Same cap as json_reader_set_max_token, for a stream.
+pub fun json_stream_set_max_token(s: ptr<JsonStream>, bytes: i64) {
+    json_reader_set_max_token(deref s.reader, bytes);
 }
 
 pub fun json_stream_text(s: ptr<JsonStream>) -> str {

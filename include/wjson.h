@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT
+/* SPDX-License-Identifier: MPL-2.0
  *
  * wjson core C ABI (implemented in Rust, core/src/lib.rs).
  *
@@ -6,6 +6,15 @@
  * and read the error from the handle, then release it with wj_free().
  * Values are addressed by int32 node ids; -1 means "no such value".
  * Every accessor tolerates a NULL handle and out-of-range ids.
+ *
+ * Threads: reading a document (wj_get, wj_at, wj_pointer, ...) is safe from
+ * several threads at once as long as nobody is editing it. Any wj_new_*,
+ * wj_arr_*, wj_obj_*, wj_set_root or wj_copy call needs exclusive access to
+ * that document. A wj_reader belongs to one thread at a time.
+ *
+ * Text returned by wj_str/wj_key/wj_num is NUL-terminated but may also contain
+ * NUL bytes (from "\u0000"); always use the returned length when the data is
+ * untrusted, because C string functions stop at the first NUL.
  */
 #ifndef WJSON_H
 #define WJSON_H
@@ -27,6 +36,8 @@ enum {
     WJ_OBJECT = 5,
     WJ_INVALID = -1
 };
+
+#define WJ_MAX_DEPTH_LIMIT 2048
 
 enum {
     WJ_ALLOW_TRAILING_COMMAS = 1u,
@@ -53,6 +64,8 @@ enum {
 const uint8_t *wj_version(void);
 
 wj_doc *wj_parse(const uint8_t *src, int64_t len);
+/* max_depth 0 selects the default (512); larger values are clamped to
+ * WJ_MAX_DEPTH_LIMIT because the DOM parser recurses once per level. */
 wj_doc *wj_parse_ex(const uint8_t *src, int64_t len, int32_t max_depth, uint32_t flags);
 wj_doc *wj_parse_cstr(const uint8_t *src, int32_t max_depth, uint32_t flags);
 void wj_free(wj_doc *doc);
@@ -88,7 +101,8 @@ enum {
     WJ_EDIT_CYCLE = -3,
     WJ_EDIT_NOT_FOUND = -4,
     WJ_EDIT_WRONG_TYPE = -5,
-    WJ_EDIT_BAD_VALUE = -6
+    WJ_EDIT_BAD_VALUE = -6,
+    WJ_EDIT_TOO_DEEP = -7 /* wj_copy: value nested deeper than WJ_MAX_DEPTH_LIMIT */
 };
 
 wj_doc *wj_new_doc(void);
@@ -105,6 +119,8 @@ int32_t wj_arr_insert(wj_doc *doc, int32_t arr, int64_t index, int32_t value);
 int32_t wj_arr_set(wj_doc *doc, int32_t arr, int64_t index, int32_t value);
 int32_t wj_arr_remove(wj_doc *doc, int32_t arr, int64_t index);
 int32_t wj_obj_set(wj_doc *doc, int32_t obj, const uint8_t *key, int64_t key_len, int32_t value);
+/* Removes every member; returns how many were removed (or a negative code). */
+int32_t wj_obj_clear(wj_doc *doc, int32_t obj);
 int32_t wj_obj_remove(wj_doc *doc, int32_t obj, const uint8_t *key, int64_t key_len);
 int32_t wj_copy(wj_doc *doc, const wj_doc *src, int32_t src_node);
 
@@ -130,6 +146,11 @@ enum {
 #define WJ_STREAM_MULTI 4u /* accept many top-level values (JSON Lines) */
 
 wj_reader *wj_reader_new(int32_t max_depth, uint32_t flags);
+/* Caps the input held while one string or comment is still incomplete (default
+ * 256 MiB; 0 or less restores it). Beyond the cap the reader reports
+ * WJ_ERR_TOO_LARGE, so a peer that never closes a string cannot make it buffer
+ * without bound. Number lexemes are limited to 64 KiB. */
+void wj_reader_set_max_token(wj_reader *r, int64_t bytes);
 void wj_reader_free(wj_reader *r);
 int32_t wj_reader_feed(wj_reader *r, const uint8_t *data, int64_t len);
 void wj_reader_finish(wj_reader *r);

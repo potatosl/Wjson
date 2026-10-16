@@ -1,9 +1,11 @@
+# SPDX-License-Identifier: MPL-2.0
 [package]
 name = "wjlink"
 authors = ["panda"]
-version = "0.1.0"
-edition = "2021"
-license = "MIT"
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.99"
+license = "MPL-2.0"
 description = "MSVC-free Windows link driver for wjson: import libraries generated from system DLLs, a tiny C runtime object, and rust-lld"
 publish = false
 

@@ -1,10 +1,24 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: MPL-2.0
 //! wjson_core: the parsing half of the wjson Wave library.
 //!
 //! Exposes a C ABI (see `include/wjson.h`). A parse always yields a document
 //! handle — even on failure — so the caller can read the error position from
 //! it. Values are addressed by `i32` node ids; `-1` means "no such value".
 //! Every accessor tolerates a null handle and out-of-range ids.
+
+// Every `extern "C"` function below shares one safety contract, stated once
+// here instead of in 50 copies: a document/reader handle must be null or come
+// from the matching constructor and not yet have been freed; a `(pointer, len)`
+// pair must describe `len` readable bytes (or `len == 0`); `out_len` must be
+// null or writable; handles must not be used from two threads at once when
+// either call mutates (reads of a document nobody is editing may run
+// concurrently). Null handles, bad ids and negative lengths are tolerated.
+#![allow(clippy::missing_safety_doc)]
+// Edition 2024 asks for an explicit `unsafe {}` around each unsafe operation
+// inside an `unsafe fn`. Here every such operation is dereferencing or slicing
+// the caller's pointers, which is exactly what the contract above covers, so a
+// block in each of the ~60 entry points would only repeat it.
+#![allow(unsafe_op_in_unsafe_fn)]
 
 pub mod dom;
 pub mod edit;
@@ -64,20 +78,20 @@ fn id_out(id: Option<u32>) -> i32 {
 }
 
 /// Library version, NUL-terminated.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn wj_version() -> *const u8 {
     concat!(env!("CARGO_PKG_VERSION"), "\0").as_ptr()
 }
 
 /// Parses `len` bytes with default options (strict, depth 512).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn wj_parse(src: *const u8, len: i64) -> *mut Doc {
     wj_parse_ex(src, len, 0, 0)
 }
 
 /// Parses with explicit options. `max_depth == 0` selects the default.
 /// `flags`: 1 = allow trailing commas, 2 = allow comments.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn wj_parse_ex(src: *const u8, len: i64, max_depth: i32, flags: u32) -> *mut Doc {
     let doc = match bytes_arg(src, len) {
         None => Doc::new(
@@ -93,7 +107,7 @@ pub unsafe extern "C" fn wj_parse_ex(src: *const u8, len: i64, max_depth: i32, f
 }
 
 /// Parses a NUL-terminated string.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn wj_parse_cstr(src: *const u8, max_depth: i32, flags: u32) -> *mut Doc {
     if src.is_null() {
         return wj_parse_ex(ptr::null(), -1, max_depth, flags);
@@ -102,14 +116,14 @@ pub unsafe extern "C" fn wj_parse_cstr(src: *const u8, max_depth: i32, flags: u3
     wj_parse_ex(src, len as i64, max_depth, flags)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn wj_free(doc: *mut Doc) {
     if !doc.is_null() {
         drop(Box::from_raw(doc));
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn wj_ok(doc: *const Doc) -> i32 {
     match doc_ref(doc) {
         Some(d) if d.error.is_none() => 1,
@@ -117,7 +131,7 @@ pub unsafe extern "C" fn wj_ok(doc: *const Doc) -> i32 {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn wj_error_code(doc: *const Doc) -> i32 {
     match doc_ref(doc) {
         None => ErrorCode::InvalidArgument as i32,
@@ -125,7 +139,7 @@ pub unsafe extern "C" fn wj_error_code(doc: *const Doc) -> i32 {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn wj_error_message(doc: *const Doc) -> *const u8 {
     let code = match doc_ref(doc) {
         None => ErrorCode::InvalidArgument,
@@ -135,24 +149,24 @@ pub unsafe extern "C" fn wj_error_message(doc: *const Doc) -> *const u8 {
 }
 
 /// Byte offset of the error (0 when ok).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn wj_error_offset(doc: *const Doc) -> i64 {
     doc_ref(doc).and_then(|d| d.error).map_or(0, |e| e.offset as i64)
 }
 
 /// 1-based line of the error (0 when ok).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn wj_error_line(doc: *const Doc) -> i64 {
     doc_ref(doc).and_then(|d| d.error).map_or(0, |e| e.line as i64)
 }
 
 /// 1-based column (in code points) of the error (0 when ok).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn wj_error_column(doc: *const Doc) -> i64 {
     doc_ref(doc).and_then(|d| d.error).map_or(0, |e| e.column as i64)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn wj_root(doc: *const Doc) -> i32 {
     match doc_ref(doc) {
         Some(d) if d.error.is_none() => id_out(Some(d.dom.root)),
@@ -160,13 +174,13 @@ pub unsafe extern "C" fn wj_root(doc: *const Doc) -> i32 {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn wj_node_count(doc: *const Doc) -> i64 {
     doc_ref(doc).map_or(0, |d| d.dom.nodes.len() as i64)
 }
 
 /// 0 null, 1 bool, 2 number, 3 string, 4 array, 5 object, -1 invalid.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn wj_type(doc: *const Doc, node: i32) -> i32 {
     doc_ref(doc)
         .and_then(|d| d.dom.node(node as i64))
@@ -174,7 +188,7 @@ pub unsafe extern "C" fn wj_type(doc: *const Doc, node: i32) -> i32 {
 }
 
 /// 1 for true, 0 for false, -1 when not a bool.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn wj_bool(doc: *const Doc, node: i32) -> i32 {
     match doc_ref(doc).and_then(|d| d.dom.node(node as i64)) {
         Some(n) if n.kind == KIND_BOOL => n.flag as i32,
@@ -183,7 +197,7 @@ pub unsafe extern "C" fn wj_bool(doc: *const Doc, node: i32) -> i32 {
 }
 
 /// Element/member count for containers, byte length for strings, -1 otherwise.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn wj_len(doc: *const Doc, node: i32) -> i64 {
     match doc_ref(doc).and_then(|d| d.dom.node(node as i64)) {
         Some(n) if matches!(n.kind, KIND_ARRAY | KIND_OBJECT | KIND_STRING) => n.len as i64,
@@ -192,13 +206,13 @@ pub unsafe extern "C" fn wj_len(doc: *const Doc, node: i32) -> i64 {
 }
 
 /// Array element or object member value at `index`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn wj_at(doc: *const Doc, node: i32, index: i64) -> i32 {
     id_out(doc_ref(doc).and_then(|d| d.dom.child(node as i64, index)))
 }
 
 /// Object key at `index` (decoded, NUL-terminated), or null.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn wj_key(doc: *const Doc, node: i32, index: i64, out_len: *mut i64) -> *const u8 {
     match doc_ref(doc).and_then(|d| d.dom.member(node as i64, index).map(|m| (d, *m))) {
         Some((d, m)) => {
@@ -213,7 +227,7 @@ pub unsafe extern "C" fn wj_key(doc: *const Doc, node: i32, index: i64, out_len:
 }
 
 /// Object member lookup by key bytes (last duplicate wins).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn wj_get(doc: *const Doc, node: i32, key: *const u8, key_len: i64) -> i32 {
     match (doc_ref(doc), bytes_arg(key, key_len)) {
         (Some(d), Some(k)) => id_out(d.dom.get(node as i64, k)),
@@ -222,7 +236,7 @@ pub unsafe extern "C" fn wj_get(doc: *const Doc, node: i32, key: *const u8, key_
 }
 
 /// RFC 6901 JSON Pointer lookup relative to `node`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn wj_pointer(doc: *const Doc, node: i32, pointer: *const u8, len: i64) -> i32 {
     match (doc_ref(doc), bytes_arg(pointer, len)) {
         (Some(d), Some(p)) => id_out(d.dom.pointer(node as i64, p)),
@@ -232,19 +246,19 @@ pub unsafe extern "C" fn wj_pointer(doc: *const Doc, node: i32, pointer: *const 
 
 /// Decoded string bytes (NUL-terminated; may contain embedded NULs from
 /// `\u0000`, so prefer `out_len`). Null when not a string.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn wj_str(doc: *const Doc, node: i32, out_len: *mut i64) -> *const u8 {
     lexeme(doc, node, KIND_STRING, out_len)
 }
 
 /// Raw number lexeme exactly as written in the source (NUL-terminated).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn wj_num(doc: *const Doc, node: i32, out_len: *mut i64) -> *const u8 {
     lexeme(doc, node, KIND_NUMBER, out_len)
 }
 
 /// 1 when the number has no fraction/exponent, 0 when it does, -1 when not a number.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn wj_num_is_int(doc: *const Doc, node: i32) -> i32 {
     match doc_ref(doc).and_then(|d| d.dom.node(node as i64)) {
         Some(n) if n.kind == KIND_NUMBER => (n.flag & NUM_INTEGER != 0) as i32,
@@ -303,23 +317,23 @@ fn node_or(r: Result<u32, EditError>) -> i32 {
 }
 
 /// An empty, editable document with no root (wj_root returns -1).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn wj_new_doc() -> *mut Doc {
     Box::into_raw(Box::new(Doc::new(Dom::default(), None)))
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn wj_new_null(doc: *mut Doc) -> i32 {
     doc_mut(doc).map_or(-1, |d| node_or(Ok(d.dom.new_null())))
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn wj_new_bool(doc: *mut Doc, value: i32) -> i32 {
     doc_mut(doc).map_or(-1, |d| node_or(Ok(d.dom.new_bool(value != 0))))
 }
 
 /// `lexeme` must be a JSON number ("12", "-0.5", "1e9"); -6 otherwise.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn wj_new_number(doc: *mut Doc, lexeme: *const u8, len: i64) -> i32 {
     let input = edit_input(doc, lexeme, len);
     match (doc_mut(doc), input) {
@@ -329,7 +343,7 @@ pub unsafe extern "C" fn wj_new_number(doc: *mut Doc, lexeme: *const u8, len: i6
 }
 
 /// `text` is the raw (unescaped) UTF-8 content; -6 for invalid UTF-8.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn wj_new_string(doc: *mut Doc, text: *const u8, len: i64) -> i32 {
     let input = edit_input(doc, text, len);
     match (doc_mut(doc), input) {
@@ -338,24 +352,24 @@ pub unsafe extern "C" fn wj_new_string(doc: *mut Doc, text: *const u8, len: i64)
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn wj_new_array(doc: *mut Doc) -> i32 {
     doc_mut(doc).map_or(-1, |d| node_or(Ok(d.dom.new_array())))
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn wj_new_object(doc: *mut Doc) -> i32 {
     doc_mut(doc).map_or(-1, |d| node_or(Ok(d.dom.new_object())))
 }
 
 /// Makes a detached value the root; the previous root becomes detached.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn wj_set_root(doc: *mut Doc, node: i32) -> i32 {
     doc_mut(doc).map_or(-1, |d| code(d.dom.set_root(node as i64)))
 }
 
 /// Parent node id; -2 for the root, -1 for a detached value, -3 if invalid.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn wj_parent(doc: *const Doc, node: i32) -> i32 {
     match doc_ref(doc) {
         Some(d) if d.error.is_none() => d.dom.parent_of(node as i64).unwrap_or(-3),
@@ -363,28 +377,28 @@ pub unsafe extern "C" fn wj_parent(doc: *const Doc, node: i32) -> i32 {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn wj_arr_push(doc: *mut Doc, arr: i32, value: i32) -> i32 {
     doc_mut(doc).map_or(-1, |d| code(d.dom.arr_push(&mut d.slack, arr as i64, value as i64)))
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn wj_arr_insert(doc: *mut Doc, arr: i32, index: i64, value: i32) -> i32 {
     doc_mut(doc).map_or(-1, |d| code(d.dom.arr_insert(&mut d.slack, arr as i64, index, value as i64)))
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn wj_arr_set(doc: *mut Doc, arr: i32, index: i64, value: i32) -> i32 {
     doc_mut(doc).map_or(-1, |d| code(d.dom.arr_set(arr as i64, index, value as i64)))
 }
 
 /// Removes element `index`; returns the now-detached element id (or < 0).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn wj_arr_remove(doc: *mut Doc, arr: i32, index: i64) -> i32 {
     doc_mut(doc).map_or(-1, |d| node_or(d.dom.arr_remove(arr as i64, index)))
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn wj_obj_set(doc: *mut Doc, obj: i32, key: *const u8, key_len: i64, value: i32) -> i32 {
     let input = edit_input(doc, key, key_len);
     match (doc_mut(doc), input) {
@@ -394,7 +408,7 @@ pub unsafe extern "C" fn wj_obj_set(doc: *mut Doc, obj: i32, key: *const u8, key
 }
 
 /// Removes every member named `key`; returns the count removed (or < 0).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn wj_obj_remove(doc: *mut Doc, obj: i32, key: *const u8, key_len: i64) -> i32 {
     let input = edit_input(doc, key, key_len);
     match (doc_mut(doc), input) {
@@ -406,9 +420,18 @@ pub unsafe extern "C" fn wj_obj_remove(doc: *mut Doc, obj: i32, key: *const u8, 
     }
 }
 
+/// Removes every member of an object; returns the count removed (or < 0).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn wj_obj_clear(doc: *mut Doc, obj: i32) -> i32 {
+    doc_mut(doc).map_or(-1, |d| match d.dom.obj_clear(obj as i64) {
+        Ok(n) => n.min(i32::MAX as u32) as i32,
+        Err(e) => e as i32,
+    })
+}
+
 /// Deep-copies `src_node` from `src` (may be the same document) into `doc`
 /// as a new detached value.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn wj_copy(doc: *mut Doc, src: *const Doc, src_node: i32) -> i32 {
     if std::ptr::eq(doc as *const Doc, src) {
         // Copy through a scratch document to avoid aliasing the source.
@@ -435,20 +458,30 @@ pub unsafe extern "C" fn wj_copy(doc: *mut Doc, src: *const Doc, src_node: i32) 
 
 use stream::Reader;
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn wj_reader_new(max_depth: i32, flags: u32) -> *mut Reader {
     Box::into_raw(Box::new(Reader::new(max_depth.max(0) as u32, flags)))
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn wj_reader_free(r: *mut Reader) {
     if !r.is_null() {
         drop(Box::from_raw(r));
     }
 }
 
+/// Caps the input held while one token (string, comment) is incomplete;
+/// beyond it the reader reports TooLarge. 0 or less restores the default
+/// (256 MiB).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn wj_reader_set_max_token(r: *mut Reader, bytes: i64) {
+    if let Some(r) = r.as_mut() {
+        r.set_max_token(if bytes <= 0 { 0 } else { usize::try_from(bytes).unwrap_or(usize::MAX) });
+    }
+}
+
 /// Appends input. Returns 0, or -1 after wj_reader_finish / on bad arguments.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn wj_reader_feed(r: *mut Reader, data: *const u8, len: i64) -> i32 {
     match (r.as_mut(), bytes_arg(data, len)) {
         (Some(r), Some(d)) => {
@@ -463,21 +496,21 @@ pub unsafe extern "C" fn wj_reader_feed(r: *mut Reader, data: *const u8, len: i6
 }
 
 /// Marks the end of input.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn wj_reader_finish(r: *mut Reader) {
     if let Some(r) = r.as_mut() {
         r.finish();
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn wj_reader_next(r: *mut Reader) -> i32 {
     r.as_mut().map_or(-1, |r| r.next() as i32)
 }
 
 /// Key/string (decoded, NUL-terminated) or number lexeme of the last event;
 /// valid until the next call to wj_reader_next.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn wj_reader_text(r: *const Reader, out_len: *mut i64) -> *const u8 {
     match r.as_ref() {
         Some(r) => {
@@ -486,50 +519,50 @@ pub unsafe extern "C" fn wj_reader_text(r: *const Reader, out_len: *mut i64) -> 
         }
         None => {
             write_len(out_len, 0);
-            b"\0".as_ptr()
+            c"".as_ptr() as *const u8
         }
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn wj_reader_depth(r: *const Reader) -> i32 {
     r.as_ref().map_or(0, |r| r.depth() as i32)
 }
 
 /// Completed top-level values so far.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn wj_reader_documents(r: *const Reader) -> i64 {
     r.as_ref().map_or(0, |r| r.documents() as i64)
 }
 
 /// Bytes currently held (unconsumed input).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn wj_reader_buffered(r: *const Reader) -> i64 {
     r.as_ref().map_or(0, |r| r.buffered() as i64)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn wj_reader_error_code(r: *const Reader) -> i32 {
     r.as_ref().and_then(|r| r.error()).map_or(0, |e| e.code as i32)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn wj_reader_error_message(r: *const Reader) -> *const u8 {
     let code = r.as_ref().and_then(|r| r.error()).map_or(ErrorCode::Ok, |e| e.code);
     code.message().as_ptr()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn wj_reader_error_offset(r: *const Reader) -> i64 {
     r.as_ref().and_then(|r| r.error()).map_or(0, |e| e.offset as i64)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn wj_reader_error_line(r: *const Reader) -> i64 {
     r.as_ref().and_then(|r| r.error()).map_or(0, |e| e.line as i64)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn wj_reader_error_column(r: *const Reader) -> i64 {
     r.as_ref().and_then(|r| r.error()).map_or(0, |e| e.column as i64)
 }
@@ -830,5 +863,94 @@ mod tests {
             }
             wj_free(d);
         }
+    }
+    #[test]
+    fn clearing_an_object_detaches_members_and_resets_the_index() {
+        unsafe {
+            let d = wj_new_doc();
+            let obj = wj_new_object(d);
+            wj_set_root(d, obj);
+            let mut values = Vec::new();
+            for i in 0..5000 {
+                let key = format!("k{i}");
+                let v = wj_new_number(d, i.to_string().as_ptr(), i.to_string().len() as i64);
+                assert_eq!(wj_obj_set(d, obj, key.as_ptr(), key.len() as i64, v), 0);
+                values.push(v);
+            }
+            // Large object: this builds the lazy key index.
+            assert_eq!(wj_get(d, obj, b"k42".as_ptr(), 3), values[42]);
+            assert_eq!(wj_obj_clear(d, obj), 5000);
+            assert_eq!(wj_len(d, obj), 0);
+            assert_eq!(wj_get(d, obj, b"k42".as_ptr(), 3), -1, "stale index entry survived the clear");
+            assert_eq!(wj_parent(d, values[42]), -1, "cleared members are detached");
+            // The object is reusable, and a detached value can be attached again.
+            assert_eq!(wj_obj_set(d, obj, b"k42".as_ptr(), 3, values[42]), 0);
+            assert_eq!(wj_get(d, obj, b"k42".as_ptr(), 3), values[42]);
+            assert_eq!(wj_len(d, obj), 1);
+            assert_eq!(wj_obj_clear(d, obj), 1);
+            let arr = wj_new_array(d);
+            assert_eq!(wj_obj_clear(d, arr), EditError::WrongType as i32);
+            wj_free(d);
+        }
+    }
+
+    #[test]
+    fn max_depth_is_clamped_to_the_hard_limit() {
+        // Debug builds use big stack frames; run on a roomy thread.
+        std::thread::Builder::new()
+            .stack_size(256 << 20)
+            .spawn(|| unsafe {
+                let limit = parser::MAX_DEPTH_LIMIT as usize;
+                let too_deep = "[".repeat(limit + 1) + &"]".repeat(limit + 1);
+                let d = wj_parse_ex(too_deep.as_ptr(), too_deep.len() as i64, i32::MAX, 0);
+                assert_eq!(wj_ok(d), 0);
+                assert_eq!(wj_error_code(d), ErrorCode::TooDeep as i32);
+                wj_free(d);
+
+                let fits = "[".repeat(limit) + &"]".repeat(limit);
+                let d = wj_parse_ex(fits.as_ptr(), fits.len() as i64, i32::MAX, 0);
+                assert_eq!(wj_ok(d), 1);
+
+                // Copying is bounded as well: a document nested deeper than
+                // the limit (possible through edits) cannot be deep-copied.
+                let e = wj_new_doc();
+                let top = wj_new_array(e);
+                let mut chain = top;
+                for _ in 0..limit + 10 {
+                    let inner = wj_new_array(e);
+                    assert_eq!(wj_arr_push(e, chain, inner), 0);
+                    chain = inner;
+                }
+                assert_eq!(wj_copy(e, e, top), EditError::TooDeep as i32);
+                wj_free(e);
+                wj_free(d);
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn concurrent_lookups_on_a_shared_document() {
+        // Large objects build their key index lazily on first lookup; many
+        // threads hitting that for the first time must be safe.
+        let members: Vec<String> = (0..200).map(|i| format!("\"k{i}\":{i}")).collect();
+        let text = format!("{{{}}}", members.join(","));
+        let dom = parser::parse(text.as_bytes(), 0, 0).unwrap();
+        let root = dom.root as i64;
+        std::thread::scope(|scope| {
+            for t in 0..8 {
+                let dom = &dom;
+                scope.spawn(move || {
+                    for round in 0..2000 {
+                        let i = (round * 7 + t) % 200;
+                        let key = format!("k{i}");
+                        let id = dom.get(root, key.as_bytes()).expect("key present");
+                        assert_eq!(dom.slice(dom.nodes[id as usize].start, dom.nodes[id as usize].len), i.to_string().as_bytes());
+                        assert!(dom.get(root, b"missing").is_none());
+                    }
+                });
+            }
+        });
     }
 }

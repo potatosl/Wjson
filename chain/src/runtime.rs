@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: MPL-2.0
 //! The C runtime startup object (`wjrt.obj`) that replaces the static parts
 //! of MSVC's msvcrt.lib. Everything else a program needs (printf, memcpy,
 //! exit, C++ exception support for Rust panics) comes from the system's

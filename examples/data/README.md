@@ -15,4 +15,4 @@ manufacturing industries add up to the manufacturing subtotal.
 `survey_report.json` is written by `examples/survey_report.wave` and is not
 tracked.
 
-Like the rest of the repository, these files are licensed under the MIT License.
+Like the rest of the repository, these files are licensed under the Mozilla Public License 2.0.

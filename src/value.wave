@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: MPL-2.0
 //
 // Parsing entry points and read access to parsed values.
 //
@@ -22,7 +22,7 @@ import("./ffi")::{
 };
 import("./consts")::{
     JSON_INVALID, JSON_NULL, JSON_BOOL, JSON_NUMBER, JSON_STRING, JSON_ARRAY,
-    JSON_OBJECT, JSON_STRICT, JSON_NUM_OK,
+    JSON_OBJECT, JSON_STRICT, JSON_NUM_OK, json_null_str,
 };
 
 pub struct JsonDoc {
@@ -155,10 +155,18 @@ pub fun json_at(v: Json, index: i64) -> Json {
     return _make(v.doc, ffi_at(v.doc, v.node, index));
 }
 
-// Object key at index, or null when out of range / not an object.
+// Object key at index, or null when out of range / not an object. Like
+// json_as_str, the text stops at an embedded "\u0000"; use json_key_at_bytes
+// when the key may contain one.
 pub fun json_key_at(v: Json, index: i64) -> str {
     var len: i64 = 0;
     return ffi_key(v.doc, v.node, index, &len) as str;
+}
+
+// Object key at index as a byte range (exact length, may contain NUL bytes);
+// null when out of range / not an object.
+pub fun json_key_at_bytes(v: Json, index: i64, result_len: ptr<i64>) -> ptr<u8> {
+    return ffi_key(v.doc, v.node, index, result_len);
 }
 
 pub fun json_has(v: Json, key: str) -> bool {
@@ -187,9 +195,34 @@ pub fun json_as_bool(v: Json, result: ptr<bool>) -> bool {
 
 // Decoded string (NUL-terminated), or null when v is not a string. The text
 // lives inside the document; copy it if it must outlive json_free().
+//
+// WARNING: a str ends at the first NUL byte, and JSON can put one in a string
+// ("\u0000"). "admin\u0000.txt" therefore reads as "admin" here. For untrusted
+// documents use json_as_str_checked, json_str_eq / json_as_bytes (exact length).
 pub fun json_as_str(v: Json) -> str {
     var len: i64 = 0;
     return ffi_str(v.doc, v.node, &len) as str;
+}
+
+// True when v is a string whose text contains a NUL byte.
+pub fun json_str_has_nul(v: Json) -> bool {
+    var len: i64 = 0;
+    var s: ptr<u8> = ffi_str(v.doc, v.node, &len);
+    if (s == null) {
+        return false;
+    }
+    return _cstr_len(s) != len;
+}
+
+// Like json_as_str, but null when v is not a string OR the string contains a
+// NUL byte, so the result can never be silently truncated.
+pub fun json_as_str_checked(v: Json) -> str {
+    var len: i64 = 0;
+    var s: ptr<u8> = ffi_str(v.doc, v.node, &len);
+    if (s == null || _cstr_len(s) != len) {
+        return json_null_str();
+    }
+    return s as str;
 }
 
 // Decoded string as a byte range; use when the string may contain "\u0000".

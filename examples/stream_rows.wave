@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: MPL-2.0
 //
 // Streaming example: scan data/survey_sample.json without loading it and list
 // the manufacturing industries whose "매출증대 · 규모확장" subtotal is above

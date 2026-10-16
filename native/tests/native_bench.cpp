@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: MPL-2.0
 // Number conversion and escaping speed of wjson_native, next to the C
 // runtime's snprintf/strtod for scale. Freestanding: no library headers;
 // the few C runtime and clock functions used are declared here.

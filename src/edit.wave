@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: MPL-2.0
 //
 // Editing documents: create values, change objects and arrays, copy between
 // documents, and build a document from scratch.
@@ -22,8 +22,8 @@
 import("./ffi")::{
     ffi_new_doc, ffi_new_null, ffi_new_bool, ffi_new_number, ffi_new_string,
     ffi_new_array, ffi_new_object, ffi_set_root, ffi_parent, ffi_arr_push,
-    ffi_arr_insert, ffi_arr_set, ffi_arr_remove, ffi_obj_set, ffi_obj_remove,
-    ffi_copy, ffi_format_i64, ffi_format_f64, ffi_format_f64_fixed, ffi_type, ffi_len, ffi_key,
+    ffi_arr_insert, ffi_arr_set, ffi_arr_remove, ffi_obj_set, ffi_obj_remove, ffi_obj_clear,
+    ffi_copy, ffi_format_i64, ffi_format_f64, ffi_format_f64_fixed, ffi_type, ffi_len,
 };
 import("./consts")::{
     JSON_EDIT_OK, JSON_EDIT_INVALID, JSON_EDIT_NOT_FOUND, JSON_EDIT_WRONG_TYPE,
@@ -312,22 +312,13 @@ pub fun json_clear(v: Json) -> i32 {
         return JSON_EDIT_OK;
     }
     if (kind == JSON_OBJECT) {
-        // Removing by key drops duplicates too; repeat until empty.
-        while (ffi_len(v.doc, v.node) > 0) {
-            var klen: i64 = 0;
-            var key: ptr<u8> = _first_key(v, &klen);
-            var removed: i32 = ffi_obj_remove(v.doc, v.node, key, klen);
-            if (removed <= 0) {
-                return JSON_EDIT_INVALID;
-            }
+        var removed: i32 = ffi_obj_clear(v.doc, v.node);
+        if (removed < 0) {
+            return removed;
         }
         return JSON_EDIT_OK;
     }
     return JSON_EDIT_WRONG_TYPE;
-}
-
-fun _first_key(v: Json, len_out: ptr<i64>) -> ptr<u8> {
-    return ffi_key(v.doc, v.node, 0, len_out);
 }
 
 // ---- path-based editing ----------------------------------------------------------------

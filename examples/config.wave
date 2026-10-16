@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: MPL-2.0
 //
 // Reads examples/config.json (comments + trailing commas) and pulls typed
 // settings out with path queries.
@@ -14,7 +14,7 @@ import("wjson")::{
     JsonDoc, Json, JsonError, JSON_RELAXED,
     json_parse_bytes, json_ok, json_error, json_root, json_free, json_len,
     json_path, json_path_str, json_path_i64, json_path_f64, json_path_bool, json_at,
-    json_as_str, json_i64_or, json_get,
+    json_str_or, json_i64_or, json_get,
 };
 
 fun load(path: str, doc: ptr<JsonDoc>) -> bool {
@@ -71,8 +71,8 @@ fun main() -> i32 {
     var i: i64 = 0;
     while (i < json_len(routes)) {
         var r: Json = json_at(routes, i);
-        println("route        : {} -> {}", json_as_str(json_get(r, "path")),
-                json_as_str(json_get(r, "upstream")));
+        println("route        : {} -> {}", json_str_or(json_get(r, "path"), "?"),
+                json_str_or(json_get(r, "upstream"), "?"));
         i += 1;
     }
 

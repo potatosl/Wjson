@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: MPL-2.0
 //
 // wjson build driver, written in Wave. Run from the repository root:
 //
@@ -6,6 +6,8 @@
 //   WJSON_RUN=examples/show_data.wave wavec run build.wave     build and run one program
 //   WJSON_TASK=libs wavec run build.wave         only build the Rust + C++ libraries
 //   WJSON_TASK=bench wavec run build.wave        run the Rust and C++ benchmarks
+//   WJSON_TASK=sanitize wavec run build.wave     C++ tests under ASan + UBSan, then C++ and Rust
+//                                                tests under valgrind (Linux; valgrind is optional)
 //   WJSON_DRY_RUN=1 wavec run build.wave         print the commands without running them
 //
 // Windows (PowerShell; no Visual Studio / MSVC needed):
@@ -201,7 +203,7 @@ fun build_toolchain(b: ptr<Buffer>) -> bool {
 // Windows SDK's headers are needed; dynamic CRT naming (msvcrt.lib).
 fun add_win_cxx(b: ptr<Buffer>) {
     add(b, env_or("CXX", "clang++"));
-    add(b, " --target=x86_64-pc-windows-msvc -std=c++17 -ffreestanding -nostdlibinc -fno-exceptions -fno-rtti -fms-runtime-lib=dll -Wall -Wextra");
+    add(b, " --target=x86_64-pc-windows-msvc -std=c++20 -ffreestanding -nostdlibinc -fno-exceptions -fno-rtti -fms-runtime-lib=dll -Wall -Wextra");
 }
 
 // ---- library builds -----------------------------------------------------------------
@@ -255,7 +257,7 @@ fun build_native(b: ptr<Buffer>) -> bool {
     var i: i32 = 0;
     while (i < 3) {
         add(b, cxx);
-        add(b, " -std=c++17 -O2 -fPIC -Wall -Wextra -fno-exceptions -fno-rtti -Inative/include -c native/src/");
+        add(b, " -std=c++20 -O2 -fPIC -Wall -Wextra -fno-exceptions -fno-rtti -Inative/include -c native/src/");
         add(b, srcs[i]);
         add(b, ".cpp -o build/native/");
         add(b, srcs[i]);
@@ -464,7 +466,7 @@ fun cxx_test(b: ptr<Buffer>, flags: ptr<Buffer>) -> bool {
         add_cl_libs(b, flags);                  // Rust's system libraries as X.lib
     } else {
         add(b, env_or("CXX", "c++"));
-        add(b, " -std=c++17 -O1 -Iinclude -Inative/include native/tests/native_test.cpp build/native/libwjson_native.a build/cargo/release/libwjson_core.a -lpthread -ldl -o build/native_test");
+        add(b, " -std=c++20 -O1 -Iinclude -Inative/include native/tests/native_test.cpp build/native/libwjson_native.a build/cargo/release/libwjson_core.a -lpthread -ldl -o build/native_test");
     }
     if (!must(b)) {
         return false;
@@ -561,11 +563,60 @@ fun task_bench(b: ptr<Buffer>) {
         add(b, " /NOLOGO /SUBSYSTEM:CONSOLE /OUT:build\\native_bench.exe build\\native_bench.obj build\\native\\wjson_native.lib");
     } else {
         add(b, env_or("CXX", "c++"));
-        add(b, " -std=c++17 -O2 -Inative/include native/src/number.cpp native/src/escape.cpp native/src/console.cpp native/tests/native_bench.cpp -o build/native_bench");
+        add(b, " -std=c++20 -O2 -Inative/include native/src/number.cpp native/src/escape.cpp native/src/console.cpp native/tests/native_bench.cpp -o build/native_bench");
     }
     if (must(b)) {
         run_in(b, ".", "build/native_bench");
     }
+}
+
+// Memory-safety checks (Linux): the C++ tests under AddressSanitizer and
+// UBSan, then the C++ tests and the Rust unit tests under valgrind. Only
+// "definite" leaks count for valgrind: Rust's std keeps a few thread-start
+// allocations alive on purpose and reports them as "possibly lost".
+fun task_sanitize(b: ptr<Buffer>, flags: ptr<Buffer>) {
+    if (WINDOWS) {
+        println("sanitize: Linux only (AddressSanitizer, UBSan and valgrind)");
+        return;
+    }
+    if (!build_libs(b, flags)) {
+        return;
+    }
+    var srcs: str = " -Iinclude -Inative/include native/src/number.cpp native/src/escape.cpp native/src/console.cpp native/tests/native_test.cpp build/cargo/release/libwjson_core.a -lpthread -ldl";
+
+    step("C++ tests under AddressSanitizer + UBSan");
+    add(b, env_or("CXX", "c++"));
+    add(b, " -std=c++20 -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=undefined");
+    add(b, srcs);
+    add(b, " -o build/native_test_san");
+    if (!must(b)) {
+        return;
+    }
+    add(b, "WJSON_FUZZ_ITERS=20000 build/native_test_san");
+    must(b);
+
+    add(b, "command -v valgrind > /dev/null 2>&1");
+    if (sh(b) != 0) {
+        println("valgrind not installed: skipping the valgrind steps");
+        return;
+    }
+    step("C++ tests under valgrind");
+    add(b, env_or("CXX", "c++"));
+    add(b, " -std=c++20 -O1 -g");
+    add(b, srcs);
+    add(b, " -o build/native_test_vg");
+    if (!must(b)) {
+        return;
+    }
+    add(b, "WJSON_FUZZ_ITERS=1500 valgrind -q --error-exitcode=9 --leak-check=full --errors-for-leak-kinds=definite,indirect --show-leak-kinds=definite build/native_test_vg");
+    must(b);
+
+    step("Rust unit tests under valgrind");
+    add(b, env_or("CARGO", "cargo"));
+    add(b, " test --quiet --manifest-path core/Cargo.toml --target-dir build/cargo --lib");
+    add(b, " --config \"target.'cfg(unix)'.runner=['valgrind','-q','--error-exitcode=9','--leak-check=full','--errors-for-leak-kinds=definite,indirect','--show-leak-kinds=definite']\"");
+    add(b, " -- --test-threads=1 --skip long_tokens_in_tiny_chunks_are_not_rescanned");
+    must(b);
 }
 
 // WJSON_RUN=dir/name.wave -> build/run/name, executed inside dir/.
@@ -620,6 +671,11 @@ fun main() -> i32 {
         task_run(&b, &flags, env_or("WJSON_RUN", ""));
     } else if (streq(env_or("WJSON_TASK", "test"), "bench")) {
         task_bench(&b);
+    } else if (streq(env_or("WJSON_TASK", "test"), "sanitize")) {
+        task_sanitize(&b, &flags);
+        if (FAILED == 0) {
+            step("sanitizers clean");
+        }
     } else if (streq(env_or("WJSON_TASK", "test"), "libs")) {
         if (build_libs(&b, &flags)) {
             buffer_push(&flags, 0);

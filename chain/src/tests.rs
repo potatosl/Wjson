@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: MPL-2.0
 //! Host-side tests (they run with std on the development machine).
 
 extern crate std;
@@ -38,7 +38,9 @@ fn coff_symbols(obj: &[u8]) -> Vec<(String, i16, u8)> {
 
 /// Members of a COFF archive: (name field, data), skipping the linker and
 /// longnames members; also returns the second linker member's symbols.
-fn archive(lib: &[u8]) -> (Vec<Vec<u8>>, Vec<(String, u16)>, Vec<u32>) {
+type ParsedArchive = (Vec<Vec<u8>>, Vec<(String, u16)>, Vec<u32>);
+
+fn archive(lib: &[u8]) -> ParsedArchive {
     assert_eq!(&lib[..8], b"!<arch>\n");
     let mut at = 8;
     let mut members = Vec::new();
@@ -208,4 +210,82 @@ fn real_dll_exports() {
     for w in kernel32.exports.windows(2) {
         assert!(w[0].name < w[1].name && w[0].hint + 1 == w[1].hint);
     }
+}
+
+/// A minimal PE32+ image whose export directory claims `nnames` names.
+fn pe_with_exports(nnames: u32, section_va: u32, section_size: u32) -> Vec<u8> {
+    let mut img = vec![0u8; 0x800];
+    img[..2].copy_from_slice(b"MZ");
+    img[0x3C..0x40].copy_from_slice(&0x80u32.to_le_bytes());
+    img[0x80..0x84].copy_from_slice(b"PE\0\0");
+    let coff = 0x84;
+    img[coff + 2..coff + 4].copy_from_slice(&1u16.to_le_bytes()); // one section
+    img[coff + 16..coff + 18].copy_from_slice(&240u16.to_le_bytes()); // optional header size
+    let opt = coff + 20;
+    img[opt..opt + 2].copy_from_slice(&0x20Bu16.to_le_bytes());
+    let dirs = opt + 112;
+    img[dirs..dirs + 4].copy_from_slice(&section_va.to_le_bytes()); // export RVA
+    img[dirs + 4..dirs + 8].copy_from_slice(&0x100u32.to_le_bytes());
+    let sec = opt + 240;
+    img[sec + 8..sec + 12].copy_from_slice(&section_size.to_le_bytes());
+    img[sec + 12..sec + 16].copy_from_slice(&section_va.to_le_bytes());
+    img[sec + 16..sec + 20].copy_from_slice(&0x300u32.to_le_bytes()); // raw size
+    img[sec + 20..sec + 24].copy_from_slice(&0x400u32.to_le_bytes()); // raw offset
+    let dir = 0x400;
+    img[dir + 20..dir + 24].copy_from_slice(&1u32.to_le_bytes()); // one function
+    img[dir + 24..dir + 28].copy_from_slice(&nnames.to_le_bytes());
+    for (field, at) in [(28, 0x40u32), (32, 0x50), (36, 0x60)] {
+        img[dir + field..dir + field + 4].copy_from_slice(&(section_va + at).to_le_bytes());
+    }
+    img
+}
+
+#[test]
+fn hostile_pe_images_fail_cleanly() {
+    // A header that promises billions of names must not size an allocation
+    // (that used to abort the process); it is just a truncated table.
+    let huge = pe_with_exports(0xFFFF_FFF0, 0x1000, 0x1000);
+    assert!(pe::read_exports(&huge).is_err());
+
+    // RVAs that would wrap around u32 are rejected or ignored, not wrapped
+    // into a valid-looking offset (this panicked in debug builds).
+    let wrapping = pe_with_exports(1, 0xFFFF_FF00, 0xFFFF_FFFF);
+    let _ = pe::read_exports(&wrapping);
+
+    // Every truncation of a valid-looking image is an error or an empty
+    // result, never a panic.
+    let image = pe_with_exports(2, 0x1000, 0x1000);
+    for cut in 0..image.len() {
+        let _ = pe::read_exports(&image[..cut]);
+    }
+    // Arbitrary garbage behind the headers, too.
+    let mut noisy = image.clone();
+    let mut x: u32 = 0x1234_5678;
+    for round in 0..200 {
+        for b in noisy[0x80..].iter_mut() {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            if x.is_multiple_of(7) {
+                *b = (x >> 8) as u8;
+            }
+        }
+        let _ = pe::read_exports(&noisy);
+        if round % 50 == 0 {
+            noisy = image.clone();
+        }
+    }
+}
+
+#[test]
+fn tool_lookup_ignores_the_current_directory() {
+    let exists = |p: &str| p == "/opt/llvm/bin/rust-lld" || p == "./rust-lld" || p == "rust-lld" || p == "tools/rust-lld";
+    // "." , "" and relative entries never win, even though a file would be found there.
+    let path = ".::tools:/usr/bin:/opt/llvm/bin";
+    if cfg!(windows) {
+        return;
+    }
+    assert_eq!(os::search_path(path, "rust-lld", &exists).as_deref(), Some("/opt/llvm/bin/rust-lld"));
+    assert_eq!(os::search_path(".:tools", "rust-lld", &exists), None);
+    assert_eq!(os::search_path("", "rust-lld", &exists), None);
 }

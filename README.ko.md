@@ -8,7 +8,7 @@ Rust, C++, Wave가 각자 잘하는 일을 나눠 맡는 JSON 라이브러리입
 | --- | --- | --- | --- |
 | API | **Wave** | 탐색, 경로 쿼리, 문서 수정·경로 기반 수정, writer, 직렬화, 깊은 비교, 파일 스트리밍 | `src/*.wave` |
 | 코어 | **Rust** | RFC 8259 파서, 인덱스 기반 DOM과 수정 연산, 큰 객체 키 해시 인덱스, 증분(pull) 파서, JSON Pointer, 에러 위치 | `core/` |
-| 네이티브 | **C++17** (freestanding) | 숫자 변환(자체 구현: 정확한 반올림 파싱·최단 왕복 출력), 문자열 이스케이프, UTF-8 검사. 표준 라이브러리·SDK 헤더 없이 컴파일 | `native/` |
+| 네이티브 | **C++20** (freestanding) | 숫자 변환(자체 구현: 정확한 반올림 파싱·최단 왕복 출력), 문자열 이스케이프, UTF-8 검사. 표준 라이브러리·SDK 헤더 없이 컴파일 | `native/` |
 | 툴체인 | **Rust** | `wjlink`: Windows에서 MSVC 대신 쓰는 링크 도구. 시스템 DLL에서 import 라이브러리 생성, 시작 코드(wjrt) 생성, 아카이버, rust-lld 구동 | `chain/` |
 
 Wave ↔ Rust/C++ 경계는 모두 C ABI(`extern(c)`)입니다. C/C++ 프로그램도 `include/wjson.h`, `native/include/wjson.hpp`로 같은 코어를 쓸 수 있습니다.
@@ -77,7 +77,7 @@ json_stream_close(&s);
 
 ## 빌드와 테스트
 
-빌드 드라이버도 Wave로 짜여 있어요(`build.wave`). 필요한 것: [wavec](https://wave-lang.dev/docs/getting-started/install)(LLVM 21 기반), Rust(cargo), C++17 컴파일러.
+빌드 드라이버도 Wave로 짜여 있어요(`build.wave`). 필요한 것: [wavec](https://wave-lang.dev/docs/getting-started/install)(LLVM 21 기반), Rust 1.99 이상(cargo), C++20 컴파일러.
 
 ```sh
 wavec run build.wave                                   # Rust + C++ + Wave 테스트, 예제 전부 실행
@@ -168,14 +168,14 @@ wavec build show_data.wave ../build/native/libwjson_native.a ../build/cargo/rele
 **파싱** — `json_parse(text)`, `json_parse_with(text, max_depth, flags)`, `json_parse_bytes(ptr, len, max_depth, flags)`, `json_ok(doc)`, `json_error(doc) -> JsonError{code, message, offset, line, column}`, `json_root(doc)`, `json_free(&doc)`
 
 - flags: `JSON_STRICT`(기본), `JSON_ALLOW_TRAILING_COMMAS`, `JSON_ALLOW_COMMENTS`, `JSON_RELAXED`(둘 다)
-- 기본 최대 중첩 깊이 512, UTF-8 BOM 허용, 잘못된 UTF-8·홀로 있는 서로게이트는 거부
+- 기본 최대 중첩 깊이 512, 파싱이 재귀라서 `max_depth`를 아무리 크게 줘도 `JSON_MAX_DEPTH_LIMIT`(2048)로 제한, UTF-8 BOM 허용, 잘못된 UTF-8·홀로 있는 서로게이트는 거부
 
 **탐색** — `json_get(v, key)`, `json_at(v, i)`, `json_key_at(v, i)`, `json_len(v)`, `json_has(v, key)`, `json_pointer(v, "/a/0/b")`, `json_path(v, "a.b[0][\"x.y\"]")`
 
 - 없는 키·범위 밖 인덱스·타입 불일치는 실패 대신 "invalid" 값을 돌려줘서 체인이 항상 안전합니다. 끝에서 `json_is_valid()`로 확인하세요.
 - 중복 키는 마지막 값이 이깁니다(JavaScript `JSON.parse`와 동일).
 
-**값 읽기** — `json_type`, `json_is_*`, `json_as_bool`, `json_as_str`, `json_as_bytes`, `json_as_i64`, `json_as_f64`(+ `_checked` 버전), `json_number_text`(원문 숫자), 기본값 버전 `json_i64_or` / `json_f64_or` / `json_bool_or` / `json_str_or`, 경로+기본값 `json_path_i64` 등, `json_str_eq`
+**값 읽기** — `json_type`, `json_is_*`, `json_as_bool`, `json_as_str`, `json_as_bytes`, `json_as_str_checked`, `json_str_has_nul`, `json_as_i64`, `json_as_f64`(+ `_checked` 버전), `json_number_text`(원문 숫자), 기본값 버전 `json_i64_or` / `json_f64_or` / `json_bool_or` / `json_str_or`, 경로+기본값 `json_path_i64` 등, `json_str_eq`
 
 **쓰기** — `json_writer_new(indent)`, `json_begin_object/array`, `json_end_object/array`, `json_key`, `json_write_null/bool/i64/f64/f64_fixed/str/raw`, `json_field_*`, `json_writer_finish`, `json_writer_status`, `json_writer_reset`, `json_writer_free`, `json_writer_set_escape(JSON_ESCAPE_ASCII | JSON_ESCAPE_HTML)`
 
@@ -194,8 +194,8 @@ wavec build show_data.wave ../build/native/libwjson_native.a ../build/cargo/rele
 - 교체·삭제된 값은 "떨어진" 상태가 되고 다시 붙일 수 있어요. 파싱에 실패한 문서는 수정할 수 없어요.
 - 키 16개 이상인 객체는 첫 조회 때 해시 인덱스를 만들고, 키 추가·삭제 때 함께 갱신해요.
 
-**스트리밍** — 저수준: `json_reader_new(flags)`, `json_reader_feed/feed_str/finish/next`, `json_reader_text/text_eq/i64/f64`, `json_reader_depth/documents/buffered/error`, `json_reader_free`
-파일: `json_stream_open(path, flags)`, `json_stream_open_with(path, flags, chunk)`, `json_stream_next(&s)`, `json_stream_skip(&s)`(현재 컨테이너 통째로 건너뛰기), `json_stream_text/text_eq/i64/f64`, `json_stream_depth/documents/bytes_read/buffered/error/io_error`, `json_stream_close(&s)`
+**스트리밍** — 저수준: `json_reader_new(flags)`, `json_reader_feed/feed_str/finish/next`, `json_reader_text/text_eq/i64/f64`, `json_reader_depth/documents/buffered/error`, `json_reader_set_max_token`, `json_reader_free`
+파일: `json_stream_open(path, flags)`, `json_stream_open_with(path, flags, chunk)`, `json_stream_next(&s)`, `json_stream_skip(&s)`(현재 컨테이너 통째로 건너뛰기), `json_stream_text/text_eq/i64/f64`, `json_stream_depth/documents/bytes_read/buffered/error/io_error`, `json_stream_set_max_token`, `json_stream_close(&s)`
 
 - 이벤트: `JSON_EV_OBJECT_START/END`, `ARRAY_START/END`, `KEY`, `STRING`, `NUMBER`, `TRUE`, `FALSE`, `NULL`, `END`, `ERROR`(리더는 `NEED_MORE`도).
 - flags: `JSON_ALLOW_TRAILING_COMMAS`, `JSON_ALLOW_COMMENTS`, `JSON_STREAM_MULTI`(여러 최상위 값, JSON Lines).
@@ -206,6 +206,9 @@ wavec build show_data.wave ../build/native/libwjson_native.a ../build/cargo/rele
 ## 메모리 규칙
 
 - `Json` 값과 `json_as_str`·`json_key_at`·`json_number_text`가 돌려준 문자열은 문서 안에 있으므로 `json_free` 이후에는 쓰면 안 됩니다. 반대로 `json_free` 전까지는 **문서를 계속 수정해도 유효해요.** 파싱된 텍스트는 파싱 후 다시 쓰지 않고, 수정으로 생기는 텍스트는 각자 따로 할당해서 옮겨지지 않아요. 그래서 `json_set_str(v, "새 키", json_as_str(json_get(v, "옛 키")))`처럼 같은 문서의 문자열을 그대로 넘겨도 안전해요.
+- **문자열 안의 NUL.** JSON 문자열에는 `\u0000`이 들어갈 수 있고 `str`은 첫 NUL에서 끝나서, `"admin\u0000.txt"`는 `json_as_str`·`json_key_at`으로 읽으면 `admin`이 돼요. 믿을 수 없는 문서에는 `json_as_str_checked`(NUL이 있으면 null), `json_str_has_nul`, 또는 길이를 정확히 주는 `json_as_bytes` / `json_key_at_bytes` / `json_str_eq`를 쓰세요.
+- **스레드.** 수정하지 않는 문서를 읽는 일(`json_get`, `json_at`, `json_path` 등)은 여러 스레드에서 동시에 해도 안전해요. 수정은 혼자만 써야 하고, reader/stream은 한 번에 한 스레드만 쓰세요.
+- **스트리밍 한도.** 문자열·주석 하나가 끝나지 않은 동안 reader가 들고 있는 양은 `json_reader_set_max_token`(기본 256 MiB)까지이고, 64 KiB가 넘는 숫자는 거부해요(`JSON_ERR_TOO_LARGE`). 믿을 수 없는 상대가 보내는 입력이면 작게 정하세요.
 - `json_writer_finish`의 결과는 writer 소유(다음 쓰기/리셋/해제 전까지 유효).
 - `json_to_string*`의 결과는 호출자 소유 → `json_string_free`.
 - 수정 때문에 옮겨진 자식 목록의 옛 자리는 문서를 `json_free`할 때 한꺼번에 반환돼요.
@@ -239,4 +242,4 @@ build.wave     빌드 드라이버 (Wave)
 
 ## 라이선스
 
-MIT License — `LICENSE` 참고.
+Mozilla Public License 2.0 (MPL-2.0) — `LICENSE` 참고. Copyright (c) 2026 panda and the wjson contributors. 이 저장소의 파일을 수정해 배포하면 그 파일은 MPL-2.0을 유지해야 하고, wjson을 가져다 쓰는 프로그램은 어떤 라이선스든 괜찮아요.

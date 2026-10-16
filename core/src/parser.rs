@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: MPL-2.0
 //! Strict RFC 8259 parser with two opt-in relaxations
 //! (trailing commas and `//` / `/* */` comments).
 
@@ -8,6 +8,11 @@ pub const OPT_TRAILING_COMMAS: u32 = 1;
 pub const OPT_COMMENTS: u32 = 2;
 
 pub const DEFAULT_MAX_DEPTH: u32 = 512;
+
+/// Hard ceiling for `max_depth`. The DOM parser (and deep copies) recurse once
+/// per nesting level, so an unbounded limit would let hostile input overflow
+/// the stack. Larger requests are clamped to this value.
+pub const MAX_DEPTH_LIMIT: u32 = 2048;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(i32)]
@@ -109,7 +114,7 @@ pub fn parse(src: &[u8], max_depth: u32, options: u32) -> Result<Dom, ParseError
         src,
         pos: start,
         depth: 0,
-        max_depth: if max_depth == 0 { DEFAULT_MAX_DEPTH } else { max_depth },
+        max_depth: if max_depth == 0 { DEFAULT_MAX_DEPTH } else { max_depth.min(MAX_DEPTH_LIMIT) },
         options,
         dom: Dom::default(),
         scratch: Vec::new(),
@@ -340,7 +345,7 @@ impl<'a> Parser<'a> {
         match src.get(i) {
             Some(b'0') => {
                 i += 1;
-                if src.get(i).map_or(false, |b| b.is_ascii_digit()) {
+                if src.get(i).is_some_and(|b| b.is_ascii_digit()) {
                     return Err((ErrorCode::InvalidNumber, i));
                 }
             }

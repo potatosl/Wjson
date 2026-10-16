@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: MPL-2.0
 //! Reads the export table of a PE image (a Windows DLL).
 
 use alloc::string::String;
@@ -70,13 +70,18 @@ pub fn read_exports(image: &[u8]) -> Result<Exports, &'static str> {
             flags: u32_at(image, s + 36).ok_or("truncated section table")?,
         });
     }
+    // Every offset below comes from the file, so all arithmetic is widened or
+    // checked: a malformed image must produce an error, never a wrapped value.
     let section_of = |rva: u32| {
-        sections.iter().find(|s| rva >= s.va && rva < s.va + s.size.max(s.raw_size))
+        sections.iter().find(|s| {
+            let end = s.va as u64 + s.size.max(s.raw_size) as u64;
+            rva >= s.va && (rva as u64) < end
+        })
     };
     let offset = |rva: u32| -> Option<usize> {
         let s = section_of(rva)?;
         let off = rva - s.va;
-        (off < s.raw_size).then(|| (s.raw + off) as usize)
+        (off < s.raw_size).then(|| s.raw as usize + off as usize)
     };
     let cstr = |rva: u32| -> Option<String> {
         let at = offset(rva)?;
@@ -101,7 +106,9 @@ pub fn read_exports(image: &[u8]) -> Result<Exports, &'static str> {
         return Err("export tables outside the image");
     };
 
-    let mut exports = Vec::with_capacity(nnames);
+    // The count is untrusted: size the vector by what the name table could
+    // actually hold in this image, not by what the header claims.
+    let mut exports = Vec::with_capacity(nnames.min(image.len() / 4));
     for i in 0..nnames {
         let name_rva = u32_at(image, names + 4 * i).ok_or("truncated name table")?;
         let index = u16_at(image, ords + 2 * i).ok_or("truncated ordinal table")? as u32;
@@ -115,7 +122,7 @@ pub fn read_exports(image: &[u8]) -> Result<Exports, &'static str> {
         }
         // A forwarder's RVA points at a string inside the export directory;
         // the loader resolves it, so it imports like code.
-        let forwarded = func_rva >= export_rva && func_rva < export_rva + export_size;
+        let forwarded = func_rva >= export_rva && (func_rva as u64) < export_rva as u64 + export_size as u64;
         let data = !forwarded && section_of(func_rva).is_some_and(|s| s.flags & SCN_MEM_EXECUTE == 0);
         exports.push(Export { name, hint: i.min(u16::MAX as usize) as u16, data });
     }

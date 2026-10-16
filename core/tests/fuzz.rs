@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: MPL-2.0
 //! Differential fuzzing with zero external dependencies.
 //!
 //! * A small, independent reference implementation (value model, RFC 8259
@@ -820,7 +820,7 @@ fn large_objects_use_index_correctly() {
         let doc = parse(text.as_bytes());
         let root = unsafe { wj_root(doc) };
         assert!(same(doc, root, &model));
-        assert_eq!(model.distinct_keys() > 0, true);
+        assert!(model.distinct_keys() > 0);
         for step in 0..50 {
             let key = format!("k{}", rng.below(n as u64 / 2 + 2));
             unsafe {

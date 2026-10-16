@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: MPL-2.0
 //
 // Streaming JSON writer with structural validation.
 //
@@ -26,7 +26,7 @@ import("./ffi")::{ffi_escape, ffi_format_f64, ffi_format_f64_fixed, ffi_format_i
 import("./consts")::{
     JSON_ESCAPE_DEFAULT, JSON_ESCAPE_QUOTES, JSON_WRITER_OK, JSON_WRITER_ERR_STATE,
     JSON_WRITER_ERR_ALLOC, JSON_WRITER_ERR_NUMBER, JSON_WRITER_ERR_UTF8,
-    JSON_WRITER_ERR_INCOMPLETE, json_null_str,
+    JSON_WRITER_ERR_INCOMPLETE, JSON_WRITER_ERR_DEPTH, JSON_MAX_DEPTH_LIMIT, json_null_str,
 };
 
 // Per-depth state bits.
@@ -126,8 +126,15 @@ fun _fail(w: ptr<JsonWriter>, code: i32) -> bool {
     return false;
 }
 
+// Largest buffer the writer will ask for (2^60 bytes). Bigger requests can
+// only come from a bad length argument, and doubling toward them would wrap.
+const MAX_BUFFER: i64 = 1152921504606846976;
+
 // Ensures room for `extra` more bytes after len.
 fun _reserve(w: ptr<JsonWriter>, extra: i64) -> bool {
+    if (extra < 0 || extra > MAX_BUFFER || deref w.len > MAX_BUFFER - extra) {
+        return _fail(w, JSON_WRITER_ERR_ALLOC);
+    }
     var need: i64 = deref w.len + extra;
     var cap: i64 = deref w.cap;
     if (need <= cap) {
@@ -221,6 +228,9 @@ fun _set_top(w: ptr<JsonWriter>, bits: u8) {
 
 fun _push(w: ptr<JsonWriter>, bits: u8) -> bool {
     var depth: i64 = deref w.depth;
+    if (depth >= JSON_MAX_DEPTH_LIMIT as i64) {
+        return _fail(w, JSON_WRITER_ERR_DEPTH);
+    }
     if (depth >= deref w.stack_cap) {
         var old_cap: i64 = deref w.stack_cap;
         var new_cap: i64 = old_cap * 2;
@@ -462,8 +472,11 @@ pub fun json_write_str_bytes(w: ptr<JsonWriter>, value: ptr<u8>, n: i64) -> bool
     return true;
 }
 
-// Inserts already-serialized JSON verbatim (not validated). Useful for
-// copying number lexemes exactly or splicing cached fragments.
+// Inserts already-serialized JSON verbatim. NOT validated or escaped: it is
+// for text you produced yourself (a number lexeme that came from a parsed
+// document, a cached fragment). Passing text from an untrusted source lets it
+// break out of the surrounding structure and forge keys or values; use
+// json_write_str for anything that is data.
 pub fun json_write_raw_bytes(w: ptr<JsonWriter>, text: ptr<u8>, n: i64) -> bool {
     if (!_before_value(w) || !_put_bytes(w, text, n)) {
         return false;

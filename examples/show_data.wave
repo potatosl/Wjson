@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: MPL-2.0
 //
 // Prints examples/data/survey_sample.json (made by csv2json.wave) as a table,
 // reading everything through wjson. Numbers are shown exactly as stored.
@@ -10,7 +10,7 @@ import("std::mem::alloc")::{mem_alloc, mem_free};
 import("wjson")::{
     wjson_console_utf8,
     JsonDoc, Json, json_parse_bytes, json_ok, json_root, json_free, json_len, json_at,
-    json_get, json_as_str, json_number_text, json_str_eq, json_key_at, json_str_is_null,
+    json_get, json_str_or, json_number_text, json_str_eq, json_key_at, json_str_is_null,
     json_path_i64,
 };
 
@@ -121,9 +121,9 @@ fun main() -> i32 {
     var i: i64 = 0;
     while (i < json_len(rows)) {
         var row: Json = json_at(rows, i);
-        var d1: str = json_as_str(json_get(row, "특성별(1)"));
-        var d2: str = json_as_str(json_get(row, "특성별(2)"));
-        var d3: str = json_as_str(json_get(row, "특성별(3)"));
+        var d1: str = json_str_or(json_get(row, "특성별(1)"), "?");
+        var d2: str = json_str_or(json_get(row, "특성별(2)"), "?");
+        var d3: str = json_str_or(json_get(row, "특성별(3)"), "?");
 
         // Blank line before each top-level section.
         if (json_str_eq(json_get(row, "특성별(2)"), "소계") && i > 0) {
@@ -140,7 +140,7 @@ fun main() -> i32 {
 
         var g: i64 = 0;
         while (g < json_len(measures)) {
-            var name: str = json_as_str(json_get(json_at(measures, g), "name"));
+            var name: str = json_str_or(json_get(json_at(measures, g), "name"), "?");
             cell_right(subtotal(row, name), 10);
             g += 1;
         }
@@ -156,15 +156,19 @@ fun main() -> i32 {
     var m: i64 = 0;
     while (m < json_len(measures)) {
         var group: Json = json_at(measures, m);
-        var gname: str = json_as_str(json_get(group, "name"));
+        var gname: str = json_str_or(json_get(group, "name"), "?");
         println("  {}", gname);
         var items: Json = json_get(group, "items");
         var k: i64 = 0;
         while (k < json_len(items)) {
-            var item: str = json_as_str(json_at(items, k));
+            var item: str = json_str_or(json_at(items, k), "?");
             print("      ");
             cell_left(item, 30);
-            cell_right(json_number_text(json_get(json_get(first, gname), item)), 8);
+            var cell: str = json_number_text(json_get(json_get(first, gname), item));
+            if (json_str_is_null(cell)) {
+                cell = "-";
+            }
+            cell_right(cell, 8);
             println("");
             k += 1;
         }
