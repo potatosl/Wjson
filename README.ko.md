@@ -15,6 +15,72 @@ Wave ↔ Rust/C++ 경계는 모두 C ABI(`extern(c)`)입니다. C/C++ 프로그�
 
 **외부 의존성 0개.** Rust crate도 C++ 라이브러리도 받지 않습니다(`core/Cargo.lock`에는 `wjson_core` 하나뿐). 퍼징에 쓰는 비교용 레퍼런스 파서도 테스트 안에 직접 구현돼 있습니다. 필요한 건 빌드 도구(wavec, cargo, C++ 컴파일러)뿐이고, Windows에서도 **MSVC/Visual Studio는 필요 없습니다**.
 
+## 사용 방법
+
+wjson은 소스로 받아서 씁니다. 정적 라이브러리 두 개를 한 번 빌드한 뒤, 내 프로그램을 그 라이브러리에 링크해서 컴파일하면 돼요.
+
+**1. 도구 설치** — Wave 컴파일러 `wavec`(0.2.1-pre-beta), Rust 1.99 이상, C++20 컴파일러. Windows는 [Windows (MSVC 없이)](#windows-msvc-없이)를 보세요. `setup-windows.cmd`가 필요한 걸 전부 설치해 줘요.
+
+**2. wjson 받고 라이브러리 빌드**
+
+```sh
+git clone https://github.com/potatosl/wjson.git
+cd wjson
+WJSON_TASK=libs wavec run build.wave
+```
+
+마지막 줄들에 라이브러리 경로 두 개와, 내 컴퓨터에 맞는 링커 플래그가 든 `link :` 줄이 출력돼요. 그 줄을 4단계에서 써요.
+
+**3. 프로그램 작성** (`hello.wave`, 위치는 아무 데나 — 예를 들면 `wjson` 폴더 옆):
+
+```wave
+import("wjson")::{JsonDoc, Json, json_parse, json_ok, json_root, json_path_str,
+                  json_path_i64, json_free};
+
+fun main() {
+    var doc: JsonDoc = json_parse("{\"server\": {\"host\": \"0.0.0.0\", \"ports\": [8080, 8443]}}");
+    if (!json_ok(doc)) { return; }
+    var cfg: Json = json_root(doc);
+    println("{}:{}", json_path_str(cfg, "server.host", "localhost"),
+                     json_path_i64(cfg, "server.ports[0]", 80));
+    json_free(&doc);
+}
+```
+
+**4. 컴파일하고 실행**
+
+```sh
+wavec build hello.wave \
+      wjson/build/native/libwjson_native.a wjson/build/cargo/release/libwjson_core.a \
+      --dep=wjson=wjson \
+      --link=gcc_s --link=util --link=rt --link=pthread --link=m --link=dl --link=c \
+      -L /usr/lib/gcc/x86_64-linux-gnu/15 --run
+```
+
+`0.0.0.0:8080`이 출력돼요. `--dep=wjson=wjson`은 받은 폴더를 가리켜요. `--link=...`와 `-L ...` 부분은 2단계의 `link :` 줄로 바꿔 쓰세요(gcc 폴더는 컴퓨터마다 달라요). `wavec`이 표준 라이브러리를 못 찾는다고 하면 `--std-root=<Wave의 std가 있는 폴더>`를 붙이세요.
+
+**C / C++에서 쓰기** (Wave 없이) — 같은 라이브러리 두 개를 링크하고 헤더를 include 하면 돼요. `wjson.hpp`는 헤더만으로 된 C++ 래퍼이고, `wjson.h`는 순수 C API예요(`libwjson_core.a`만 있으면 됩니다):
+
+```sh
+c++ -std=c++20 -Iwjson/include -Iwjson/native/include app.cpp \
+    wjson/build/native/libwjson_native.a wjson/build/cargo/release/libwjson_core.a \
+    -lpthread -ldl -o app
+```
+
+```cpp
+#include "wjson.hpp"
+#include <cstdio>
+
+int main() {
+    auto doc = wjson::Document::parse(R"({"server": {"host": "0.0.0.0", "ports": [8080, 8443]}})");
+    if (!doc) return 1;
+    auto server = doc.root()["server"];
+    std::printf("%lld\n", (long long)server["ports"][0].as_int().value_or(80));   // 8080
+}
+```
+
+다음은 아래 예제들, [API 요약](#api-요약-wave), 더 긴 프로그램이 있는 `examples/`를 보세요.
+
 ## 빠른 예제
 
 ```wave
@@ -156,7 +222,8 @@ Wave의 `main`은 인자를 받을 수 없어서 작업 선택은 환경 변수�
 cd examples
 wavec build show_data.wave ../build/native/libwjson_native.a ../build/cargo/release/libwjson_core.a \
       --dep=wjson=.. --link=gcc_s --link=pthread --link=m --link=dl --link=c \
-      -L /usr/lib/gcc/x86_64-linux-gnu/13 --run
+      -L /usr/lib/gcc/x86_64-linux-gnu/15 --run   # gcc 폴더는 컴퓨터마다 달라요:
+                                                  # `WJSON_TASK=libs`가 출력한 플래그를 쓰세요
 ```
 
 `vex.ws`는 Vex 매니페스트 규격(format 2, `lib = true`)에 맞춰 두었어요. 다만 Vex(2026-10-12 기준)의 매니페스트에는 네이티브 라이브러리를 링크하는 필드가 없고 모르는 필드는 오류로 처리돼서, Rust·C++ 라이브러리를 링크해야 하는 wjson은 아직 `vex build`로 빌드할 수 없어요. 빌드는 `build.wave`로 해요.

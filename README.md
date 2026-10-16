@@ -25,6 +25,83 @@ Studio**.
 > Status: 0.x. Wave itself is pre-beta and the API may still change; see
 > [Known limitations](#known-limitations).
 
+## How to use
+
+wjson is used from source: build its two static libraries once, then compile
+your own program against them.
+
+**1. Install the tools** — the Wave compiler `wavec` (0.2.1-pre-beta), Rust
+1.99 or newer, and a C++20 compiler. On Windows see
+[Windows (no MSVC)](#windows-no-msvc); `setup-windows.cmd` installs everything.
+
+**2. Get wjson and build the libraries**
+
+```sh
+git clone https://github.com/potatosl/wjson.git
+cd wjson
+WJSON_TASK=libs wavec run build.wave
+```
+
+The last lines print the two library paths and a `link :` line with the
+linker flags for your machine. Keep that line for step 4.
+
+**3. Write your program** (`hello.wave`, anywhere — for example next to the
+`wjson` folder):
+
+```wave
+import("wjson")::{JsonDoc, Json, json_parse, json_ok, json_root, json_path_str,
+                  json_path_i64, json_free};
+
+fun main() {
+    var doc: JsonDoc = json_parse("{\"server\": {\"host\": \"0.0.0.0\", \"ports\": [8080, 8443]}}");
+    if (!json_ok(doc)) { return; }
+    var cfg: Json = json_root(doc);
+    println("{}:{}", json_path_str(cfg, "server.host", "localhost"),
+                     json_path_i64(cfg, "server.ports[0]", 80));
+    json_free(&doc);
+}
+```
+
+**4. Compile and run it**
+
+```sh
+wavec build hello.wave \
+      wjson/build/native/libwjson_native.a wjson/build/cargo/release/libwjson_core.a \
+      --dep=wjson=wjson \
+      --link=gcc_s --link=util --link=rt --link=pthread --link=m --link=dl --link=c \
+      -L /usr/lib/gcc/x86_64-linux-gnu/15 --run
+```
+
+This prints `0.0.0.0:8080`. `--dep=wjson=wjson` points at the cloned folder.
+Replace the `--link=...` and `-L ...` flags with the `link :` line from step 2
+(the gcc directory differs from machine to machine). If `wavec` cannot find its
+standard library, add `--std-root=<folder containing Wave's std>`.
+
+**From C or C++** (no Wave needed) link the same two libraries and include the
+headers. `wjson.hpp` is a header-only C++ view; `wjson.h` is the plain C API
+(it only needs `libwjson_core.a`):
+
+```sh
+c++ -std=c++20 -Iwjson/include -Iwjson/native/include app.cpp \
+    wjson/build/native/libwjson_native.a wjson/build/cargo/release/libwjson_core.a \
+    -lpthread -ldl -o app
+```
+
+```cpp
+#include "wjson.hpp"
+#include <cstdio>
+
+int main() {
+    auto doc = wjson::Document::parse(R"({"server": {"host": "0.0.0.0", "ports": [8080, 8443]}})");
+    if (!doc) return 1;
+    auto server = doc.root()["server"];
+    std::printf("%lld\n", (long long)server["ports"][0].as_int().value_or(80));   // 8080
+}
+```
+
+Next: the examples below, the [API overview](#api-overview-wave), and
+`examples/` for longer programs.
+
 ## Quick start
 
 ```wave
@@ -201,7 +278,8 @@ relative to `examples/`, so run them from there:
 cd examples
 wavec build show_data.wave ../build/native/libwjson_native.a ../build/cargo/release/libwjson_core.a \
       --dep=wjson=.. --link=gcc_s --link=pthread --link=m --link=dl --link=c \
-      -L /usr/lib/gcc/x86_64-linux-gnu/13 --run
+      -L /usr/lib/gcc/x86_64-linux-gnu/15 --run   # the gcc directory is machine specific:
+                                                  # use the flags `WJSON_TASK=libs` printed
 ```
 
 ### Vex
