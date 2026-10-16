@@ -105,7 +105,21 @@ jobs:
           echo "WAVE_STD=$HOME/wave/std" >> "$GITHUB_ENV"
           ls "$HOME/wave"
       - name: Build and test
-        run: wavec --std-root="$WAVE_STD" run build.wave
+        run: |
+          set +e
+          wavec --std-root="$WAVE_STD" run build.wave 2>&1 | tee build-log.txt
+          code=${PIPESTATUS[0]}
+          # On failure publish the tail of the log as an annotation: raw job logs
+          # need a login, annotations are public.
+          if [ "$code" -ne 0 ]; then
+            python3 - <<'PY'
+          import re
+          t = open("build-log.txt", errors="replace").read().splitlines()[-80:]
+          t = re.sub(r"\x1b\[[0-9;]*m", "", "\n".join(t))
+          print("::error title=build log (last 80 lines)::" + t.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A"))
+          PY
+          fi
+          exit $code
 
   windows:
     runs-on: windows-2025
