@@ -306,7 +306,7 @@ build.wave     빌드 드라이버 (Wave)
 
 - Wave 언어가 pre-beta라 문법이 바뀌면 `src/`를 맞춰야 할 수 있습니다.
 - 다른 모듈에서 `extern(c) fun name(...)` 형태(심볼 이름 생략)로 선언하면 현재 wavec가 이름을 맹글링해 링크가 깨집니다. 그래서 `src/ffi.wave`는 항상 `extern(c, "symbol")` 형태를 씁니다.
-- Linux x86-64와 Windows 11 x64(MSVC 없이)에서 검증했고, CI가 푸시할 때마다 두 환경(`ubuntu-26.04`, `windows-2025`)에서 빌드와 테스트를 합니다. macOS와 ARM은 아직 검증하지 않았습니다.
+- Linux x86-64와 Windows 11 x64(MSVC 없이)에서 검증했고, CI가 푸시할 때마다 전체 테스트를 Linux x64·ARM64(`ubuntu-26.04`, `ubuntu-26.04-arm`), Windows x64(`windows-2025`), macOS Apple Silicon·Intel(`macos-26`, `macos-26-intel`)에서 돌려요. Windows ARM은 지원하지 않아요(wjlink가 x86-64 코드만 만들어요).
 - 1.0 전이라 API가 바뀔 수 있어요. 바뀐 점은 `CHANGELOG.md`에 적어요.
 - Windows 빌드는 C 런타임으로 시스템의 `msvcrt.dll`을 써요(MinGW와 같은 방식). Microsoft가 앱용으로 권장하는 런타임은 아니에요. C99 수학 함수 일부(`fma`)만 `ucrtbase.dll`에서 가져와요.
 - `wjlink`는 wjson 빌드에 필요한 범위(x86-64, 콘솔 프로그램)에서 검증했어요. 범용 링커로 쓰기에는 아직 이릅니다.

@@ -61,11 +61,10 @@ jobs:
           WJSON_TASK=sanitize wavec --std-root="$WAVE_STD" run build.wave
 
   # Other Unix platforms: same build and tests as the Linux job, without the
-  # lint and valgrind steps. Experimental until every entry has gone green.
+  # lint and valgrind steps.
   portable:
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
-    continue-on-error: true
     strategy:
       fail-fast: false
       matrix:

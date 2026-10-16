@@ -46,6 +46,12 @@ minor releases.
   files whose header rows are missing or ragged (the examples used to index
   past the field tables); missing keys print `?` instead of a null string.
 
+### Platforms
+- CI now builds and runs the full test suite on Linux ARM64, macOS Apple Silicon
+  and macOS Intel as well (all passed on their first run), next to Linux x64 and
+  Windows x64. This also exercises the portable (non-x86) path of the C++
+  number conversion on ARM. Windows on ARM remains unsupported.
+
 ### Toolchain
 - Rust edition 2021 -> 2024 for `core/` and `chain/` (`rust-version = "1.99"`,
   the version everything is tested with). C ABI entry points use

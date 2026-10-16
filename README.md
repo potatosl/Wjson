@@ -443,9 +443,11 @@ build.wave     build driver (Wave)
 - Declaring `extern(c) fun name(...)` without an explicit symbol in another
   module currently gets the name mangled by wavec and breaks linking, so
   `src/ffi.wave` always uses the `extern(c, "symbol")` form.
-- Verified on Linux x86-64 and Windows 11 x64 (without MSVC); CI builds and
-  tests both on every push (`ubuntu-26.04`, `windows-2025`). macOS and ARM
-  have not been tested.
+- Verified on Linux x86-64 and Windows 11 x64 (without MSVC). CI builds and
+  runs the full test suite on every push on Linux x64 and ARM64
+  (`ubuntu-26.04`, `ubuntu-26.04-arm`), Windows x64 (`windows-2025`) and macOS
+  Apple Silicon and Intel (`macos-26`, `macos-26-intel`). Windows on ARM is not
+  supported: wjlink only produces x86-64 code.
 - Before 1.0 the API may change; changes are listed in `CHANGELOG.md`.
 - The Windows build uses the system `msvcrt.dll` as its C runtime (as MinGW
   does), which Microsoft does not recommend for applications. Only a few C99
