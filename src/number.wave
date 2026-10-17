@@ -15,7 +15,12 @@
 // size a buffer. Negative returns are JSON_NUM_* codes.
 
 import("std::math::float")::{float_to_bits_f64, float_from_bits_f64};
-import("./consts")::{JSON_NUM_OK, JSON_NUM_INVALID, JSON_NUM_RANGE, JSON_NUM_NONFINITE};
+// Status codes; the values match JSON_NUM_* in consts.wave. They are repeated
+// here because consts.wave imports ffi.wave, which imports this file.
+const JSON_NUM_OK: i32 = 0;
+const JSON_NUM_INVALID: i32 = -1;
+const JSON_NUM_RANGE: i32 = -2;
+const JSON_NUM_NONFINITE: i32 = -3;
 
 const MANT_MASK: u64 = 4503599627370495;          // 2^52 - 1
 const SIGN_BIT: u64 = 9223372036854775808;        // 2^63

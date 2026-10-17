@@ -9,7 +9,12 @@
 // is shorter than `cap` it is also NUL-terminated. Negative returns are
 // JSON_NUM_* codes.
 
-import("./consts")::{JSON_NUM_INVALID, JSON_ESCAPE_ASCII, JSON_ESCAPE_HTML, JSON_ESCAPE_QUOTES};
+// Values match JSON_NUM_INVALID and JSON_ESCAPE_* in consts.wave. They are
+// repeated here because consts.wave imports ffi.wave, which imports this file.
+const JSON_NUM_INVALID: i32 = -1;
+const JSON_ESCAPE_ASCII: u32 = 1;
+const JSON_ESCAPE_HTML: u32 = 2;
+const JSON_ESCAPE_QUOTES: u32 = 4;
 
 // Decodes one UTF-8 sequence at p, with `avail` bytes remaining (> 0). Returns
 // its length (1..4) and stores the code point, or returns 0 for an invalid,

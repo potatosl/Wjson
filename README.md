@@ -7,12 +7,12 @@ each do the part they are best at.
 
 | Layer | Language | Responsibility | Location |
 | --- | --- | --- | --- |
-| API | **Wave** | navigation, path queries, document editing (incl. by path), writer, serialization, deep equality, file streaming | `src/*.wave` |
+| API | **Wave** | navigation, path queries, document editing (incl. by path), writer, serialization, deep equality, file streaming; number conversion, string escaping and UTF-8 checks (`number.wave`, `escape.wave`) | `src/*.wave` |
 | Core | **Rust** | RFC 8259 parser, index-based DOM and edit operations, hash index for large objects, incremental (pull) parser, JSON Pointer, error positions | `core/` |
-| Native | **C++20** (freestanding) | number conversion (own implementation: correctly rounded parsing, shortest round-trip output), string escaping, UTF-8 validation; compiles without any standard-library or SDK headers | `native/` |
+| Native | **C++20** (freestanding) | the same number conversion (correctly rounded parsing, shortest round-trip output), string escaping and UTF-8 validation for C and C++ users, and as the reference the Wave code is tested against; compiles without any standard-library or SDK headers | `native/` |
 | Toolchain | **Rust** | `wjlink`: the Windows link driver used instead of MSVC — generates import libraries from system DLLs, emits the startup object, archives objects, drives rust-lld | `chain/` |
 
-Every boundary between Wave and Rust/C++ is a C ABI (`extern(c)`). C and C++
+Every boundary between Wave and Rust is a C ABI (`extern(c)`). C and C++
 programs can use the same core through `include/wjson.h` and
 `native/include/wjson.hpp`.
 
@@ -225,10 +225,11 @@ AddressSanitizer + UBSan and valgrind and the Rust unit tests under valgrind;
 a run with 1,000,000 sanitized iterations and 30,000 valgrind iterations
 (plus 200,000 Rust fuzz iterations) found nothing.
 
-**Pure-Wave ports (experimental).** `src/number.wave` (parse, shortest and
+**Number and string code in Wave.** `src/number.wave` (parse, shortest and
 fixed formatting of numbers) and `src/escape.wave` (string escaping, UTF-8
-check and count) re-implement the C++ layer in Wave. They are not used by the
-public API yet; the tests above compare them bit for bit with the C++ code. Built
+check and count) re-implement the C++ layer in Wave, and the Wave API uses them
+(through `src/ffi.wave`); the C++ code stays for C and C++ users. The tests above
+compare the Wave code bit for bit with the C++ code. Built
 with `-O2` they run at about the speed of the C++ code (for 200,000 values: short
 numbers 17 ms vs 20 ms, random doubles 336 ms vs 322 ms); built with `-O0` they
 are about 4x slower.
@@ -450,7 +451,7 @@ core/          Rust core: parser/dom/edit/stream (staticlib + unit tests, tests/
 native/        C++ conversion layer, wjson.hpp (C++ wrapper), C++ tests and benchmark
 chain/         wjlink: MSVC-free Windows link driver (Rust)
 include/       C header for the Rust core
-src/           Wave API (lib.wave is the entry point); number.wave and escape.wave are the experimental pure-Wave ports
+src/           Wave API (lib.wave is the entry point); number.wave and escape.wave are the pure-Wave number and string code
 tests/         Wave end-to-end tests and the port comparison tests
 examples/      Wave examples and sample data
 build.wave     build driver (Wave)

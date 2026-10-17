@@ -5,7 +5,11 @@
 // Run from the repository root:  wavec run build.wave
 
 extern(c, "getenv") fun c_getenv(name: ptr<u8>) -> ptr<u8>;
-import("wjson::ffi")::{ffi_escape, ffi_utf8_check, ffi_utf8_count};
+// The C++ reference implementation (native/src/escape.cpp), called directly:
+// wjson::ffi now routes to the Wave code under test.
+extern(c, "wjn_escape") fun ffi_escape(src: ptr<u8>, len: i64, dst: ptr<u8>, cap: i64, flags: u32) -> i64;
+extern(c, "wjn_utf8_check") fun ffi_utf8_check(src: ptr<u8>, len: i64) -> i64;
+extern(c, "wjn_utf8_count") fun ffi_utf8_count(src: ptr<u8>, len: i64) -> i64;
 import("wjson::escape")::{esc_escape, esc_utf8_check, esc_utf8_count};
 
 static CHECKS: i32 = 0;

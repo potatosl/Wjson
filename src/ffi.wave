@@ -3,11 +3,17 @@
 // Raw C ABI bindings for wjson.
 //
 //   wj_*  : Rust core (core/src/lib.rs)  — parsing and the document model
-//   wjn_* : C++ native (native/src/*.cpp) — number conversion and escaping
+//   num_* / esc_* : pure Wave (number.wave, escape.wave) — number conversion,
+//                   string escaping and UTF-8 checks. The C++ versions in
+//                   native/src/*.cpp (wjn_*) remain for C and C++ users and as
+//                   the reference the Wave tests compare against.
 //
 // Wave keeps `extern(c)` declarations private to their module, so this file
 // re-exposes each one as a thin `pub fun`. Higher-level modules import these
 // wrappers and never declare foreign symbols themselves.
+
+import("./number")::{num_parse_f64, num_parse_i64, num_format_f64, num_format_f64_fixed, num_format_i64};
+import("./escape")::{esc_escape, esc_utf8_check, esc_utf8_count};
 
 // ---- Rust core -------------------------------------------------------------
 
@@ -151,37 +157,31 @@ pub fun ffi_reader_error_offset(r: ptr<u8>) -> i64 { return c_wj_reader_error_of
 pub fun ffi_reader_error_line(r: ptr<u8>) -> i64 { return c_wj_reader_error_line(r); }
 pub fun ffi_reader_error_column(r: ptr<u8>) -> i64 { return c_wj_reader_error_column(r); }
 
-// ---- C++ native ------------------------------------------------------------
-
-extern(c, "wjn_parse_f64") fun c_wjn_parse_f64(src: ptr<u8>, len: i64, value: ptr<f64>) -> i32;
-extern(c, "wjn_parse_i64") fun c_wjn_parse_i64(src: ptr<u8>, len: i64, value: ptr<i64>) -> i32;
-extern(c, "wjn_format_f64") fun c_wjn_format_f64(value: f64, dst: ptr<u8>, cap: i64) -> i64;
-extern(c, "wjn_format_f64_fixed") fun c_wjn_format_f64_fixed(value: f64, precision: i32, dst: ptr<u8>, cap: i64) -> i64;
-extern(c, "wjn_format_i64") fun c_wjn_format_i64(value: i64, dst: ptr<u8>, cap: i64) -> i64;
-extern(c, "wjn_escape") fun c_wjn_escape(src: ptr<u8>, len: i64, dst: ptr<u8>, cap: i64, flags: u32) -> i64;
-extern(c, "wjn_utf8_check") fun c_wjn_utf8_check(src: ptr<u8>, len: i64) -> i64;
-extern(c, "wjn_utf8_count") fun c_wjn_utf8_count(src: ptr<u8>, len: i64) -> i64;
+// ---- Numbers, strings and UTF-8 (pure Wave) -----------------------------------
 
 pub fun ffi_parse_f64(src: ptr<u8>, len: i64, value: ptr<f64>) -> i32 {
-    return c_wjn_parse_f64(src, len, value);
+    return num_parse_f64(src, len, value);
 }
 pub fun ffi_parse_i64(src: ptr<u8>, len: i64, value: ptr<i64>) -> i32 {
-    return c_wjn_parse_i64(src, len, value);
+    return num_parse_i64(src, len, value);
 }
 pub fun ffi_format_f64(value: f64, dst: ptr<u8>, cap: i64) -> i64 {
-    return c_wjn_format_f64(value, dst, cap);
+    return num_format_f64(value, dst, cap);
 }
 pub fun ffi_format_f64_fixed(value: f64, precision: i32, dst: ptr<u8>, cap: i64) -> i64 {
-    return c_wjn_format_f64_fixed(value, precision, dst, cap);
+    return num_format_f64_fixed(value, precision, dst, cap);
 }
 pub fun ffi_format_i64(value: i64, dst: ptr<u8>, cap: i64) -> i64 {
-    return c_wjn_format_i64(value, dst, cap);
+    return num_format_i64(value, dst, cap);
 }
 pub fun ffi_escape(src: ptr<u8>, len: i64, dst: ptr<u8>, cap: i64, flags: u32) -> i64 {
-    return c_wjn_escape(src, len, dst, cap, flags);
+    return esc_escape(src, len, dst, cap, flags);
 }
+pub fun ffi_utf8_check(src: ptr<u8>, len: i64) -> i64 { return esc_utf8_check(src, len); }
+pub fun ffi_utf8_count(src: ptr<u8>, len: i64) -> i64 { return esc_utf8_count(src, len); }
+
+// ---- C++ native (Windows console only) -----------------------------------------
+
 extern(c, "wjn_console_utf8") fun c_wjn_console_utf8() -> i32;
 
 pub fun ffi_console_utf8() -> i32 { return c_wjn_console_utf8(); }
-pub fun ffi_utf8_check(src: ptr<u8>, len: i64) -> i64 { return c_wjn_utf8_check(src, len); }
-pub fun ffi_utf8_count(src: ptr<u8>, len: i64) -> i64 { return c_wjn_utf8_count(src, len); }

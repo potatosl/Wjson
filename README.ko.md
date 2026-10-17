@@ -174,7 +174,7 @@ WJSON_DRY_RUN=1 wavec run build.wave                   # 실행할 명령만 출
 
 퍼징 횟수는 `WJSON_FUZZ_ITERS`로 늘릴 수 있어요(기본 5,000 / C++ 50,000). 개발 중에는 테스트별 1,000,000회로 돌려서 통과를 확인했어요. `WJSON_TASK=sanitize`는 C++ 테스트를 AddressSanitizer + UBSan과 valgrind로, Rust 단위 테스트를 valgrind로 돌려요. 새니타이저 100만 회, valgrind 3만 회(그리고 Rust 퍼징 20만 회)로 돌렸을 때 발견된 문제는 없었어요.
 
-**순수 Wave 포팅 (실험).** `src/number.wave`(숫자 파싱, 최단·고정소수점 출력)와 `src/escape.wave`(문자열 이스케이프, UTF-8 검사·개수)는 C++ 레이어를 Wave로 다시 구현한 거예요. 아직 공개 API에서는 쓰지 않고, 위 테스트가 C++ 코드와 비트 단위로 대조해요. `-O2`로 빌드하면 C++과 비슷한 속도예요(값 20만 개 기준 짧은 숫자 17ms 대 20ms, 무작위 double 336ms 대 322ms). `-O0`으로 빌드하면 약 4배 느려요.
+**Wave로 쓴 숫자·문자열 코드.** `src/number.wave`(숫자 파싱, 최단·고정소수점 출력)와 `src/escape.wave`(문자열 이스케이프, UTF-8 검사·개수)는 C++ 레이어를 Wave로 다시 구현한 거고, Wave API가 `src/ffi.wave`를 통해 이걸 써요. C++ 코드는 C/C++ 사용자를 위해 그대로 두고, 위 테스트가 Wave 코드를 C++ 코드와 비트 단위로 대조해요. `-O2`로 빌드하면 C++과 비슷한 속도예요(값 20만 개 기준 짧은 숫자 17ms 대 20ms, 무작위 double 336ms 대 322ms). `-O0`으로 빌드하면 약 4배 느려요.
 
 성능 (Linux, Xeon 2.8GHz 1코어, `WJSON_TASK=bench`):
 
@@ -303,7 +303,7 @@ core/          Rust 코어: parser/dom/edit/stream (staticlib + 단위 테스트
 native/        C++ 변환 계층, wjson.hpp(C++용 래퍼), C++ 테스트·벤치마크
 chain/         wjlink: MSVC 없는 Windows 링크 도구 (Rust)
 include/       Rust 코어의 C 헤더
-src/           Wave API (lib.wave가 진입점), number.wave·escape.wave는 실험적인 순수 Wave 포팅
+src/           Wave API (lib.wave가 진입점), number.wave·escape.wave는 순수 Wave 숫자·문자열 코드
 tests/         Wave 종단 간 테스트와 포팅 대조 테스트
 examples/      Wave 예제와 데이터
 build.wave     빌드 드라이버 (Wave)

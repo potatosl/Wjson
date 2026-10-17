@@ -6,7 +6,13 @@
 // Run from the repository root:  wavec run build.wave
 
 import("std::math::float")::{float_to_bits_f64, float_from_bits_f64};
-import("wjson::ffi")::{ffi_parse_f64, ffi_parse_i64, ffi_format_f64, ffi_format_f64_fixed, ffi_format_i64};
+// The C++ reference implementation (native/src/number.cpp), called directly:
+// wjson::ffi now routes to the Wave code under test.
+extern(c, "wjn_parse_f64") fun ffi_parse_f64(src: ptr<u8>, len: i64, value: ptr<f64>) -> i32;
+extern(c, "wjn_parse_i64") fun ffi_parse_i64(src: ptr<u8>, len: i64, value: ptr<i64>) -> i32;
+extern(c, "wjn_format_f64") fun ffi_format_f64(value: f64, dst: ptr<u8>, cap: i64) -> i64;
+extern(c, "wjn_format_f64_fixed") fun ffi_format_f64_fixed(value: f64, precision: i32, dst: ptr<u8>, cap: i64) -> i64;
+extern(c, "wjn_format_i64") fun ffi_format_i64(value: i64, dst: ptr<u8>, cap: i64) -> i64;
 import("wjson::number")::{num_parse_f64, num_parse_i64, num_format_f64, num_format_f64_fixed, num_format_i64};
 
 extern(c, "getenv") fun c_getenv(name: ptr<u8>) -> ptr<u8>;

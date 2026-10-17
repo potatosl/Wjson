@@ -9,10 +9,12 @@ minor releases.
 ### Wave
 - `build.wave` now compiles every Wave program with `-O2` (wavec defaults to
   `-O0`, about 4x slower on the same code).
-- New `src/number.wave` and `src/escape.wave`: pure-Wave ports of the number
-  conversion and the string escaping / UTF-8 checks. Experimental and not used
-  by the public API yet. `tests/number_test.wave` and `tests/escape_test.wave`
-  compare them with the C++ layer (same status code, same bits or bytes).
+- New `src/number.wave` and `src/escape.wave`: the number conversion and the
+  string escaping / UTF-8 checks written in Wave. The Wave API now uses them
+  (through `src/ffi.wave`) instead of the C++ functions, which remain for C and
+  C++ users. `tests/number_test.wave` and `tests/escape_test.wave` compare them
+  with the C++ layer (same status code, same bits or bytes). Without `-O2` the
+  Wave code is about 4x slower than the C++ code; with `-O2` it is level.
 - `.gitattributes` marks `*.wave` as Wave for GitHub's language statistics.
 
 ### Native
