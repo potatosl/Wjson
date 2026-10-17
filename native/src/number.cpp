@@ -723,6 +723,32 @@ int layout(bool negative, const char *digits, int n, int k, const char *exact, i
     return len;
 }
 
+// Fast path for short decimals such as 12.5 or 0.001234. A decimal with at
+// most 15 significant digits maps to a distinct double (DBL_DIG), so if some
+// m / 10^k with m < 10^15 divides back to exactly `a`, that decimal is the
+// only one of at most 15 digits that reads as `a`, hence also the shortest.
+// m and 10^k (k <= 22) are exact doubles and the division is correctly
+// rounded, so the check is exact. Returns the digit count (trailing zeros
+// removed) and sets *k_out like shortest_digits, or returns 0 when `a` is not
+// of that form (the caller then uses the general algorithm).
+int short_decimal_digits(double a, char *digits, int *k_out) {
+    for (int k = 0; k <= 22; ++k) {
+        const double t = a * POW10_F64[k];
+        if (t >= 1e15) return 0;  // too many digits, and only more with larger k
+        u64 m = static_cast<u64>(t + 0.5);
+        if (m == 0 || static_cast<double>(m) / POW10_F64[k] != a) continue;
+        int scale = k;  // value = m * 10^-scale
+        while (m % 10 == 0) {
+            m /= 10;
+            --scale;
+        }
+        const int n = u64_digits(m, digits);
+        *k_out = n - scale;  // value ~ 0.DIGITS * 10^(n - scale)
+        return n;
+    }
+    return 0;
+}
+
 }  // namespace
 
 extern "C" int32_t wjn_parse_f64(const char *src, int64_t len, double *out) noexcept {
@@ -765,7 +791,8 @@ extern "C" int64_t wjn_format_f64(double value, char *dst, int64_t cap) noexcept
     } else {
         char digits[24];
         int k = 0;
-        const int n = shortest_digits(bits & ~SIGN_BIT, digits, &k);
+        int n = short_decimal_digits(from_bits(bits & ~SIGN_BIT), digits, &k);
+        if (n == 0) n = shortest_digits(bits & ~SIGN_BIT, digits, &k);
         char exact[24];
         int exact_n = 0;
         const int be = static_cast<int>((bits >> 52) & 0x7FF);

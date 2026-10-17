@@ -79,6 +79,10 @@ wavec build hello.wave \
       -L /usr/lib/gcc/x86_64-linux-gnu/15 --run
 ```
 
+wavec compiles at `-O0` unless told otherwise. wjson's native code is already
+optimized, but your own Wave code runs several times faster with `-O2`
+(`wavec -O2 build ...`).
+
 This prints `0.0.0.0:8080`. `--dep=wjson=wjson` points at the cloned folder.
 Replace the `--link=...` and `-L ...` flags with the `link :` line from step 2
 (the gcc directory differs from machine to machine). If `wavec` cannot find its
@@ -195,6 +199,9 @@ WJSON_TASK=bench wavec run build.wave                  # benchmarks (Rust core +
 WJSON_DRY_RUN=1 wavec run build.wave                   # print the commands only
 ```
 
+`build.wave` compiles every Wave program (tests and examples) with `-O2`;
+wavec's default is `-O0`, which was about 4x slower on the same code.
+
 Wave's `main` takes no arguments, so tasks are chosen with environment
 variables. Other knobs: `WAVEC`, `WAVE_STD` (explicit std root), `CARGO`,
 `RUSTC`, `CXX`. Because `std::process` cannot spawn processes on Windows yet,
@@ -209,10 +216,22 @@ Tests:
 | `native/tests/native_test.cpp` | C++ conversions against an exact in-house oracle (decimal expansions): parse rounding, halfway cases, shortest output, fixed notation, escape → parse round trip |
 | `chain/src/tests.rs` | wjlink: import library and archive layout, runtime object, command-line quoting |
 | `tests/*.wave` | Wave API end to end: basics, editing, streaming (incl. 100k-line JSON Lines) |
+| `tests/number_test.wave`, `tests/escape_test.wave` | the pure-Wave ports (below) against the C++ layer: same status code and the same bits or bytes for every input, including too-small buffers (defaults: 5,000 / 20,000 iterations) |
 
 Increase the randomized iterations with `WJSON_FUZZ_ITERS` (defaults: 5,000
 Rust / 50,000 C++). During development every randomized test was run for
-1,000,000 iterations.
+1,000,000 iterations. `WJSON_TASK=sanitize` runs the C++ tests under
+AddressSanitizer + UBSan and valgrind and the Rust unit tests under valgrind;
+a run with 1,000,000 sanitized iterations and 30,000 valgrind iterations
+(plus 200,000 Rust fuzz iterations) found nothing.
+
+**Pure-Wave ports (experimental).** `src/number.wave` (parse, shortest and
+fixed formatting of numbers) and `src/escape.wave` (string escaping, UTF-8
+check and count) re-implement the C++ layer in Wave. They are not used by the
+public API yet; the tests above compare them bit for bit with the C++ code. Built
+with `-O2` they run at about the speed of the C++ code (for 200,000 values: short
+numbers 17 ms vs 20 ms, random doubles 336 ms vs 322 ms); built with `-O0` they
+are about 4x slower.
 
 Performance (Linux, Xeon 2.8 GHz, one core, `WJSON_TASK=bench`):
 
@@ -431,8 +450,8 @@ core/          Rust core: parser/dom/edit/stream (staticlib + unit tests, tests/
 native/        C++ conversion layer, wjson.hpp (C++ wrapper), C++ tests and benchmark
 chain/         wjlink: MSVC-free Windows link driver (Rust)
 include/       C header for the Rust core
-src/           Wave API (lib.wave is the entry point)
-tests/         Wave end-to-end tests
+src/           Wave API (lib.wave is the entry point); number.wave and escape.wave are the experimental pure-Wave ports
+tests/         Wave end-to-end tests and the port comparison tests
 examples/      Wave examples and sample data
 build.wave     build driver (Wave)
 ```

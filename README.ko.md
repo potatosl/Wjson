@@ -63,6 +63,8 @@ wavec build hello.wave \
       -L /usr/lib/gcc/x86_64-linux-gnu/15 --run
 ```
 
+wavec는 따로 지정하지 않으면 `-O0`으로 컴파일해요. wjson의 네이티브 코드는 이미 최적화돼 있지만, 내 Wave 코드는 `-O2`(`wavec -O2 build ...`)를 주면 몇 배 빨라져요.
+
 `0.0.0.0:8080`이 출력돼요. `--dep=wjson=wjson`은 받은 폴더를 가리켜요. `--link=...`와 `-L ...` 부분은 2단계의 `link :` 줄로 바꿔 쓰세요(gcc 폴더는 컴퓨터마다 달라요). `wavec`이 표준 라이브러리를 못 찾는다고 하면(`wavec print std-path`가 찾는 위치를 보여 주고, 설치 스크립트는 `~/.wave/bin/std`에 둬요) `--std-root=<Wave의 std가 있는 폴더>`를 붙이거나, Wave 문제 해결 페이지의 안내처럼 `wavec install std`를 실행하세요.
 
 **C / C++에서 쓰기** (Wave 없이) — 같은 라이브러리 두 개를 링크하고 헤더를 include 하면 돼요. `wjson.hpp`는 헤더만으로 된 C++ 래퍼이고, `wjson.h`는 순수 C API예요(`libwjson_core.a`만 있으면 됩니다):
@@ -168,8 +170,11 @@ WJSON_DRY_RUN=1 wavec run build.wave                   # 실행할 명령만 출
 | `native/tests/native_test.cpp` | C++ 변환 + 자체 정확 오라클(10진 전개)과 무작위 대조: 파싱 반올림, 중간값(tie), 최단 출력, 고정소수점, 이스케이프→파싱 왕복 |
 | `chain/src/tests.rs` | wjlink: import 라이브러리·아카이브 구조, 런타임 오브젝트, 명령줄 인용 |
 | `tests/*.wave` | Wave API 종단 간: 기본 기능, 수정, 스트리밍(10만 줄 JSON Lines 포함) |
+| `tests/number_test.wave`, `tests/escape_test.wave` | 순수 Wave 포팅(아래)을 C++ 레이어와 대조: 모든 입력에서 상태 코드와 결과 비트·바이트가 같은지(버퍼가 모자란 경우 포함, 기본 5,000 / 20,000회) |
 
-퍼징 횟수는 `WJSON_FUZZ_ITERS`로 늘릴 수 있어요(기본 5,000 / C++ 50,000). 개발 중에는 테스트별 1,000,000회로 돌려서 통과를 확인했어요.
+퍼징 횟수는 `WJSON_FUZZ_ITERS`로 늘릴 수 있어요(기본 5,000 / C++ 50,000). 개발 중에는 테스트별 1,000,000회로 돌려서 통과를 확인했어요. `WJSON_TASK=sanitize`는 C++ 테스트를 AddressSanitizer + UBSan과 valgrind로, Rust 단위 테스트를 valgrind로 돌려요. 새니타이저 100만 회, valgrind 3만 회(그리고 Rust 퍼징 20만 회)로 돌렸을 때 발견된 문제는 없었어요.
+
+**순수 Wave 포팅 (실험).** `src/number.wave`(숫자 파싱, 최단·고정소수점 출력)와 `src/escape.wave`(문자열 이스케이프, UTF-8 검사·개수)는 C++ 레이어를 Wave로 다시 구현한 거예요. 아직 공개 API에서는 쓰지 않고, 위 테스트가 C++ 코드와 비트 단위로 대조해요. `-O2`로 빌드하면 C++과 비슷한 속도예요(값 20만 개 기준 짧은 숫자 17ms 대 20ms, 무작위 double 336ms 대 322ms). `-O0`으로 빌드하면 약 4배 느려요.
 
 성능 (Linux, Xeon 2.8GHz 1코어, `WJSON_TASK=bench`):
 
@@ -221,6 +226,8 @@ $env:WJSON_RUN="examples/show_data.wave"; wavec --std-root="$env:LOCALAPPDATA\Wa
 ```
 
 Windows 11 + wavec 0.2.1-pre-beta + Rust 1.99.1 + clang 23.1.3 조합에서, MSVC 경로를 전부 비운 상태로 전체 테스트가 통과하는 것을 확인했어요.
+
+`build.wave`는 모든 Wave 프로그램(테스트와 예제)을 `-O2`로 컴파일해요. wavec의 기본값 `-O0`은 같은 코드에서 약 4배 느렸어요.
 
 Wave의 `main`은 인자를 받을 수 없어서 작업 선택은 환경 변수로 해요. 그 밖에 `WAVEC`, `WAVE_STD`(std 루트 직접 지정), `CARGO`, `RUSTC`, `CXX`를 쓸 수 있어요. `std::process`가 아직 Windows에서 프로세스를 띄우지 못해서, 드라이버는 C 라이브러리의 `system()`을 `extern(c)`로 불러 명령을 실행해요.
 
@@ -296,8 +303,8 @@ core/          Rust 코어: parser/dom/edit/stream (staticlib + 단위 테스트
 native/        C++ 변환 계층, wjson.hpp(C++용 래퍼), C++ 테스트·벤치마크
 chain/         wjlink: MSVC 없는 Windows 링크 도구 (Rust)
 include/       Rust 코어의 C 헤더
-src/           Wave API (lib.wave가 진입점)
-tests/         Wave 종단 간 테스트
+src/           Wave API (lib.wave가 진입점), number.wave·escape.wave는 실험적인 순수 Wave 포팅
+tests/         Wave 종단 간 테스트와 포팅 대조 테스트
 examples/      Wave 예제와 데이터
 build.wave     빌드 드라이버 (Wave)
 ```

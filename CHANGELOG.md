@@ -4,6 +4,34 @@ All notable changes are listed here. The project follows
 [Semantic Versioning](https://semver.org); before 1.0 the API may change in
 minor releases.
 
+## Unreleased
+
+### Wave
+- `build.wave` now compiles every Wave program with `-O2` (wavec defaults to
+  `-O0`, about 4x slower on the same code).
+- New `src/number.wave` and `src/escape.wave`: pure-Wave ports of the number
+  conversion and the string escaping / UTF-8 checks. Experimental and not used
+  by the public API yet. `tests/number_test.wave` and `tests/escape_test.wave`
+  compare them with the C++ layer (same status code, same bits or bytes).
+- `.gitattributes` marks `*.wave` as Wave for GitHub's language statistics.
+
+### Native
+- `wjn_format_f64` has a fast path for short decimals (12.5, 0.001234, ...): a
+  decimal of at most 15 significant digits is unique for its double, so when
+  `m / 10^k` divides back to the value exactly it is also the shortest form.
+  Anything else still uses the general algorithm. About 25% faster on the
+  benchmark's mixed values (about 127 ns to 97 ns; about half of them are
+  short decimals); the output is unchanged: identical to the previous
+  implementation on 320 million values (random bits, short decimals and their
+  neighbouring doubles, integers, powers of ten).
+- `native_test` checks short decimals and their neighbours against the exact
+  shortest-form oracle, plus fixed cases for trailing zeros and the
+  fixed/scientific choice.
+
+### Verification
+- No findings from 1,000,000 AddressSanitizer + UBSan iterations of the C++
+  tests, 30,000 valgrind iterations and 200,000 Rust fuzz iterations.
+
 ## 0.4.0 — 2026-10-17
 
 ### License

@@ -445,6 +445,20 @@ static void test_numbers() {
     parse_f("+1", &rc);
     CHECK(rc == WJN_ERR_INVALID);
 
+    // Short decimals take the formatter's fast path: digits, trailing zeros
+    // and the fixed/scientific choice must match the general algorithm.
+    CHECK(wjn_format_f64(12.5, buf, sizeof buf) == 4 && same(buf, "12.5"));
+    CHECK(wjn_format_f64(-0.5, buf, sizeof buf) == 4 && same(buf, "-0.5"));
+    CHECK(wjn_format_f64(100.0, buf, sizeof buf) == 3 && same(buf, "100"));
+    CHECK(wjn_format_f64(1e10, buf, sizeof buf) == 5 && same(buf, "1e+10"));
+    CHECK(wjn_format_f64(12e9, buf, sizeof buf) == 7 && same(buf, "1.2e+10"));
+    CHECK(wjn_format_f64(0.000123, buf, sizeof buf) == 8 && same(buf, "0.000123"));
+    CHECK(wjn_format_f64(1.5e-7, buf, sizeof buf) == 7 && same(buf, "1.5e-07"));
+    CHECK(wjn_format_f64(123456789012345.0, buf, sizeof buf) == 15 && same(buf, "123456789012345"));
+    CHECK(wjn_format_f64(1e15, buf, sizeof buf) == 5 && same(buf, "1e+15"));
+    CHECK(wjn_format_f64(0.3, buf, sizeof buf) == 3 && same(buf, "0.3"));
+    CHECK(wjn_format_f64(0.1 + 0.2, buf, sizeof buf) == 19 && same(buf, "0.30000000000000004"));
+
     // Round trip: shortest output must parse back to the same bits.
     const double samples[] = {0.1, 1.0 / 3.0, 123456789.125, 2.2250738585072014e-308, 1.7976931348623157e308,
                               -7.5e-10};
@@ -593,6 +607,34 @@ static void fuzz_numbers(long iters) {
             int64_t n = wjn_format_f64(d, buf, sizeof buf);
             if (n <= 0 || !shortest_is_exact(buf, static_cast<int>(n), d)) {
                 if (++shortest_fail < 5) printf("shortest: %s\n", buf);
+            }
+        }
+
+        // 1b) Short decimals (m * 10^k with up to 17 digits, the case the
+        //     formatter has a fast path for) and their neighbouring doubles
+        //     must meet the same exact shortest-form check.
+        {
+            u64 mm = rng.next() % 100000000000000000ull;
+            for (int cut = static_cast<int>(rng.below(17)); cut > 0; --cut) mm /= 10;
+            if (mm == 0) mm = 1 + rng.below(9);
+            char rev[24], txt[48];
+            int rl = 0, tl = 0;
+            for (u64 w = mm; w; w /= 10) rev[rl++] = static_cast<char>('0' + w % 10);
+            while (rl) txt[tl++] = rev[--rl];
+            txt[tl++] = 'e';
+            tl += append_int(txt + tl, static_cast<int>(rng.below(60)) - 30);
+            txt[tl] = '\0';
+            double sd = 0;
+            if (wjn_parse_f64(txt, tl, &sd) == WJN_OK && sd > 0) {
+                const u64 sb = bits_of(sd);
+                const double near[3] = {sd, from_bits(sb + 1), from_bits(sb - 1)};
+                for (double nd : near) {
+                    if (!is_finite(nd) || nd <= 0) continue;
+                    int64_t n = wjn_format_f64(nd, buf, sizeof buf);
+                    if (n <= 0 || !shortest_is_exact(buf, static_cast<int>(n), nd)) {
+                        if (++shortest_fail < 5) printf("shortest (short decimal %s): %s\n", txt, buf);
+                    }
+                }
             }
         }
 
