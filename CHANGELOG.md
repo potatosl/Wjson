@@ -45,6 +45,13 @@ minor releases.
   100,000-key object with `-O2`); lookups are faster (1M lookups: 35 ms vs 72 ms).
   `tests/core_lookup_test.wave` compares every key and many pointers (including
   `~0`/`~1`, leading zeros and out-of-range indexes) with the Rust core.
+- New `install.sh`: `curl -fsSL .../install.sh | sh` downloads the sources
+  (`WJSON_REF` picks a tag, branch or commit), builds the libraries and writes
+  `~/.wjson/bin/wjson-wavec`, a wrapper that compiles a Wave program against
+  them (`-O2`, or `-O0` on macOS arm64). It checks for `wavec`, Rust and a C++
+  compiler and says how to install what is missing; it prints the SHA-256 of
+  the download and can verify it (`WJSON_SHA256`). CI installs the commit under
+  test with it on Linux and macOS and runs a program through the wrapper.
 - `.gitattributes` marks `*.wave` as Wave for GitHub's language statistics.
 
 ### Native

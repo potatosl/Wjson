@@ -30,6 +30,23 @@ Studio**.
 wjson is used from source: build its two static libraries once, then compile
 your own program against them.
 
+**Quick install (Linux, macOS).** One command downloads the sources, builds the
+libraries and writes a wrapper that compiles a Wave program against them (it
+needs `wavec`, Rust and a C++ compiler on your `PATH`, see step 1 below; it
+tells you if one is missing and never installs them for you):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/potatosl/wjson/main/install.sh | sh
+~/.wjson/bin/wjson-wavec hello.wave --run     # hello.wave: see step 3
+```
+
+The script is short, [read it](install.sh) before running it. It installs into
+`~/.wjson` (remove that folder to uninstall). `WJSON_REF=<tag or commit>` picks
+a version instead of `main`, `WJSON_DIR` the folder, and `WJSON_SHA256` makes
+it refuse a download whose SHA-256 differs (the actual value is always
+printed). The steps below do the same by hand; on Windows use them or
+`setup-windows.cmd`.
+
 **1. Install the tools** — the Wave compiler `wavec` (0.2.1-pre-beta, the
 newest release), Rust 1.99 or newer, and a C++20 compiler. Wave's official
 installer (see its [install page](https://wave-lang.dev/docs/en/getting-started/install)):

@@ -54,6 +54,25 @@ jobs:
           cargo check --manifest-path core/Cargo.toml --target x86_64-pc-windows-msvc
       - name: Build and test
         run: wavec --std-root="$WAVE_STD" run build.wave
+      # The curl installer: install this very commit and use the wrapper.
+      - name: Install script
+        run: |
+          git archive --format=tar.gz --prefix=wjson/ -o "$RUNNER_TEMP/wjson.tar.gz" HEAD
+          WJSON_TARBALL="$RUNNER_TEMP/wjson.tar.gz" WJSON_DIR="$RUNNER_TEMP/wjson-install" sh install.sh
+          cat > "$RUNNER_TEMP/hello.wave" <<'WAVE'
+          import("wjson")::{JsonDoc, Json, json_parse, json_ok, json_root, json_path_str, json_path_i64, json_free};
+
+          fun main() {
+              var doc: JsonDoc = json_parse("{\"server\": {\"host\": \"0.0.0.0\", \"ports\": [8080, 8443]}}");
+              if (!json_ok(doc)) { return; }
+              var cfg: Json = json_root(doc);
+              println("{}:{}", json_path_str(cfg, "server.host", "localhost"), json_path_i64(cfg, "server.ports[0]", 80));
+              json_free(&doc);
+          }
+          WAVE
+          cd "$RUNNER_TEMP"
+          "$RUNNER_TEMP/wjson-install/bin/wjson-wavec" hello.wave --run | tee hello.out
+          grep -qx "0.0.0.0:8080" hello.out
       - name: Sanitizers and valgrind
         run: |
           sudo apt-get update
@@ -119,6 +138,25 @@ jobs:
           PY
           fi
           exit $code
+      # The curl installer: install this very commit and use the wrapper.
+      - name: Install script
+        run: |
+          git archive --format=tar.gz --prefix=wjson/ -o "$RUNNER_TEMP/wjson.tar.gz" HEAD
+          WJSON_TARBALL="$RUNNER_TEMP/wjson.tar.gz" WJSON_DIR="$RUNNER_TEMP/wjson-install" sh install.sh
+          cat > "$RUNNER_TEMP/hello.wave" <<'WAVE'
+          import("wjson")::{JsonDoc, Json, json_parse, json_ok, json_root, json_path_str, json_path_i64, json_free};
+
+          fun main() {
+              var doc: JsonDoc = json_parse("{\"server\": {\"host\": \"0.0.0.0\", \"ports\": [8080, 8443]}}");
+              if (!json_ok(doc)) { return; }
+              var cfg: Json = json_root(doc);
+              println("{}:{}", json_path_str(cfg, "server.host", "localhost"), json_path_i64(cfg, "server.ports[0]", 80));
+              json_free(&doc);
+          }
+          WAVE
+          cd "$RUNNER_TEMP"
+          "$RUNNER_TEMP/wjson-install/bin/wjson-wavec" hello.wave --run | tee hello.out
+          grep -qx "0.0.0.0:8080" hello.out
 
   windows:
     runs-on: windows-2025

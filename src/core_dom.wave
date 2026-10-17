@@ -48,6 +48,9 @@ pub struct CoreDoc {
     starts: ptr<u32>;    // string/number: offset into bytes; array: into elems; object: into members
     lens: ptr<u32>;      // string/number: byte length (without the NUL); containers: child count
     parents: ptr<i32>;
+    // Spare capacity of a relocated container's child list (0 = none beyond
+    // `len`). Allocated on the first edit that needs it.
+    caps: ptr<u32>;
     node_count: i64;
     node_cap: i64;
 
@@ -96,7 +99,7 @@ pub struct CoreDoc {
 
 pub fun core_doc_empty() -> CoreDoc {
     return CoreDoc {
-        kinds: null, flags: null, starts: null, lens: null, parents: null,
+        kinds: null, flags: null, starts: null, lens: null, parents: null, caps: null,
         node_count: 0, node_cap: 0,
         elems: null, elem_count: 0, elem_cap: 0,
         mkey_start: null, mkey_len: null, mvalue: null, member_count: 0, member_cap: 0,
@@ -117,6 +120,7 @@ pub fun core_doc_release(d: ptr<CoreDoc>) {
     if (deref d.starts != null) { c_free(deref d.starts as ptr<u8>); }
     if (deref d.lens != null) { c_free(deref d.lens as ptr<u8>); }
     if (deref d.parents != null) { c_free(deref d.parents as ptr<u8>); }
+    if (deref d.caps != null) { c_free(deref d.caps as ptr<u8>); }
     if (deref d.elems != null) { c_free(deref d.elems as ptr<u8>); }
     var mc: i64 = deref d.member_cap;
     if (deref d.mkey_start != null) { c_free(deref d.mkey_start as ptr<u8>); }
@@ -152,6 +156,7 @@ pub fun core_doc_release(d: ptr<CoreDoc>) {
     deref d.starts = null;
     deref d.lens = null;
     deref d.parents = null;
+    deref d.caps = null;
     deref d.node_count = 0;
     deref d.node_cap = 0;
     deref d.elems = null;
@@ -238,6 +243,11 @@ pub fun core_node_push(d: ptr<CoreDoc>, kind: u8, flag: u8, start: u32, len: u32
         var p: ptr<u8> = _regrow(deref d.parents as ptr<u8>, cap * 4, nc * 4);
         if (p == null) { return 0 - 1; }
         deref d.parents = p as ptr<i32>;
+        if (deref d.caps != null) {
+            var cp: ptr<u8> = _regrow(deref d.caps as ptr<u8>, cap * 4, nc * 4);
+            if (cp == null) { return 0 - 1; }
+            deref d.caps = cp as ptr<u32>;
+        }
         deref d.node_cap = nc;
     }
     var kinds: ptr<u8> = deref d.kinds;
@@ -250,8 +260,117 @@ pub fun core_node_push(d: ptr<CoreDoc>, kind: u8, flag: u8, start: u32, len: u32
     deref starts[n] = start;
     deref lens[n] = len;
     deref parents[n] = CORE_PARENT_NONE;
+    if (deref d.caps != null) {
+        var caps: ptr<u32> = deref d.caps;
+        deref caps[n] = 0;
+    }
     deref d.node_count = n + 1;
     return n;
+}
+
+// Stores a copy of `n` bytes (plus a NUL) in its own allocation, so nothing
+// handed out earlier ever moves. Returns the `start` value for a node or
+// member (with CORE_EXTRA_BIT set), or -1 when memory runs out.
+pub fun core_extra_push(d: ptr<CoreDoc>, src: ptr<u8>, n: i64) -> i64 {
+    var cnt: i64 = deref d.extra_count;
+    if (cnt >= deref d.extra_cap) {
+        var nc: i64 = deref d.extra_cap * 2;
+        if (nc < 16) { nc = 16; }
+        var g: ptr<u8> = c_realloc(deref d.extra as ptr<u8>, nc * 8);
+        if (g == null) { return 0 - 1; }
+        deref d.extra = g as ptr<ptr<u8>>;
+        deref d.extra_cap = nc;
+    }
+    var text: ptr<u8> = c_malloc(n + 1);
+    if (text == null) { return 0 - 1; }
+    var i: i64 = 0;
+    while (i < n) {
+        deref text[i] = src[i];
+        i += 1;
+    }
+    deref text[n] = 0;
+    var ex: ptr<ptr<u8>> = deref d.extra;
+    deref ex[cnt] = text;
+    deref d.extra_count = cnt + 1;
+    return cnt | (CORE_EXTRA_BIT as i64);
+}
+
+// Ensures room for `count` more element slots and marks them used (filled
+// with 0xFFFFFFFF); returns the start offset of the new slots or -1.
+pub fun core_elems_extend(d: ptr<CoreDoc>, count: i64) -> i64 {
+    var n: i64 = deref d.elem_count;
+    var cap: i64 = deref d.elem_cap;
+    if (n + count > cap) {
+        var nc: i64 = _next_cap(cap, 64);
+        while (nc < n + count) {
+            nc = nc * 2;
+        }
+        var e: ptr<u8> = _regrow(deref d.elems as ptr<u8>, cap * 4, nc * 4);
+        if (e == null) { return 0 - 1; }
+        deref d.elems = e as ptr<u32>;
+        deref d.elem_cap = nc;
+    }
+    var elems: ptr<u32> = deref d.elems;
+    var i: i64 = 0;
+    while (i < count) {
+        deref elems[n + i] = 4294967295;
+        i += 1;
+    }
+    deref d.elem_count = n + count;
+    return n;
+}
+
+// Same for member slots (key_start 0, key_len 0, value 0xFFFFFFFF).
+pub fun core_members_extend(d: ptr<CoreDoc>, count: i64) -> i64 {
+    var n: i64 = deref d.member_count;
+    var cap: i64 = deref d.member_cap;
+    if (n + count > cap) {
+        var nc: i64 = _next_cap(cap, 64);
+        while (nc < n + count) {
+            nc = nc * 2;
+        }
+        var a: ptr<u8> = _regrow(deref d.mkey_start as ptr<u8>, cap * 4, nc * 4);
+        if (a == null) { return 0 - 1; }
+        deref d.mkey_start = a as ptr<u32>;
+        var b: ptr<u8> = _regrow(deref d.mkey_len as ptr<u8>, cap * 4, nc * 4);
+        if (b == null) { return 0 - 1; }
+        deref d.mkey_len = b as ptr<u32>;
+        var c: ptr<u8> = _regrow(deref d.mvalue as ptr<u8>, cap * 4, nc * 4);
+        if (c == null) { return 0 - 1; }
+        deref d.mvalue = c as ptr<u32>;
+        deref d.member_cap = nc;
+    }
+    var ks: ptr<u32> = deref d.mkey_start;
+    var kl: ptr<u32> = deref d.mkey_len;
+    var mv: ptr<u32> = deref d.mvalue;
+    var i: i64 = 0;
+    while (i < count) {
+        deref ks[n + i] = 0;
+        deref kl[n + i] = 0;
+        deref mv[n + i] = 4294967295;
+        i += 1;
+    }
+    deref d.member_count = n + count;
+    return n;
+}
+
+// Spare capacity bookkeeping: allocates the caps array on first use.
+pub fun core_caps_ensure(d: ptr<CoreDoc>) -> bool {
+    if (deref d.caps != null) {
+        return true;
+    }
+    var nc: i64 = deref d.node_cap;
+    if (nc < 64) { nc = 64; }
+    var g: ptr<u8> = c_malloc(nc * 4);
+    if (g == null) { return false; }
+    var caps: ptr<u32> = g as ptr<u32>;
+    var i: i64 = 0;
+    while (i < nc) {
+        deref caps[i] = 0;
+        i += 1;
+    }
+    deref d.caps = caps;
+    return true;
 }
 
 // Appends `count` child ids (from `items`) to the element table; returns the
@@ -449,8 +568,8 @@ pub fun core_num_is_int(d: ptr<CoreDoc>, node: i32) -> i32 {
 }
 
 pub fun core_parent(d: ptr<CoreDoc>, node: i32) -> i32 {
-    if (!_valid(d, node as i64)) {
-        return CORE_NO_NODE;
+    if (deref d.err_code != 0 || !_valid(d, node as i64)) {
+        return 0 - 3;
     }
     var parents: ptr<i32> = deref d.parents;
     return parents[node];
@@ -614,6 +733,70 @@ pub fun core_index_build(d: ptr<CoreDoc>, id: i64) -> bool {
             }
         }
         pos += 1;
+    }
+    return true;
+}
+
+// Forgets the key index of object `id` (its table space stays in the pool
+// until the document is freed).
+pub fun core_index_drop(d: ptr<CoreDoc>, id: i64) {
+    var slot: i64 = _index_slot(d, id);
+    if (slot < 0) {
+        return;
+    }
+    var nodes: ptr<u32> = deref d.ix_node;
+    var offs: ptr<u32> = deref d.ix_off;
+    var sizes: ptr<u32> = deref d.ix_size;
+    var cnt: i64 = deref d.ix_count;
+    var i: i64 = slot;
+    while (i + 1 < cnt) {
+        deref nodes[i] = nodes[i + 1];
+        deref offs[i] = offs[i + 1];
+        deref sizes[i] = sizes[i + 1];
+        i += 1;
+    }
+    deref d.ix_count = cnt - 1;
+}
+
+// Adds the member at position `pos` of object `id` to its index; when the
+// table would get crowded (or there is none yet) the index is rebuilt.
+pub fun core_index_add(d: ptr<CoreDoc>, id: i64, pos: i64) -> bool {
+    var starts: ptr<u32> = deref d.starts;
+    var lens: ptr<u32> = deref d.lens;
+    var n: i64 = lens[id] as i64;
+    if (n < CORE_INDEX_THRESHOLD) {
+        return true;
+    }
+    var slot: i64 = _index_slot(d, id);
+    if (slot < 0) {
+        return core_index_build(d, id);
+    }
+    var sizes: ptr<u32> = deref d.ix_size;
+    var size: i64 = sizes[slot] as i64;
+    if (n * 2 > size) {
+        return core_index_build(d, id);
+    }
+    var offs: ptr<u32> = deref d.ix_off;
+    var off: i64 = offs[slot] as i64;
+    var pool: ptr<u32> = deref d.pool;
+    var first: i64 = starts[id] as i64;
+    var ks: ptr<u32> = deref d.mkey_start;
+    var kl: ptr<u32> = deref d.mkey_len;
+    var key: ptr<u8> = core_text(d, ks[first + pos]);
+    var klen: i64 = kl[first + pos] as i64;
+    var mask: i64 = size - 1;
+    var h: i64 = (_hash_bytes(key, klen) as i64) & mask;
+    while (true) {
+        var entry: u32 = pool[off + h];
+        if (entry == 0) {
+            deref pool[off + h] = (pos + 1) as u32;
+            return true;
+        }
+        if (_key_eq(d, first + ((entry as i64) - 1), key, klen)) {
+            deref pool[off + h] = (pos + 1) as u32;  // the newest duplicate wins
+            return true;
+        }
+        h = (h + 1) & mask;
     }
     return true;
 }
