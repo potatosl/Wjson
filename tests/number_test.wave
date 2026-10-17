@@ -1,0 +1,358 @@
+// SPDX-License-Identifier: MPL-2.0
+//
+// Differential test for the pure-Wave number conversion (src/number.wave)
+// against the C++ implementation (native/src/number.cpp), which is itself
+// checked against an exact oracle by native/tests/native_test.cpp.
+// Run from the repository root:  wavec run build.wave
+
+import("std::math::float")::{float_to_bits_f64, float_from_bits_f64};
+import("wjson::ffi")::{ffi_parse_f64, ffi_parse_i64, ffi_format_f64, ffi_format_f64_fixed, ffi_format_i64};
+import("wjson::number")::{num_parse_f64, num_parse_i64, num_format_f64, num_format_f64_fixed, num_format_i64};
+
+extern(c, "getenv") fun c_getenv(name: ptr<u8>) -> ptr<u8>;
+
+static CHECKS: i32 = 0;
+static FAILURES: i32 = 0;
+static RNG: u64 = 88172645463325252;
+
+fun check(cond: bool, label: str) {
+    CHECKS += 1;
+    if (!cond) {
+        FAILURES += 1;
+        if (FAILURES <= 20) {
+            println("FAIL: {}", label);
+        }
+    }
+}
+
+fun next() -> u64 {
+    var x: u64 = RNG;
+    x = x ^ (x << 13);
+    x = x ^ (x >> 7);
+    x = x ^ (x << 17);
+    RNG = x;
+    return x * 2685821657736338717;
+}
+
+fun below(n: u64) -> u64 {
+    return (next() >> 11) % n;
+}
+
+fun same_text(a: ptr<u8>, an: i64, b: ptr<u8>, bn: i64) -> bool {
+    if (an != bn) {
+        return false;
+    }
+    var i: i64 = 0;
+    while (i < an) {
+        if (a[i] != b[i]) {
+            return false;
+        }
+        i += 1;
+    }
+    return true;
+}
+
+fun len_of(s: str) -> i64 {
+    var p: ptr<u8> = s as ptr<u8>;
+    var n: i64 = 0;
+    while (p[n] != 0) {
+        n += 1;
+    }
+    return n;
+}
+
+// Both parsers must agree on the status and, when they produce a value, on
+// every bit of it.
+fun same_parse(p: ptr<u8>, n: i64) -> bool {
+    var a: f64 = 0.0;
+    var b: f64 = 0.0;
+    var ra: i32 = num_parse_f64(p, n, &a);
+    var rb: i32 = ffi_parse_f64(p, n, &b);
+    if (ra != rb) {
+        return false;
+    }
+    if (ra == -1) {
+        return true;
+    }
+    return float_to_bits_f64(a) == float_to_bits_f64(b);
+}
+
+fun parse_str(s: str) {
+    var p: ptr<u8> = s as ptr<u8>;
+    check(same_parse(p, len_of(s)), s);
+}
+
+fun format_agrees(v: f64) -> bool {
+    var x: array<u8, 64>;
+    var y: array<u8, 64>;
+    var nx: i64 = num_format_f64(v, &x[0], 64);
+    var ny: i64 = ffi_format_f64(v, &y[0], 64);
+    return same_text(&x[0], nx, &y[0], ny);
+}
+
+fun fixed_agrees(v: f64, prec: i32) -> bool {
+    var x: array<u8, 420>;
+    var y: array<u8, 420>;
+    var nx: i64 = num_format_f64_fixed(v, prec, &x[0], 420);
+    var ny: i64 = ffi_format_f64_fixed(v, prec, &y[0], 420);
+    return same_text(&x[0], nx, &y[0], ny);
+}
+
+fun test_fixed_cases() {
+    parse_str("0");
+    parse_str("-0");
+    parse_str("0.0");
+    parse_str("1");
+    parse_str("-1");
+    parse_str("0.1");
+    parse_str("123456789012345678901234567890");
+    parse_str("1e22");
+    parse_str("1e23");
+    parse_str("9007199254740993");
+    parse_str("9007199254740992.5");
+    parse_str("1.7976931348623157e308");
+    parse_str("1.7976931348623159e308");
+    parse_str("1e309");
+    parse_str("-1e400");
+    parse_str("5e-324");
+    parse_str("2.4703282292062327e-324");
+    parse_str("2.4703282292062328e-324");
+    parse_str("1e-400");
+    parse_str("2.2250738585072011e-308");
+    parse_str("2.2250738585072012e-308");
+    parse_str("4.9406564584124654e-324");
+    parse_str("1E5");
+    parse_str("1e+5");
+    parse_str("1e-5");
+    parse_str("0e100");
+    parse_str("0.000000000000000000000000000000000000001");
+    // Invalid lexemes.
+    parse_str("");
+    parse_str("-");
+    parse_str("01");
+    parse_str("1.");
+    parse_str(".5");
+    parse_str("1e");
+    parse_str("1e+");
+    parse_str("+1");
+    parse_str("0x10");
+    parse_str("1 ");
+    parse_str("NaN");
+    // 0.5 + 2^-53 style halfway cases.
+    parse_str("1.00000000000000011102230246251565404236316680908203125");
+    parse_str("1.00000000000000011102230246251565404236316680908203126");
+    parse_str("1.00000000000000011102230246251565404236316680908203124");
+
+    check(format_agrees(0.0), "fmt 0");
+    check(format_agrees(0.0 - 0.0), "fmt -0");
+    check(format_agrees(1.0), "fmt 1");
+    check(format_agrees(0.1), "fmt 0.1");
+    check(format_agrees(1e22), "fmt 1e22");
+    check(format_agrees(1e21), "fmt 1e21");
+    check(format_agrees(123456789012345680000.0), "fmt big int");
+    check(format_agrees(9007199254740992.0), "fmt 2^53");
+    check(format_agrees(1.7976931348623157e308), "fmt max");
+    check(format_agrees(5e-324), "fmt min subnormal");
+    check(format_agrees(2.2250738585072014e-308), "fmt min normal");
+    check(format_agrees(1e-7), "fmt 1e-7");
+    check(format_agrees(123.456), "fmt 123.456");
+    check(format_agrees(float_from_bits_f64(9218868437227405312)), "fmt inf rejected");
+    check(format_agrees(float_from_bits_f64(9221120237041090560)), "fmt nan rejected");
+
+    var p: i32 = 0;
+    while (p <= 17) {
+        check(fixed_agrees(2.5, p), "fixed 2.5");
+        check(fixed_agrees(0.125, p), "fixed .125");
+        check(fixed_agrees(82.345, p), "fixed 82.345");
+        check(fixed_agrees(1e22, p), "fixed 1e22");
+        check(fixed_agrees(1.7976931348623157e308, p), "fixed max");
+        check(fixed_agrees(5e-324, p), "fixed tiny");
+        check(fixed_agrees(0.0 - 0.0, p), "fixed -0");
+        check(fixed_agrees(0.0 - 99.995, p), "fixed neg");
+        p += 1;
+    }
+    check(num_format_f64_fixed(1.0, 18, null, 0) == -1, "fixed precision 18 invalid");
+    check(num_format_f64_fixed(1.0, 0 - 1, null, 0) == -1, "fixed precision -1 invalid");
+}
+
+fun test_integers() {
+    var a: array<u8, 32>;
+    var b: array<u8, 32>;
+    var vals: array<i64, 10>;
+    vals[0] = 0;
+    vals[1] = 1;
+    vals[2] = 0 - 1;
+    vals[3] = 9223372036854775807;
+    vals[4] = 0 - 9223372036854775807 - 1;
+    vals[5] = 1000000000;
+    vals[6] = 4294967296;
+    vals[7] = 0 - 4294967296;
+    vals[8] = 123456789012345678;
+    vals[9] = 10;
+    var i: i32 = 0;
+    while (i < 10) {
+        var na: i64 = num_format_i64(vals[i], &a[0], 32);
+        var nb: i64 = ffi_format_i64(vals[i], &b[0], 32);
+        check(same_text(&a[0], na, &b[0], nb), "i64 format");
+        var ra: i64 = 7;
+        var rb: i64 = 9;
+        var sa: i32 = num_parse_i64(&a[0], na, &ra);
+        var sb: i32 = ffi_parse_i64(&a[0], na, &rb);
+        check(sa == sb && ra == rb && ra == vals[i], "i64 parse round trip");
+        i += 1;
+    }
+    var out_a: i64 = 0;
+    var out_b: i64 = 0;
+    parse_i64_str("9223372036854775808", &out_a, &out_b);
+    parse_i64_str("-9223372036854775808", &out_a, &out_b);
+    parse_i64_str("-9223372036854775809", &out_a, &out_b);
+    parse_i64_str("99999999999999999999", &out_a, &out_b);
+    parse_i64_str("1.5", &out_a, &out_b);
+    parse_i64_str("1e3", &out_a, &out_b);
+    parse_i64_str("-", &out_a, &out_b);
+    parse_i64_str("007", &out_a, &out_b);
+    // Size query contract: cap == 0 reports the length, writes nothing.
+    check(num_format_i64(12345, null, 0) == 5, "i64 size query");
+    check(num_format_f64(1.5, null, 0) == 3, "f64 size query");
+    var tight: array<u8, 4>;
+    check(num_format_i64(12345, &tight[0], 5) == 5, "i64 tight cap");
+}
+
+fun parse_i64_str(s: str, a: ptr<i64>, b: ptr<i64>) {
+    var p: ptr<u8> = s as ptr<u8>;
+    deref a = 0;
+    deref b = 0;
+    var ra: i32 = num_parse_i64(p, len_of(s), a);
+    var rb: i32 = ffi_parse_i64(p, len_of(s), b);
+    check(ra == rb && (ra != 0 || deref a == deref b), s);
+}
+
+// Random decimal text: sign, integer part, fraction, exponent.
+fun random_lexeme(buf: ptr<u8>) -> i64 {
+    var n: i64 = 0;
+    if (below(4) == 0) {
+        deref buf[n] = 45;
+        n += 1;
+    }
+    var int_digits: u64 = 1 + below(25);
+    if (below(10) == 0) {
+        int_digits = 1 + below(400);
+    }
+    if (int_digits == 1 || below(20) == 0) {
+        deref buf[n] = (48 + below(10)) as u8;
+        n += 1;
+    } else {
+        deref buf[n] = (49 + below(9)) as u8;
+        n += 1;
+        var i: u64 = 1;
+        while (i < int_digits && n < 780) {
+            deref buf[n] = (48 + below(10)) as u8;
+            n += 1;
+            i += 1;
+        }
+    }
+    if (below(2) == 0) {
+        deref buf[n] = 46;
+        n += 1;
+        var fd: u64 = 1 + below(30);
+        if (below(10) == 0) {
+            fd = 1 + below(400);
+        }
+        var j: u64 = 0;
+        while (j < fd && n < 1500) {
+            deref buf[n] = (48 + below(10)) as u8;
+            n += 1;
+            j += 1;
+        }
+    }
+    if (below(2) == 0) {
+        deref buf[n] = 101;
+        n += 1;
+        var sgn: u64 = below(3);
+        if (sgn == 1) {
+            deref buf[n] = 43;
+            n += 1;
+        } else if (sgn == 2) {
+            deref buf[n] = 45;
+            n += 1;
+        }
+        var ed: u64 = 1 + below(3);
+        var k: u64 = 0;
+        while (k < ed) {
+            deref buf[n] = (48 + below(10)) as u8;
+            n += 1;
+            k += 1;
+        }
+    }
+    deref buf[n] = 0;
+    return n;
+}
+
+fun test_random(iters: i32) {
+    var buf: array<u8, 2000>;
+    var i: i32 = 0;
+    while (i < iters) {
+        // Random decimal text parsed by both implementations.
+        var n: i64 = random_lexeme(&buf[0]);
+        if (!same_parse(&buf[0], n)) {
+            check(false, "random lexeme parse");
+        }
+        CHECKS += 1;
+
+        // Random bit patterns: formatting, fixed, and the parse of what we print.
+        var bits: u64 = next();
+        var mode: u64 = below(4);
+        if (mode == 1) {
+            bits = bits & 4503599627370495;                  // subnormals
+        } else if (mode == 2) {
+            bits = (bits & 4503599627370495) | ((1 + below(2046)) << 52);
+        }
+        var v: f64 = float_from_bits_f64(bits);
+        if (((bits >> 52) & 2047) != 2047) {
+            if (!format_agrees(v)) {
+                check(false, "random format");
+            }
+            CHECKS += 1;
+            var prec: i32 = below(18) as i32;
+            if (!fixed_agrees(v, prec)) {
+                check(false, "random fixed");
+            }
+            CHECKS += 1;
+            var txt: array<u8, 64>;
+            var tn: i64 = num_format_f64(v, &txt[0], 64);
+            var back: f64 = 0.0;
+            var rs: i32 = num_parse_f64(&txt[0], tn, &back);
+            if (rs != 0 || float_to_bits_f64(back) != bits) {
+                // -0 and subnormal edge ranges still must round-trip exactly.
+                check(false, "random round trip");
+            }
+            CHECKS += 1;
+        }
+        i += 1;
+    }
+}
+
+fun main() -> i32 {
+    var iters: i32 = 5000;
+    var p: ptr<u8> = c_getenv("WJSON_FUZZ_ITERS" as ptr<u8>);
+    if (p != null) {
+        var x: i32 = 0;
+        var k: i64 = 0;
+        while (p[k] >= 48 && p[k] <= 57) {
+            x = x * 10 + ((p[k] - 48) as i32);
+            k += 1;
+        }
+        if (x > 0) {
+            iters = x;
+        }
+    }
+    test_fixed_cases();
+    test_integers();
+    test_random(iters);
+    println("number_test: {}/{} checks passed", CHECKS - FAILURES, CHECKS);
+    if (FAILURES != 0) {
+        println("number_test: {} FAILED", FAILURES);
+        return 1;
+    }
+    return 0;
+}

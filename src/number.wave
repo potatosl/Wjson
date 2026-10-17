@@ -1,0 +1,1209 @@
+// SPDX-License-Identifier: MPL-2.0
+//
+// Number conversion in pure Wave (a port of native/src/number.cpp).
+//
+//   parse   exact: a fast path for short inputs (Clinger), otherwise big
+//           integer arithmetic that yields the correctly rounded double
+//           (round to nearest, ties to even) for any number of digits.
+//   format  shortest round-trip digits (Steele & White / Burger & Dybvig
+//           free-format algorithm on big integers), laid res like C++17
+//           std::to_chars: fixed or scientific, whichever is shorter.
+//   fixed   exact decimal expansion rounded half to even, like printf("%.*f").
+//
+// Writers return the number of bytes the full result needs. When that is less
+// than `cap` the output is also NUL-terminated; call once with cap == 0 to
+// size a buffer. Negative returns are JSON_NUM_* codes.
+
+import("std::math::float")::{float_to_bits_f64, float_from_bits_f64};
+import("./consts")::{JSON_NUM_OK, JSON_NUM_INVALID, JSON_NUM_RANGE, JSON_NUM_NONFINITE};
+
+const MANT_MASK: u64 = 4503599627370495;          // 2^52 - 1
+const SIGN_BIT: u64 = 9223372036854775808;        // 2^63
+const EXP_INF: u64 = 9218868437227405312;         // 0x7FF << 52
+const ONE: u64 = 1;
+const LOW32: u64 = 4294967295;
+
+fun _clz64(v: u64) -> i32 {
+    if (v == 0) {
+        return 64;
+    }
+    var n: i32 = 0;
+    var x: u64 = v;
+    while ((x & SIGN_BIT) == 0) {
+        x = x << 1;
+        n += 1;
+    }
+    return n;
+}
+
+fun _clz32(v: u32) -> i32 {
+    var n: i32 = 0;
+    var x: u32 = v;
+    if (x == 0) {
+        return 32;
+    }
+    while ((x & (0x80000000 as u32)) == 0) {
+        x = x << 1;
+        n += 1;
+    }
+    return n;
+}
+
+fun _pow10_u32(k: i32) -> u32 {
+    var v: u32 = 1;
+    var i: i32 = 0;
+    while (i < k) {
+        v = v * 10;
+        i += 1;
+    }
+    return v;
+}
+
+// 10^k for 0 <= k <= 22: every step is an exact double.
+fun _pow10_f64(k: i32) -> f64 {
+    var v: f64 = 1.0;
+    var ten: f64 = 10.0;
+    var i: i32 = 0;
+    while (i < k) {
+        v = v * ten;
+        i += 1;
+    }
+    return v;
+}
+
+// ---------------------------------------------------------------------------
+// Big unsigned integer with fixed capacity (little-endian 32-bit limbs).
+// The largest value any routine builds is under 4,000 bits (a 781-digit
+// significand shifted against 10^1100); 6,400 bits leaves a wide margin.
+// ---------------------------------------------------------------------------
+struct Big {
+    d: array<u32, 200>;
+    n: i32;
+}
+
+fun _big_set(b: ptr<Big>, v: u64) {
+    var x: u64 = v;
+    deref b.n = 0;
+    while (x != 0) {
+        var n: i32 = deref b.n;
+        deref b.d[n] = (x & LOW32) as u32;
+        deref b.n = n + 1;
+        x = x >> 32;
+    }
+}
+
+fun _big_is_zero(b: ptr<Big>) -> bool {
+    return deref b.n == 0;
+}
+
+fun _big_bits(b: ptr<Big>) -> i32 {
+    var n: i32 = deref b.n;
+    if (n == 0) {
+        return 0;
+    }
+    return (n - 1) * 32 + (32 - _clz32(deref b.d[n - 1]));
+}
+
+fun _big_trim(b: ptr<Big>) {
+    while (deref b.n > 0 && deref b.d[deref b.n - 1] == 0) {
+        deref b.n = deref b.n - 1;
+    }
+}
+
+fun _big_mul_small(b: ptr<Big>, m: u32) {
+    var carry: u64 = 0;
+    var n: i32 = deref b.n;
+    var i: i32 = 0;
+    while (i < n) {
+        var t: u64 = (deref b.d[i] as u64) * (m as u64) + carry;
+        deref b.d[i] = (t & LOW32) as u32;
+        carry = t >> 32;
+        i += 1;
+    }
+    if (carry != 0) {
+        deref b.d[n] = carry as u32;
+        deref b.n = n + 1;
+    }
+}
+
+fun _big_add_small(b: ptr<Big>, a: u32) {
+    var carry: u64 = a as u64;
+    var n: i32 = deref b.n;
+    var i: i32 = 0;
+    while (i < n && carry != 0) {
+        var t: u64 = (deref b.d[i] as u64) + carry;
+        deref b.d[i] = (t & LOW32) as u32;
+        carry = t >> 32;
+        i += 1;
+    }
+    if (carry != 0) {
+        deref b.d[n] = carry as u32;
+        deref b.n = n + 1;
+    }
+}
+
+fun _big_mul_pow10(b: ptr<Big>, k: i32) {
+    var left: i32 = k;
+    while (left >= 9) {
+        _big_mul_small(b, 1000000000 as u32);
+        left -= 9;
+    }
+    if (left > 0) {
+        _big_mul_small(b, _pow10_u32(left));
+    }
+}
+
+fun _big_shl(b: ptr<Big>, s: i32) {
+    var n: i32 = deref b.n;
+    if (n == 0 || s <= 0) {
+        return;
+    }
+    var words: i32 = s / 32;
+    var bits: i32 = s % 32;
+    if (bits != 0) {
+        var carry: u32 = 0;
+        var i: i32 = 0;
+        while (i < n) {
+            var v: u32 = deref b.d[i];
+            deref b.d[i] = (v << (bits as u32)) | carry;
+            carry = v >> ((32 - bits) as u32);
+            i += 1;
+        }
+        if (carry != 0) {
+            deref b.d[n] = carry;
+            n += 1;
+            deref b.n = n;
+        }
+    }
+    if (words != 0) {
+        var j: i32 = n - 1;
+        while (j >= 0) {
+            deref b.d[j + words] = deref b.d[j];
+            j -= 1;
+        }
+        var z: i32 = 0;
+        while (z < words) {
+            deref b.d[z] = 0;
+            z += 1;
+        }
+        deref b.n = n + words;
+    }
+}
+
+fun _big_shr1(b: ptr<Big>) {
+    var n: i32 = deref b.n;
+    var i: i32 = 0;
+    while (i < n) {
+        var hi: u32 = 0;
+        if (i + 1 < n) {
+            hi = deref b.d[i + 1] << 31;
+        }
+        deref b.d[i] = (deref b.d[i] >> 1) | hi;
+        i += 1;
+    }
+    _big_trim(b);
+}
+
+fun _big_shr(b: ptr<Big>, s: i32) {
+    var n: i32 = deref b.n;
+    if (s <= 0 || n == 0) {
+        return;
+    }
+    var words: i32 = s / 32;
+    var bits: i32 = s % 32;
+    if (words >= n) {
+        deref b.n = 0;
+        return;
+    }
+    var i: i32 = 0;
+    while (i + words < n) {
+        deref b.d[i] = deref b.d[i + words];
+        i += 1;
+    }
+    n -= words;
+    deref b.n = n;
+    if (bits != 0) {
+        var k: i32 = 0;
+        while (k < n) {
+            var hi: u32 = 0;
+            if (k + 1 < n) {
+                hi = deref b.d[k + 1] << ((32 - bits) as u32);
+            }
+            deref b.d[k] = (deref b.d[k] >> (bits as u32)) | hi;
+            k += 1;
+        }
+    }
+    _big_trim(b);
+}
+
+// Value of bit `i`.
+fun _big_bit(b: ptr<Big>, i: i32) -> bool {
+    var w: i32 = i / 32;
+    if (w >= deref b.n) {
+        return false;
+    }
+    return ((deref b.d[w] >> ((i % 32) as u32)) & 1) != 0;
+}
+
+// True when any bit below `i` is set.
+fun _big_any_below(b: ptr<Big>, i: i32) -> bool {
+    var w: i32 = i / 32;
+    var n: i32 = deref b.n;
+    var k: i32 = 0;
+    while (k < w && k < n) {
+        if (deref b.d[k] != 0) {
+            return true;
+        }
+        k += 1;
+    }
+    if (w < n && (i % 32) != 0) {
+        var mask: u32 = (1 as u32 << ((i % 32) as u32)) - 1;
+        return (deref b.d[w] & mask) != 0;
+    }
+    return false;
+}
+
+// Bits [from, from + 64) as an integer (bits past the top read as 0).
+fun _big_limb(b: ptr<Big>, i: i32) -> u64 {
+    if (i < deref b.n) {
+        return deref b.d[i] as u64;
+    }
+    return 0;
+}
+
+fun _big_extract64(b: ptr<Big>, from: i32) -> u64 {
+    var w: i32 = from / 32;
+    var sh: u64 = (from % 32) as u64;
+    var v: u64 = _big_limb(b, w) | (_big_limb(b, w + 1) << 32);
+    if (sh == 0) {
+        return v;
+    }
+    return (v >> sh) | (_big_limb(b, w + 2) << (64 - sh));
+}
+
+// Value of a Big known to be below 2^64.
+fun _big_to_u64(b: ptr<Big>) -> u64 {
+    var v: u64 = 0;
+    var n: i32 = deref b.n;
+    if (n > 1) {
+        v = (deref b.d[1] as u64) << 32;
+    }
+    if (n > 0) {
+        v = v | (deref b.d[0] as u64);
+    }
+    return v;
+}
+
+fun _big_cmp(a: ptr<Big>, b: ptr<Big>) -> i32 {
+    var an: i32 = deref a.n;
+    var bn: i32 = deref b.n;
+    if (an != bn) {
+        if (an < bn) {
+            return -1;
+        }
+        return 1;
+    }
+    var i: i32 = an - 1;
+    while (i >= 0) {
+        var x: u32 = deref a.d[i];
+        var y: u32 = deref b.d[i];
+        if (x != y) {
+            if (x < y) {
+                return -1;
+            }
+            return 1;
+        }
+        i -= 1;
+    }
+    return 0;
+}
+
+// a -= b, requires a >= b.
+fun _big_sub(a: ptr<Big>, b: ptr<Big>) {
+    var borrow: i64 = 0;
+    var an: i32 = deref a.n;
+    var bn: i32 = deref b.n;
+    var i: i32 = 0;
+    while (i < an) {
+        var sub: i64 = 0;
+        if (i < bn) {
+            sub = deref b.d[i] as i64;
+        }
+        var t: i64 = (deref a.d[i] as i64) - sub - borrow;
+        borrow = 0;
+        if (t < 0) {
+            borrow = 1;
+        }
+        deref a.d[i] = (t & (LOW32 as i64)) as u32;
+        i += 1;
+    }
+    _big_trim(a);
+}
+
+// Compares a + b with c.
+fun _big_cmp_sum(a: ptr<Big>, b: ptr<Big>, c: ptr<Big>) -> i32 {
+    var x: ptr<Big> = a;
+    var y: ptr<Big> = b;
+    if (deref a.n < deref b.n) {
+        x = b;
+        y = a;
+    }
+    var s: Big;
+    var carry: u64 = 0;
+    var xn: i32 = deref x.n;
+    var yn: i32 = deref y.n;
+    var i: i32 = 0;
+    while (i < xn) {
+        var add: u64 = 0;
+        if (i < yn) {
+            add = deref y.d[i] as u64;
+        }
+        var t: u64 = (deref x.d[i] as u64) + add + carry;
+        s.d[i] = (t & LOW32) as u32;
+        carry = t >> 32;
+        i += 1;
+    }
+    s.n = xn;
+    if (carry != 0) {
+        s.d[xn] = carry as u32;
+        s.n = xn + 1;
+    }
+    return _big_cmp(&s, c);
+}
+
+// ---------------------------------------------------------------------------
+// Grammar and small helpers
+// ---------------------------------------------------------------------------
+
+fun _is_digit(c: u8) -> bool {
+    return c >= 48 && c <= 57;
+}
+
+// RFC 8259 number grammar over [0, len); returns 0 for invalid, 1 for a plain
+// integer, 2 for a number with a fraction or exponent.
+fun _json_number_kind(s: ptr<u8>, len: i64) -> i32 {
+    var p: i64 = 0;
+    var kind: i32 = 1;
+    if (p < len && s[p] == 45) {
+        p += 1;
+    }
+    if (p == len) {
+        return 0;
+    }
+    if (s[p] == 48) {
+        p += 1;
+    } else if (s[p] >= 49 && s[p] <= 57) {
+        while (p < len && _is_digit(s[p])) {
+            p += 1;
+        }
+    } else {
+        return 0;
+    }
+    if (p < len && s[p] == 46) {
+        kind = 2;
+        p += 1;
+        var d: i64 = p;
+        while (p < len && _is_digit(s[p])) {
+            p += 1;
+        }
+        if (p == d) {
+            return 0;
+        }
+    }
+    if (p < len && (s[p] == 101 || s[p] == 69)) {
+        kind = 2;
+        p += 1;
+        if (p < len && (s[p] == 43 || s[p] == 45)) {
+            p += 1;
+        }
+        var d2: i64 = p;
+        while (p < len && _is_digit(s[p])) {
+            p += 1;
+        }
+        if (p == d2) {
+            return 0;
+        }
+    }
+    if (p != len) {
+        return 0;
+    }
+    return kind;
+}
+
+// Copies tmp[0..len) into dst honoring the "needed length" contract.
+fun _emit(tmp: ptr<u8>, len: i64, dst: ptr<u8>, cap: i64) -> i64 {
+    if (dst != null && cap > len) {
+        var i: i64 = 0;
+        while (i < len) {
+            deref dst[i] = tmp[i];
+            i += 1;
+        }
+        deref dst[len] = 0;
+    }
+    return len;
+}
+
+// Writes the decimal digits of v (no sign) and returns their count.
+fun _u64_digits(v: u64, res: ptr<u8>) -> i32 {
+    var tmp: array<u8, 20>;
+    var n: i32 = 0;
+    var x: u64 = v;
+    var more: bool = true;
+    while (more) {
+        tmp[n] = (48 + (x % 10)) as u8;
+        n += 1;
+        x = x / 10;
+        more = x != 0;
+    }
+    var i: i32 = 0;
+    while (i < n) {
+        deref res[i] = tmp[n - 1 - i];
+        i += 1;
+    }
+    return n;
+}
+
+// Decimal digits of a nonzero big integer (most significant first).
+fun _big_digits(src: ptr<Big>, res: ptr<u8>) -> i32 {
+    var v: Big = deref src;
+    var rev: array<u8, 800>;
+    var n: i32 = 0;
+    while (v.n != 0) {
+        var rem: u64 = 0;  // v /= 10^9
+        var i: i32 = v.n - 1;
+        while (i >= 0) {
+            var cur: u64 = (rem << 32) | (v.d[i] as u64);
+            v.d[i] = (cur / 1000000000) as u32;
+            rem = cur % 1000000000;
+            i -= 1;
+        }
+        _big_trim(&v);
+        var k: i32 = 0;
+        while (k < 9) {
+            rev[n] = (48 + (rem % 10)) as u8;
+            n += 1;
+            rem = rem / 10;
+            k += 1;
+        }
+    }
+    while (n > 1 && rev[n - 1] == 48) {
+        n -= 1;
+    }
+    var j: i32 = 0;
+    while (j < n) {
+        deref res[j] = rev[n - 1 - j];
+        j += 1;
+    }
+    return n;
+}
+
+// ---------------------------------------------------------------------------
+// Parsing
+// ---------------------------------------------------------------------------
+
+const MAX_DIGITS: i32 = 780;  // >= 768 keeps rounding exact (see _parse_double)
+
+fun _store_f64(res: ptr<f64>, bits: u64) {
+    deref res = float_from_bits_f64(bits);
+}
+
+// Rounds q * 2^exp2 (+ a nonzero tail when `sticky`) to the nearest double,
+// ties to even. Returns JSON_NUM_OK, or JSON_NUM_RANGE for +-inf / +-0 results.
+fun _round_to_double(qin: u64, exp2in: i32, sticky: bool, negative: bool, res: ptr<f64>) -> i32 {
+    var sign: u64 = 0;
+    if (negative) {
+        sign = SIGN_BIT;
+    }
+    var inf: u64 = sign | EXP_INF;
+    var lz: i32 = _clz64(qin);
+    var q: u64 = qin << (lz as u64);
+    var exp2: i32 = exp2in - lz;
+    var e: i32 = exp2 + 63;  // exponent of the leading bit
+    if (e > 1023) {
+        _store_f64(res, inf);
+        return JSON_NUM_RANGE;
+    }
+    var keep: i32 = e + 1075;  // significant bits that survive
+    if (e >= -1022) {
+        keep = 53;
+    }
+    if (keep < 0) {
+        _store_f64(res, sign);
+        return JSON_NUM_RANGE;
+    }
+    var m: u64 = 0;
+    if (keep == 0) {
+        // Value in [2^-1075, 2^-1074): at or above half the smallest subnormal.
+        m = 1;
+        if (q == SIGN_BIT && !sticky) {
+            m = 0;
+        }
+    } else {
+        var shift: u64 = (64 - keep) as u64;  // 11 for normal numbers
+        m = q >> shift;
+        var rem: u64 = q & ((ONE << shift) - 1);
+        var half: u64 = ONE << (shift - 1);
+        if (rem > half || (rem == half && (sticky || (m & 1) != 0))) {
+            m += 1;
+        }
+    }
+    var bits: u64 = 0;
+    if (keep == 53) {
+        if (m == (ONE << 53)) {
+            m = m >> 1;
+            e += 1;
+            if (e > 1023) {
+                _store_f64(res, inf);
+                return JSON_NUM_RANGE;
+            }
+        }
+        bits = ((e + 1023) as u64) << 52 | (m & MANT_MASK);
+    } else {
+        bits = m;  // subnormal; m == 2^52 encodes the smallest normal
+    }
+    _store_f64(res, sign | bits);
+    if (bits == 0) {
+        return JSON_NUM_RANGE;
+    }
+    return JSON_NUM_OK;
+}
+
+// `s` is a validated JSON number lexeme of length `len`.
+fun _parse_double(s: ptr<u8>, len: i64, res: ptr<f64>) -> i32 {
+    var negative: bool = false;
+    var p: i64 = 0;
+    if (s[0] == 45) {
+        negative = true;
+        p = 1;
+    }
+    var dig: array<u8, 781>;
+    var nd: i32 = 0;
+    var exp10: i64 = 0;  // value = DIGITS * 10^exp10
+    var dropped: bool = false;
+    while (p < len && _is_digit(s[p])) {
+        var c: u8 = s[p];
+        p += 1;
+        if (nd == 0 && c == 48) {
+            continue;
+        }
+        if (nd < MAX_DIGITS) {
+            dig[nd] = c;
+            nd += 1;
+        } else {
+            if (c != 48) {
+                dropped = true;
+            }
+            exp10 += 1;
+        }
+    }
+    if (p < len && s[p] == 46) {
+        p += 1;
+        while (p < len && _is_digit(s[p])) {
+            var c2: u8 = s[p];
+            p += 1;
+            if (nd == 0 && c2 == 48) {
+                exp10 -= 1;
+            } else if (nd < MAX_DIGITS) {
+                dig[nd] = c2;
+                nd += 1;
+                exp10 -= 1;
+            } else if (c2 != 48) {
+                dropped = true;
+            }
+        }
+    }
+    if (p < len && (s[p] == 101 || s[p] == 69)) {
+        p += 1;
+        var eneg: bool = false;
+        if (s[p] == 43 || s[p] == 45) {
+            eneg = s[p] == 45;
+            p += 1;
+        }
+        var x: i64 = 0;
+        while (p < len) {
+            if (x < 100000000) {
+                x = x * 10 + ((s[p] - 48) as i64);
+            }
+            p += 1;
+        }
+        if (eneg) {
+            exp10 -= x;
+        } else {
+            exp10 += x;
+        }
+    }
+    if (nd == 0) {
+        var z: u64 = 0;
+        if (negative) {
+            z = SIGN_BIT;
+        }
+        _store_f64(res, z);
+        return JSON_NUM_OK;
+    }
+    while (nd > 1 && dig[nd - 1] == 48) {
+        nd -= 1;
+        exp10 += 1;
+    }
+    // Digits past the 780th matter only as "something nonzero follows": any
+    // value strictly between D*10^E and (D+1)*10^E rounds like
+    // D*10^E + 10^(E-1), since points halfway between doubles have at most
+    // 767 significant digits and cannot fall strictly inside that interval.
+    if (dropped) {
+        dig[nd] = 49;
+        nd += 1;
+        exp10 -= 1;
+    }
+    var magnitude: i64 = (nd as i64) + exp10;  // 10^(magnitude-1) <= value < 10^magnitude
+    var sgn: u64 = 0;
+    if (negative) {
+        sgn = SIGN_BIT;
+    }
+    if (magnitude > 310) {
+        _store_f64(res, sgn | EXP_INF);
+        return JSON_NUM_RANGE;
+    }
+    if (magnitude < -324) {  // below 10^-324: under half the smallest subnormal
+        _store_f64(res, sgn);
+        return JSON_NUM_RANGE;
+    }
+    var e10: i32 = exp10 as i32;
+
+    // Fast path: the significand and the power of ten are exact doubles, so
+    // one IEEE multiplication or division rounds correctly.
+    if (nd <= 15) {
+        var w: u64 = 0;
+        var i: i32 = 0;
+        while (i < nd) {
+            w = w * 10 + ((dig[i] - 48) as u64);
+            i += 1;
+        }
+        var v: f64 = 0.0 - 1.0;
+        if (e10 >= 0 && e10 <= 22) {
+            v = (w as f64) * _pow10_f64(e10);
+        } else if (e10 < 0 && e10 >= -22) {
+            v = (w as f64) / _pow10_f64(0 - e10);
+        } else if (e10 > 22 && e10 <= 22 + 15 - nd) {
+            var scaled: u64 = w * (_pow10_f64(e10 - 22) as u64);
+            v = (scaled as f64) * _pow10_f64(22);
+        }
+        if (v >= 0.0) {
+            if (negative) {
+                v = 0.0 - v;
+            }
+            deref res = v;
+            return JSON_NUM_OK;
+        }
+    }
+
+    // Exact path.
+    var D: Big;
+    _big_set(&D, 0);
+    var at: i32 = 0;
+    while (at < nd) {
+        var chunk: i32 = nd - at;
+        if (chunk > 9) {
+            chunk = 9;
+        }
+        var part: u32 = 0;
+        var k: i32 = 0;
+        while (k < chunk) {
+            part = part * 10 + ((dig[at + k] - 48) as u32);
+            k += 1;
+        }
+        _big_mul_small(&D, _pow10_u32(chunk));
+        _big_add_small(&D, part);
+        at += chunk;
+    }
+    var q: u64 = 0;
+    var exp2: i32 = 0;
+    var sticky: bool = false;
+    if (e10 >= 0) {
+        _big_mul_pow10(&D, e10);
+        var b: i32 = _big_bits(&D);
+        if (b <= 64) {
+            q = _big_extract64(&D, 0);
+            exp2 = 0;
+            sticky = false;
+        } else {
+            q = _big_extract64(&D, b - 64);
+            exp2 = b - 64;
+            sticky = _big_any_below(&D, b - 64);
+        }
+    } else {
+        // q = floor(D * 2^s / 10^-e10), with s chosen so q has 63 or 64 bits;
+        // the remainder only matters as sticky.
+        var Q: Big;
+        _big_set(&Q, 1);
+        _big_mul_pow10(&Q, 0 - e10);
+        var sh: i32 = 63 + _big_bits(&Q) - _big_bits(&D);
+        if (sh >= 0) {
+            _big_shl(&D, sh);
+        } else {
+            _big_shl(&Q, 0 - sh);
+        }
+        var B: Big = Q;  // binary long division; the quotient is below 2^64
+        _big_shl(&B, 63);
+        var kk: i32 = 63;
+        while (kk >= 0) {
+            if (_big_cmp(&D, &B) >= 0) {
+                _big_sub(&D, &B);
+                q = q | (ONE << (kk as u64));
+            }
+            _big_shr1(&B);
+            kk -= 1;
+        }
+        exp2 = 0 - sh;
+        sticky = !_big_is_zero(&D);
+    }
+    return _round_to_double(q, exp2, sticky, negative, res);
+}
+
+// ---------------------------------------------------------------------------
+// Shortest formatting
+// ---------------------------------------------------------------------------
+
+// Shortest digits that round-trip to v (> 0, finite); among those, the ones
+// closest to v, ties to even. Returns the count; v ~ 0.DIGITS * 10^*k_out.
+fun _shortest_digits(bits: u64, digits: ptr<u8>, k_out: ptr<i32>) -> i32 {
+    var mant: u64 = bits & MANT_MASK;
+    var be: i32 = ((bits >> 52) & 2047) as i32;
+    var f: u64 = mant;
+    var e: i32 = 0 - 1074;
+    if (be != 0) {
+        f = mant | (ONE << 52);
+        e = be - 1075;
+    }
+    var even: bool = (f & 1) == 0;
+    var lower_closer: bool = mant == 0 && be > 1;  // gap below is half the gap above
+
+    // v = r / s; the rounding interval is (v - mm/s, v + mp/s).
+    var r: Big;
+    var s: Big;
+    var mp: Big;
+    var mm: Big;
+    _big_set(&r, f);
+    _big_set(&mp, 1);
+    _big_set(&mm, 1);
+    if (e >= 0) {
+        if (!lower_closer) {
+            _big_shl(&r, e + 1);
+            _big_set(&s, 2);
+            _big_shl(&mp, e);
+            _big_shl(&mm, e);
+        } else {
+            _big_shl(&r, e + 2);
+            _big_set(&s, 4);
+            _big_shl(&mp, e + 1);
+            _big_shl(&mm, e);
+        }
+    } else {
+        _big_set(&s, 1);
+        if (!lower_closer) {
+            _big_shl(&r, 1);
+            _big_shl(&s, 1 - e);
+        } else {
+            _big_shl(&r, 2);
+            _big_shl(&s, 2 - e);
+            _big_set(&mp, 2);
+        }
+    }
+
+    // k = ceil(log10(v)), estimated from below and fixed up.
+    var flen: i32 = 64 - _clz64(f);
+    var est: f64 = ((e + flen - 1) as f64) * 0.30102999566398114 - 0.0000000001;
+    var k: i32 = est as i32;
+    if ((k as f64) < est) {
+        k += 1;
+    }
+    if (k >= 0) {
+        _big_mul_pow10(&s, k);
+    } else {
+        _big_mul_pow10(&r, 0 - k);
+        _big_mul_pow10(&mp, 0 - k);
+        _big_mul_pow10(&mm, 0 - k);
+    }
+    var top: i32 = _big_cmp_sum(&r, &mp, &s);
+    var wrap: bool = top > 0;
+    if (even) {
+        wrap = top >= 0;
+    }
+    if (wrap) {
+        _big_mul_small(&s, 10);
+        k += 1;
+    }
+
+    var n: i32 = 0;
+
+    // Common case (short numbers of moderate size): s < 2^59, so r, m+ and m-
+    // stay below s and every step fits a native 64-bit integer.
+    if (_big_bits(&s) <= 59) {
+        var S: u64 = _big_to_u64(&s);
+        var R: u64 = _big_to_u64(&r);
+        var MP: u64 = _big_to_u64(&mp);
+        var MM: u64 = _big_to_u64(&mm);
+        while (true) {
+            R = R * 10;
+            MP = MP * 10;
+            MM = MM * 10;
+            var q: i32 = 0;
+            while (R >= S) {
+                R = R - S;
+                q += 1;
+            }
+            var t1: bool = R < MM;
+            var t2: bool = R + MP > S;
+            if (even) {
+                t1 = R <= MM;
+                t2 = R + MP >= S;
+            }
+            if (!t1 && !t2) {
+                deref digits[n] = (48 + q) as u8;
+                n += 1;
+            } else {
+                if (t1 && t2) {
+                    var twice: u64 = R * 2;
+                    if (twice > S || (twice == S && (q & 1) != 0)) {
+                        q += 1;
+                    }
+                } else if (t2) {
+                    q += 1;
+                }
+                while (q == 10) {
+                    if (n == 0) {
+                        q = 1;
+                        k += 1;
+                        break;
+                    }
+                    n -= 1;
+                    q = ((digits[n] - 48) as i32) + 1;
+                }
+                deref digits[n] = (48 + q) as u8;
+                n += 1;
+                deref k_out = k;
+                return n;
+            }
+        }
+    }
+
+    var go: bool = true;
+    while (go) {
+        _big_mul_small(&r, 10);
+        _big_mul_small(&mp, 10);
+        _big_mul_small(&mm, 10);
+        var d: i32 = 0;
+        while (_big_cmp(&r, &s) >= 0) {
+            _big_sub(&r, &s);
+            d += 1;
+        }
+        var lo: i32 = _big_cmp(&r, &mm);
+        var tc1: bool = lo < 0;  // rounding down stays inside
+        if (even) {
+            tc1 = lo <= 0;
+        }
+        var hi: i32 = _big_cmp_sum(&r, &mp, &s);
+        var tc2: bool = hi > 0;  // rounding up stays inside
+        if (even) {
+            tc2 = hi >= 0;
+        }
+        if (!tc1 && !tc2) {
+            deref digits[n] = (48 + d) as u8;
+            n += 1;
+        } else {
+            if (tc1 && tc2) {
+                var twice: Big = r;
+                _big_shl(&twice, 1);
+                var c: i32 = _big_cmp(&twice, &s);
+                if (c > 0 || (c == 0 && (d & 1) != 0)) {  // nearest, ties to even
+                    d += 1;
+                }
+            } else if (tc2) {
+                d += 1;
+            }
+            while (d == 10) {  // a final 10 carries into earlier digits
+                if (n == 0) {
+                    d = 1;
+                    k += 1;
+                    break;
+                }
+                n -= 1;
+                d = ((digits[n] - 48) as i32) + 1;
+            }
+            deref digits[n] = (48 + d) as u8;
+            n += 1;
+            go = false;
+        }
+    }
+    deref k_out = k;
+    return n;
+}
+
+fun _put(res: ptr<u8>, at: i32, c: u8) -> i32 {
+    deref res[at] = c;
+    return at + 1;
+}
+
+// Lays res digits like std::to_chars: fixed or scientific, whichever is
+// shorter (fixed on a tie). Returns the length written to `res`.
+// `exact` holds the full integer digits of the value when exact_n > 0; when
+// fixed notation is chosen for an integer at or above 2^53, those are printed
+// instead of zero padding, as std::to_chars does.
+fun _layout(negative: bool, digits: ptr<u8>, n: i32, k: i32, exact: ptr<u8>, exact_n: i32, res: ptr<u8>) -> i32 {
+    var len: i32 = 0;
+    if (negative) {
+        len = _put(res, len, 45);
+    }
+    var x: i32 = k - 1;  // scientific exponent
+    var ax: i32 = x;
+    if (x < 0) {
+        ax = 0 - x;
+    }
+    var exp_digits: i32 = 2;
+    if (ax >= 100) {
+        exp_digits = 3;
+    }
+    var sci_len: i32 = n + 2 + exp_digits;
+    if (n > 1) {
+        sci_len += 1;
+    }
+    var fixed_len: i32 = 0;
+    if (k <= 0) {
+        fixed_len = 2 - k + n;
+    } else if (k < n) {
+        fixed_len = n + 1;
+    } else {
+        fixed_len = k;
+    }
+    if (fixed_len <= sci_len) {
+        if (k <= 0) {
+            len = _put(res, len, 48);
+            len = _put(res, len, 46);
+            var z: i32 = 0;
+            while (z < 0 - k) {
+                len = _put(res, len, 48);
+                z += 1;
+            }
+            var i: i32 = 0;
+            while (i < n) {
+                len = _put(res, len, digits[i]);
+                i += 1;
+            }
+        } else if (k < n) {
+            var i2: i32 = 0;
+            while (i2 < k) {
+                len = _put(res, len, digits[i2]);
+                i2 += 1;
+            }
+            len = _put(res, len, 46);
+            var i3: i32 = k;
+            while (i3 < n) {
+                len = _put(res, len, digits[i3]);
+                i3 += 1;
+            }
+        } else if (exact_n > 0 && exact_n == k) {
+            var i4: i32 = 0;
+            while (i4 < k) {
+                len = _put(res, len, exact[i4]);
+                i4 += 1;
+            }
+        } else {
+            var i5: i32 = 0;
+            while (i5 < n) {
+                len = _put(res, len, digits[i5]);
+                i5 += 1;
+            }
+            var i6: i32 = n;
+            while (i6 < k) {
+                len = _put(res, len, 48);
+                i6 += 1;
+            }
+        }
+    } else {
+        len = _put(res, len, digits[0]);
+        if (n > 1) {
+            len = _put(res, len, 46);
+            var i7: i32 = 1;
+            while (i7 < n) {
+                len = _put(res, len, digits[i7]);
+                i7 += 1;
+            }
+        }
+        len = _put(res, len, 101);
+        if (x < 0) {
+            len = _put(res, len, 45);
+        } else {
+            len = _put(res, len, 43);
+        }
+        if (exp_digits == 3) {
+            len = _put(res, len, (48 + ax / 100) as u8);
+        }
+        len = _put(res, len, (48 + (ax / 10) % 10) as u8);
+        len = _put(res, len, (48 + ax % 10) as u8);
+    }
+    return len;
+}
+
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+
+// Parses a JSON number lexeme to double (round-to-nearest, correctly rounded).
+// Out-of-range magnitudes store +-inf or +-0 and return JSON_NUM_RANGE.
+pub fun num_parse_f64(src: ptr<u8>, len: i64, res: ptr<f64>) -> i32 {
+    if (res == null || len <= 0 || src == null) {
+        return JSON_NUM_INVALID;
+    }
+    if (_json_number_kind(src, len) == 0) {
+        return JSON_NUM_INVALID;
+    }
+    return _parse_double(src, len, res);
+}
+
+// Parses a JSON integer lexeme (no fraction/exponent) to int64.
+pub fun num_parse_i64(src: ptr<u8>, len: i64, res: ptr<i64>) -> i32 {
+    if (res == null || len <= 0 || src == null) {
+        return JSON_NUM_INVALID;
+    }
+    if (_json_number_kind(src, len) != 1) {
+        return JSON_NUM_INVALID;
+    }
+    var p: i64 = 0;
+    var negative: bool = src[0] == 45;
+    if (negative) {
+        p = 1;
+    }
+    var limit: u64 = SIGN_BIT - 1;
+    if (negative) {
+        limit = SIGN_BIT;
+    }
+    var v: u64 = 0;
+    while (p < len) {
+        var digit: u64 = (src[p] - 48) as u64;
+        if (v > (limit - digit) / 10) {
+            return JSON_NUM_RANGE;
+        }
+        v = v * 10 + digit;
+        p += 1;
+    }
+    if (negative) {
+        deref res = (0 - v) as i64;
+    } else {
+        deref res = v as i64;
+    }
+    return JSON_NUM_OK;
+}
+
+// Shortest round-trip decimal form of `value`, always valid JSON.
+pub fun num_format_f64(value: f64, dst: ptr<u8>, cap: i64) -> i64 {
+    var bits: u64 = float_to_bits_f64(value);
+    if (((bits >> 52) & 2047) == 2047) {
+        return JSON_NUM_NONFINITE as i64;
+    }
+    if (cap < 0) {
+        return JSON_NUM_INVALID as i64;
+    }
+    var negative: bool = (bits & SIGN_BIT) != 0;
+    var mag: u64 = bits & (SIGN_BIT - 1);
+    var tmp: array<u8, 64>;
+    var len: i32 = 0;
+    if (mag == 0) {
+        if (negative) {
+            len = _put(&tmp[0], len, 45);
+        }
+        len = _put(&tmp[0], len, 48);
+    } else {
+        var digits: array<u8, 24>;
+        var k: i32 = 0;
+        var n: i32 = _shortest_digits(mag, &digits[0], &k);
+        var exact: array<u8, 24>;
+        var exact_n: i32 = 0;
+        var be: i32 = ((bits >> 52) & 2047) as i32;
+        if (k > n && k <= 22 && be >= 1075) {  // integer >= 2^52 that may print in fixed form
+            var v: Big;
+            _big_set(&v, (bits & MANT_MASK) | (ONE << 52));
+            _big_shl(&v, be - 1075);
+            exact_n = _big_digits(&v, &exact[0]);
+        }
+        len = _layout(negative, &digits[0], n, k, &exact[0], exact_n, &tmp[0]);
+    }
+    return _emit(&tmp[0], len as i64, dst, cap);
+}
+
+// Fixed notation with `precision` digits after the point (0..17).
+pub fun num_format_f64_fixed(value: f64, precision: i32, dst: ptr<u8>, cap: i64) -> i64 {
+    var bits: u64 = float_to_bits_f64(value);
+    if (((bits >> 52) & 2047) == 2047) {
+        return JSON_NUM_NONFINITE as i64;
+    }
+    if (cap < 0 || precision < 0 || precision > 17) {
+        return JSON_NUM_INVALID as i64;
+    }
+    var negative: bool = (bits & SIGN_BIT) != 0;
+    var mant: u64 = bits & MANT_MASK;
+    var be: i32 = ((bits >> 52) & 2047) as i32;
+    var f: u64 = mant;
+    var e: i32 = 0 - 1074;
+    if (be != 0) {
+        f = mant | (ONE << 52);
+        e = be - 1075;
+    }
+
+    // N = round_half_even(|value| * 10^precision), exactly.
+    var N: Big;
+    _big_set(&N, f);
+    _big_mul_pow10(&N, precision);
+    if (e >= 0) {
+        _big_shl(&N, e);
+    } else {
+        var s: i32 = 0 - e;
+        var half: bool = _big_bit(&N, s - 1);
+        var below: bool = _big_any_below(&N, s - 1);
+        _big_shr(&N, s);
+        if (half && (below || _big_bit(&N, 0))) {
+            _big_add_small(&N, 1);
+        }
+    }
+
+    var digits: array<u8, 400>;  // DBL_MAX has 309 integer digits, plus 17 decimals
+    var n: i32 = 0;
+    if (!_big_is_zero(&N)) {
+        n = _big_digits(&N, &digits[0]);
+    }
+    var tmp: array<u8, 420>;
+    var len: i32 = 0;
+    if (negative) {
+        len = _put(&tmp[0], len, 45);
+    }
+    var total: i32 = precision + 1;  // >= 1 integer digit
+    if (n > precision) {
+        total = n;
+    }
+    var pad: i32 = total - n;
+    var i: i32 = 0;
+    while (i < total) {
+        if (i == total - precision) {
+            len = _put(&tmp[0], len, 46);
+        }
+        if (i < pad) {
+            len = _put(&tmp[0], len, 48);
+        } else {
+            len = _put(&tmp[0], len, digits[i - pad]);
+        }
+        i += 1;
+    }
+    return _emit(&tmp[0], len as i64, dst, cap);
+}
+
+pub fun num_format_i64(value: i64, dst: ptr<u8>, cap: i64) -> i64 {
+    if (cap < 0) {
+        return JSON_NUM_INVALID as i64;
+    }
+    var tmp: array<u8, 24>;
+    var len: i32 = 0;
+    var magnitude: u64 = value as u64;
+    if (value < 0) {
+        len = _put(&tmp[0], len, 45);
+        magnitude = 0 - magnitude;
+    }
+    len += _u64_digits(magnitude, &tmp[len]);
+    return _emit(&tmp[0], len as i64, dst, cap);
+}

@@ -385,7 +385,7 @@ fun wave_build(b: ptr<Buffer>, flags: ptr<Buffer>, source: str, output: str) -> 
         add(b, " --std-root=");
         add(b, env_or("WAVE_STD", ""));
     }
-    add(b, " build ");
+    add(b, " -O2 build ");
     add(b, source);
     add(b, " ");
     add(b, native_lib());
@@ -495,9 +495,9 @@ fun task_test(b: ptr<Buffer>, flags: ptr<Buffer>) {
     }
     cxx_test(b, flags);
 
-    var tests: array<str, 3> = ["wjson_test", "edit_test", "stream_test"];
+    var tests: array<str, 4> = ["wjson_test", "edit_test", "stream_test", "number_test"];
     var t: i32 = 0;
-    while (t < 3) {
+    while (t < 4) {
         var tsrc: Buffer = buffer_new(64);
         add(&tsrc, "tests/");
         add(&tsrc, tests[t]);
