@@ -63,7 +63,7 @@ wavec build hello.wave \
       -L /usr/lib/gcc/x86_64-linux-gnu/15 --run
 ```
 
-wavec는 따로 지정하지 않으면 `-O0`으로 컴파일해요. wjson의 네이티브 코드는 이미 최적화돼 있지만, 내 Wave 코드는 `-O2`(`wavec -O2 build ...`)를 주면 몇 배 빨라져요.
+wavec는 따로 지정하지 않으면 `-O0`으로 컴파일해요. wjson의 네이티브 코드는 이미 최적화돼 있지만, 내 Wave 코드는 `-O2`(`wavec -O2 build ...`)를 주면 몇 배 빨라져요. 단 macOS arm64에서는 최적화 빌드가 Wave의 `std::mem::alloc` 안에서 깨져요(Wave 이슈 [#933](https://github.com/wavefnd/Wave/issues/933)). 고쳐질 때까지는 거기서 `-O0`을 쓰세요.
 
 `0.0.0.0:8080`이 출력돼요. `--dep=wjson=wjson`은 받은 폴더를 가리켜요. `--link=...`와 `-L ...` 부분은 2단계의 `link :` 줄로 바꿔 쓰세요(gcc 폴더는 컴퓨터마다 달라요). `wavec`이 표준 라이브러리를 못 찾는다고 하면(`wavec print std-path`가 찾는 위치를 보여 주고, 설치 스크립트는 `~/.wave/bin/std`에 둬요) `--std-root=<Wave의 std가 있는 폴더>`를 붙이거나, Wave 문제 해결 페이지의 안내처럼 `wavec install std`를 실행하세요.
 
@@ -227,7 +227,7 @@ $env:WJSON_RUN="examples/show_data.wave"; wavec --std-root="$env:LOCALAPPDATA\Wa
 
 Windows 11 + wavec 0.2.1-pre-beta + Rust 1.99.1 + clang 23.1.3 조합에서, MSVC 경로를 전부 비운 상태로 전체 테스트가 통과하는 것을 확인했어요.
 
-`build.wave`는 모든 Wave 프로그램(테스트와 예제)을 `-O2`로 컴파일해요. wavec의 기본값 `-O0`은 같은 코드에서 약 4배 느렸어요.
+`build.wave`는 모든 Wave 프로그램(테스트와 예제)을 `-O2`로 컴파일해요. wavec의 기본값 `-O0`은 같은 코드에서 약 4배 느렸어요. macOS arm64에서는 대신 `-O0`을 써요. Wave std가 커널이 덮어쓰는 레지스터를 선언하지 않고 시스템 호출을 해서 최적화 빌드가 깨지기 때문이에요([#933](https://github.com/wavefnd/Wave/issues/933)). `WJSON_OPT=-O2`처럼 환경 변수로 직접 지정할 수도 있어요.
 
 Wave의 `main`은 인자를 받을 수 없어서 작업 선택은 환경 변수로 해요. 그 밖에 `WAVEC`, `WAVE_STD`(std 루트 직접 지정), `CARGO`, `RUSTC`, `CXX`를 쓸 수 있어요. `std::process`가 아직 Windows에서 프로세스를 띄우지 못해서, 드라이버는 C 라이브러리의 `system()`을 `extern(c)`로 불러 명령을 실행해요.
 

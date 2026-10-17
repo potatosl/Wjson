@@ -46,6 +46,8 @@ const WJLINK: str = "build/chain/release/wjlink.exe";
 const WJLINK_LIB: str = "build/chain/release/lib";
 
 static WINDOWS: bool = false;
+// Optimization level for Wave programs (see detect_opt in main).
+static OPT: str = "-O2";
 static DRY: bool = false;
 static FAILED: i32 = 0;
 static TOOLCHAIN_READY: bool = false;
@@ -385,7 +387,9 @@ fun wave_build(b: ptr<Buffer>, flags: ptr<Buffer>, source: str, output: str) -> 
         add(b, " --std-root=");
         add(b, env_or("WAVE_STD", ""));
     }
-    add(b, " -O2 build ");
+    add(b, " ");
+    add(b, OPT);
+    add(b, " build ");
     add(b, source);
     add(b, " ");
     add(b, native_lib());
@@ -661,9 +665,25 @@ fun task_run(b: ptr<Buffer>, flags: ptr<Buffer>, source: str) {
     buffer_free(&dir);
 }
 
+// Wave programs are built with -O2 (wavec defaults to -O0, about 4x slower).
+// WJSON_OPT overrides it. On macOS arm64 the default is -O0: Wave's std makes
+// its raw syscalls without declaring that XNU overwrites x1, so optimized
+// builds can fail inside std::mem::alloc (https://github.com/wavefnd/Wave/issues/933).
+fun detect_opt() {
+    if (env_set("WJSON_OPT")) {
+        OPT = env_or("WJSON_OPT", "-O2");
+        return;
+    }
+    if (!WINDOWS && c_system("test \"$(uname -s)-$(uname -m)\" = Darwin-arm64" as ptr<u8>) == 0) {
+        OPT = "-O0";
+        println("note: macOS arm64: building Wave programs with -O0 (Wave issue 933); set WJSON_OPT=-O2 to override");
+    }
+}
+
 fun main() -> i32 {
     WINDOWS = streq(env_or("OS", ""), "Windows_NT");
     DRY = env_set("WJSON_DRY_RUN");
+    detect_opt();
     var b: Buffer = buffer_new(512);
     var flags: Buffer = buffer_new(256);
 

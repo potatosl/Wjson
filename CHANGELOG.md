@@ -8,7 +8,10 @@ minor releases.
 
 ### Wave
 - `build.wave` now compiles every Wave program with `-O2` (wavec defaults to
-  `-O0`, about 4x slower on the same code).
+  `-O0`, about 4x slower on the same code). On macOS arm64 it uses `-O0`: Wave's
+  std makes raw syscalls without declaring that XNU overwrites `x1`, so optimized
+  builds fail inside `std::mem::alloc` (Wave issue #933; found with `-O2` in this
+  repository's CI). `WJSON_OPT` overrides the level.
 - New `src/number.wave` and `src/escape.wave`: the number conversion and the
   string escaping / UTF-8 checks written in Wave. The Wave API now uses them
   (through `src/ffi.wave`) instead of the C++ functions, which remain for C and

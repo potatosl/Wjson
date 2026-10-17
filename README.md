@@ -81,7 +81,9 @@ wavec build hello.wave \
 
 wavec compiles at `-O0` unless told otherwise. wjson's native code is already
 optimized, but your own Wave code runs several times faster with `-O2`
-(`wavec -O2 build ...`).
+(`wavec -O2 build ...`). Exception: on macOS arm64 optimized builds currently
+break inside Wave's `std::mem::alloc` (Wave issue
+[#933](https://github.com/wavefnd/Wave/issues/933)); use `-O0` there until that is fixed.
 
 This prints `0.0.0.0:8080`. `--dep=wjson=wjson` points at the cloned folder.
 Replace the `--link=...` and `-L ...` flags with the `link :` line from step 2
@@ -200,7 +202,11 @@ WJSON_DRY_RUN=1 wavec run build.wave                   # print the commands only
 ```
 
 `build.wave` compiles every Wave program (tests and examples) with `-O2`;
-wavec's default is `-O0`, which was about 4x slower on the same code.
+wavec's default is `-O0`, which was about 4x slower on the same code. On macOS
+arm64 it uses `-O0` instead, because Wave's std makes its raw syscalls without
+declaring a register the kernel overwrites, which breaks optimized builds
+([#933](https://github.com/wavefnd/Wave/issues/933)). `WJSON_OPT=-O2` (or any
+other level) overrides the choice.
 
 Wave's `main` takes no arguments, so tasks are chosen with environment
 variables. Other knobs: `WAVEC`, `WAVE_STD` (explicit std root), `CARGO`,
