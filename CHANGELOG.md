@@ -15,6 +15,16 @@ minor releases.
   C++ users. `tests/number_test.wave` and `tests/escape_test.wave` compare them
   with the C++ layer (same status code, same bits or bytes). Without `-O2` the
   Wave code is about 4x slower than the C++ code; with `-O2` it is level.
+- New `src/core_dom.wave` and `src/core_parse.wave`: the document model and
+  the RFC 8259 parser (with the comment and trailing-comma options) written in
+  Wave, a port of `core/src/dom.rs` and `parser.rs`. Not used by the Wave API
+  yet, which still goes through the Rust core. `tests/core_parse_test.wave`
+  compares them with the Rust parser on valid, relaxed and damaged inputs
+  (same ok/error, error code, offset, line and column, and the same tree).
+  Built with `-O2` the Wave parser runs at the Rust parser's speed (about
+  310 MB/s on a 30 MB record file); with `-O0` it is 2.5x slower. It allocates
+  through the C library, because Wave's std allocator maps fresh pages for every
+  allocation.
 - `.gitattributes` marks `*.wave` as Wave for GitHub's language statistics.
 
 ### Native

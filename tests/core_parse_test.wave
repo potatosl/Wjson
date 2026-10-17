@@ -1,0 +1,525 @@
+// SPDX-License-Identifier: MPL-2.0
+//
+// Differential test for the pure-Wave DOM and parser (src/core_dom.wave,
+// src/core_parse.wave) against the Rust core (core/src/parser.rs, reached
+// through its C ABI). Valid, relaxed and damaged inputs must give the same
+// result: ok or not, the same error code, offset, line and column, and the same
+// tree (kinds, values, children, keys, parents).
+// Run from the repository root:  wavec run build.wave
+
+import("std::mem::alloc")::{mem_alloc, mem_free};
+extern(c, "getenv") fun c_getenv(name: ptr<u8>) -> ptr<u8>;
+import("wjson::ffi")::{
+    ffi_parse, ffi_free, ffi_ok, ffi_error_code, ffi_error_offset, ffi_error_line, ffi_error_column,
+    ffi_root, ffi_node_count, ffi_type, ffi_bool, ffi_len, ffi_at, ffi_key, ffi_str, ffi_num,
+    ffi_num_is_int, ffi_parent,
+};
+import("wjson::core_dom")::{
+    CoreDoc, core_doc_release, core_root, core_type, core_bool, core_len, core_at, core_key,
+    core_str, core_num, core_num_is_int, core_parent,
+};
+import("wjson::core_parse")::{core_parse};
+
+static CHECKS: i32 = 0;
+static FAILURES: i32 = 0;
+static RNG: u64 = 88172645463325252;
+
+fun check(cond: bool, label: str) {
+    CHECKS += 1;
+    if (!cond) {
+        FAILURES += 1;
+        if (FAILURES <= 20) {
+            println("FAIL: {}", label);
+        }
+    }
+}
+
+fun next() -> u64 {
+    var x: u64 = RNG;
+    x = x ^ (x << 13);
+    x = x ^ (x >> 7);
+    x = x ^ (x << 17);
+    RNG = x;
+    return x * 2685821657736338717;
+}
+
+fun below(n: u64) -> u64 {
+    return (next() >> 11) % n;
+}
+
+fun len_of(s: str) -> i64 {
+    var p: ptr<u8> = s as ptr<u8>;
+    var n: i64 = 0;
+    while (p[n] != 0) {
+        n += 1;
+    }
+    return n;
+}
+
+// Same length and bytes, and both NUL-terminated.
+fun same_text(a: ptr<u8>, la: i64, b: ptr<u8>, lb: i64) -> bool {
+    if (la != lb) {
+        return false;
+    }
+    if (a == null || b == null) {
+        return a == b;
+    }
+    var i: i64 = 0;
+    while (i < la) {
+        if (a[i] != b[i]) {
+            return false;
+        }
+        i += 1;
+    }
+    return a[la] == 0 && b[la] == 0;
+}
+
+// Compares the two documents node by node. Returns the number of differences.
+fun compare_trees(r: ptr<u8>, d: ptr<CoreDoc>) -> i32 {
+    var bad: i32 = 0;
+    var count: i64 = ffi_node_count(r);
+    if (count != deref d.node_count) {
+        return 1;
+    }
+    if (ffi_root(r) != core_root(d)) {
+        bad += 1;
+    }
+    // Out-of-range ids are tolerated the same way.
+    if (ffi_type(r, 0 - 1) != core_type(d, 0 - 1) || ffi_type(r, count as i32) != core_type(d, count as i32)) {
+        bad += 1;
+    }
+    var id: i32 = 0;
+    while (id < (count as i32)) {
+        var t: i32 = ffi_type(r, id);
+        if (t != core_type(d, id)) {
+            bad += 1;
+        }
+        if (ffi_bool(r, id) != core_bool(d, id)) {
+            bad += 1;
+        }
+        if (ffi_len(r, id) != core_len(d, id)) {
+            bad += 1;
+        }
+        if (ffi_num_is_int(r, id) != core_num_is_int(d, id)) {
+            bad += 1;
+        }
+        if (ffi_parent(r, id) != core_parent(d, id)) {
+            bad += 1;
+        }
+        var la: i64 = 0;
+        var lb: i64 = 0;
+        var pa: ptr<u8> = ffi_str(r, id, &la);
+        var pb: ptr<u8> = core_str(d, id, &lb);
+        if (!same_text(pa, la, pb, lb)) {
+            bad += 1;
+        }
+        pa = ffi_num(r, id, &la);
+        pb = core_num(d, id, &lb);
+        if (!same_text(pa, la, pb, lb)) {
+            bad += 1;
+        }
+        var n: i64 = ffi_len(r, id);
+        if (t == 4 || t == 5) {
+            var i: i64 = 0;
+            while (i < n) {
+                if (ffi_at(r, id, i) != core_at(d, id, i)) {
+                    bad += 1;
+                }
+                if (t == 5) {
+                    pa = ffi_key(r, id, i, &la);
+                    pb = core_key(d, id, i, &lb);
+                    if (!same_text(pa, la, pb, lb)) {
+                        bad += 1;
+                    }
+                }
+                i += 1;
+            }
+            // Past the end.
+            if (ffi_at(r, id, n) != core_at(d, id, n) || ffi_at(r, id, 0 - 1) != core_at(d, id, 0 - 1)) {
+                bad += 1;
+            }
+        }
+        id += 1;
+    }
+    return bad;
+}
+
+// Parses with both implementations and compares everything observable.
+fun agree(src: ptr<u8>, n: i64, depth: i32, flags: u32, label: str) {
+    var r: ptr<u8> = ffi_parse(src, n, depth, flags);
+    var d: CoreDoc = core_parse(src, n, depth, flags);
+    var ok_r: bool = ffi_ok(r) == 1;
+    var ok_d: bool = d.err_code == 0;
+    if ((ok_r && !ok_d) || (!ok_r && ok_d)) {
+        check(false, label);
+    } else if (!ok_r) {
+        var same: bool = ffi_error_code(r) == d.err_code && ffi_error_offset(r) == d.err_offset
+            && ffi_error_line(r) == d.err_line && ffi_error_column(r) == d.err_column;
+        check(same, label);
+        if (!same && FAILURES <= 20) {
+            println("   rust: code {} offset {} line {} col {}   wave: code {} offset {} line {} col {}",
+                    ffi_error_code(r), ffi_error_offset(r), ffi_error_line(r), ffi_error_column(r),
+                    d.err_code, d.err_offset, d.err_line, d.err_column);
+        }
+    } else {
+        check(compare_trees(r, &d) == 0, label);
+    }
+    ffi_free(r);
+    core_doc_release(&d);
+}
+
+fun agree_str(s: str, flags: u32) {
+    agree(s as ptr<u8>, len_of(s), 0, flags, s);
+}
+
+fun test_fixed() {
+    var f: u32 = 0;
+    while (f < 4) {
+        agree_str("null", f);
+        agree_str("true", f);
+        agree_str("false", f);
+        agree_str("0", f);
+        agree_str("-0", f);
+        agree_str("-12.5e+3", f);
+        agree_str("1E5", f);
+        agree_str("\"\"", f);
+        agree_str("\"abc\"", f);
+        agree_str("\"a\\n\\t\\\"\\\\\\/\\b\\f\\r\"", f);
+        agree_str("\"\\u00e9\\u20ac\\ud83d\\ude00\"", f);
+        agree_str("\"\\u0000\"", f);
+        agree_str("\"é😀日本\"", f);
+        agree_str("[]", f);
+        agree_str("{}", f);
+        agree_str("[1,2,3]", f);
+        agree_str("{\"a\":1,\"b\":[true,false,null],\"c\":{\"d\":\"e\"}}", f);
+        agree_str("  [ 1 , { \"k\" : [ ] } ]  ", f);
+        agree_str("{\"a\":1,\"a\":2}", f);
+        agree_str("[1,]", f);
+        agree_str("{\"a\":1,}", f);
+        agree_str("[,]", f);
+        agree_str("// c\n[1] // d", f);
+        agree_str("/* c */ {\"a\" /* x */ : /* y */ 1}", f);
+        agree_str("/* unterminated", f);
+        agree_str("/ x", f);
+        agree_str("[1 /", f);
+        // Invalid inputs.
+        agree_str("", f);
+        agree_str("   ", f);
+        agree_str("nul", f);
+        agree_str("nulx", f);
+        agree_str("tru", f);
+        agree_str("falsy", f);
+        agree_str("01", f);
+        agree_str("-", f);
+        agree_str("1.", f);
+        agree_str("1e", f);
+        agree_str("1e+", f);
+        agree_str(".5", f);
+        agree_str("+1", f);
+        agree_str("\"abc", f);
+        agree_str("\"a\\", f);
+        agree_str("\"a\\x\"", f);
+        agree_str("\"\\u12\"", f);
+        agree_str("\"\\ud83d\"", f);
+        agree_str("\"\\ud83dx\"", f);
+        agree_str("\"\\ude00\"", f);
+        agree_str("\"\\ud83d\\u0041\"", f);
+        agree_str("\"\\uZZZZ\"", f);
+        agree_str("\"tab\there\"", f);
+        agree_str("\"nl\nhere\"", f);
+        agree_str("[1 2]", f);
+        agree_str("{\"a\" 1}", f);
+        agree_str("{\"a\":}", f);
+        agree_str("{1:2}", f);
+        agree_str("{\"a\":1 \"b\":2}", f);
+        agree_str("[1,2", f);
+        agree_str("{\"a\":1", f);
+        agree_str("1 2", f);
+        agree_str("[] x", f);
+        agree_str("\xef\xbb\xbf[1]", f);                 // BOM
+        agree_str("\xef\xbb\xbf", f);                     // BOM only
+        agree_str("\"\xff\"", f);
+        agree_str("\"\xc3\"", f);
+        agree_str("\"\xe2\x82\"", f);
+        agree_str("\"\xed\xa0\x80\"", f);
+        agree_str("\"ok\xc0\xafbad\"", f);
+        agree_str("\xff", f);
+        agree_str("[1,\n2,\n\"é\" x]", f);
+        agree_str("\n\n   @", f);
+        f += 1;
+    }
+}
+
+fun test_depth() {
+    // Nested arrays: at, just under and over the limits.
+    var buf: ptr<u8> = mem_alloc(5000);
+    var depths: array<i32, 6> = [1, 3, 512, 513, 2048, 2049];
+    var k: i32 = 0;
+    while (k < 6) {
+        var n: i32 = depths[k];
+        var i: i32 = 0;
+        while (i < n) {
+            deref buf[i] = 91;
+            deref buf[n + i] = 93;
+            i += 1;
+        }
+        var total: i64 = (n * 2) as i64;
+        agree(buf, total, 0, 0, "nested default");
+        agree(buf, total, 2, 0, "nested max_depth 2");
+        agree(buf, total, 600, 0, "nested max_depth 600");
+        agree(buf, total, 100000, 0, "nested max_depth clamped");
+        k += 1;
+    }
+    mem_free(buf, 5000);
+}
+
+// ---- random JSON ---------------------------------------------------------------------
+
+fun put(buf: ptr<u8>, at: i64, c: u8) -> i64 {
+    deref buf[at] = c;
+    return at + 1;
+}
+
+fun put_str(buf: ptr<u8>, at: i64, s: str) -> i64 {
+    var p: ptr<u8> = s as ptr<u8>;
+    var i: i64 = 0;
+    var n: i64 = at;
+    while (p[i] != 0) {
+        deref buf[n] = p[i];
+        n += 1;
+        i += 1;
+    }
+    return n;
+}
+
+fun put_ws(buf: ptr<u8>, at: i64, flags: u32) -> i64 {
+    var n: i64 = at;
+    var k: u64 = below(6);
+    if (k == 0) {
+        n = put(buf, n, 32);
+    } else if (k == 1) {
+        n = put(buf, n, 10);
+    } else if (k == 2) {
+        n = put_str(buf, n, " \t\r\n");
+    } else if (k == 3 && (flags & 2) != 0) {
+        n = put_str(buf, n, "/* c */");
+    } else if (k == 4 && (flags & 2) != 0) {
+        n = put_str(buf, n, "// c\n");
+    }
+    return n;
+}
+
+fun put_string(buf: ptr<u8>, at: i64) -> i64 {
+    var n: i64 = put(buf, at, 34);
+    var len: u64 = below(12);
+    var i: u64 = 0;
+    while (i < len) {
+        var k: u64 = below(14);
+        if (k < 6) {
+            n = put(buf, n, (97 + below(26)) as u8);
+        } else if (k == 6) {
+            n = put_str(buf, n, "\\n");
+        } else if (k == 7) {
+            n = put_str(buf, n, "\\\"");
+        } else if (k == 8) {
+            n = put_str(buf, n, "\\\\");
+        } else if (k == 9) {
+            n = put_str(buf, n, "\\u00e9");
+        } else if (k == 10) {
+            n = put_str(buf, n, "\\ud83d\\ude00");
+        } else if (k == 11) {
+            n = put_str(buf, n, "é");
+        } else if (k == 12) {
+            n = put_str(buf, n, "😀");
+        } else {
+            n = put_str(buf, n, "\\u0000");
+        }
+        i += 1;
+    }
+    return put(buf, n, 34);
+}
+
+fun put_number(buf: ptr<u8>, at: i64) -> i64 {
+    var n: i64 = at;
+    if (below(3) == 0) {
+        n = put(buf, n, 45);
+    }
+    if (below(5) == 0) {
+        n = put(buf, n, 48);
+    } else {
+        n = put(buf, n, (49 + below(9)) as u8);
+        var d: u64 = below(8);
+        while (d > 0) {
+            n = put(buf, n, (48 + below(10)) as u8);
+            d -= 1;
+        }
+    }
+    if (below(3) == 0) {
+        n = put(buf, n, 46);
+        var f: u64 = 1 + below(6);
+        while (f > 0) {
+            n = put(buf, n, (48 + below(10)) as u8);
+            f -= 1;
+        }
+    }
+    if (below(4) == 0) {
+        n = put(buf, n, 101);
+        if (below(2) == 0) {
+            n = put(buf, n, 45);
+        } else if (below(2) == 0) {
+            n = put(buf, n, 43);
+        }
+        n = put(buf, n, (48 + below(10)) as u8);
+        if (below(2) == 0) {
+            n = put(buf, n, (48 + below(10)) as u8);
+        }
+    }
+    return n;
+}
+
+fun put_value(buf: ptr<u8>, at: i64, depth: i32, flags: u32) -> i64 {
+    var n: i64 = at;
+    var k: u64 = below(10);
+    if (depth >= 6 && k >= 6) {
+        k = below(6);
+    }
+    if (k == 0) {
+        return put_str(buf, n, "null");
+    }
+    if (k == 1) {
+        if (below(2) == 0) {
+            return put_str(buf, n, "true");
+        }
+        return put_str(buf, n, "false");
+    }
+    if (k == 2 || k == 3) {
+        return put_number(buf, n);
+    }
+    if (k == 4 || k == 5) {
+        return put_string(buf, n);
+    }
+    var arr: bool = k < 8;
+    if (arr) {
+        n = put(buf, n, 91);
+    } else {
+        n = put(buf, n, 123);
+    }
+    var count: u64 = below(5);
+    var i: u64 = 0;
+    while (i < count) {
+        n = put_ws(buf, n, flags);
+        if (!arr) {
+            n = put_string(buf, n);
+            n = put_ws(buf, n, flags);
+            n = put(buf, n, 58);
+            n = put_ws(buf, n, flags);
+        }
+        n = put_value(buf, n, depth + 1, flags);
+        n = put_ws(buf, n, flags);
+        if (i + 1 < count) {
+            n = put(buf, n, 44);
+        } else if ((flags & 1) != 0 && below(2) == 0) {
+            n = put(buf, n, 44);
+        }
+        i += 1;
+    }
+    n = put_ws(buf, n, flags);
+    if (arr) {
+        return put(buf, n, 93);
+    }
+    return put(buf, n, 125);
+}
+
+fun test_random(iters: i32) {
+    var buf: ptr<u8> = mem_alloc(65536);
+    var i: i32 = 0;
+    while (i < iters) {
+        var flags: u32 = below(4) as u32;
+        var n: i64 = put_ws(buf, 0, flags);
+        n = put_value(buf, n, 0, flags);
+        n = put_ws(buf, n, flags);
+        var depth: i32 = 0;
+        var dk: u64 = below(6);
+        if (dk == 0) {
+            depth = 3;
+        } else if (dk == 1) {
+            depth = 1;
+        }
+        // Valid (or relaxed) document as generated.
+        agree(buf, n, depth, flags, "random valid");
+        // Then damaged in a few ways.
+        var damage: u64 = below(7);
+        if (damage == 0 && n > 0) {
+            deref buf[below(n as u64) as i64] = below(256) as u8;                 // random byte
+        } else if (damage == 1 && n > 0) {
+            n = below(n as u64) as i64;                                            // truncate
+        } else if (damage == 2 && n > 0) {
+            var at: i64 = below(n as u64) as i64;                                  // delete a byte
+            var j: i64 = at;
+            while (j + 1 < n) {
+                deref buf[j] = buf[j + 1];
+                j += 1;
+            }
+            n -= 1;
+        } else if (damage == 3 && n > 0) {
+            var at2: i64 = below((n + 1) as u64) as i64;                           // insert a byte
+            var j2: i64 = n;
+            while (j2 > at2) {
+                deref buf[j2] = buf[j2 - 1];
+                j2 -= 1;
+            }
+            var pool: str = "{}[],:\"\\/*-+.eE0aunl \n\x01\x80\xff";
+            var pp: ptr<u8> = pool as ptr<u8>;
+            deref buf[at2] = pp[below(len_of(pool) as u64) as i64];
+            n += 1;
+        } else if (damage == 4) {
+            n = below(40) as i64;                                                  // pure noise
+            var m: i64 = 0;
+            while (m < n) {
+                deref buf[m] = below(256) as u8;
+                m += 1;
+            }
+        }
+        agree(buf, n, depth, flags, "random damaged");
+        i += 1;
+    }
+    mem_free(buf, 65536);
+}
+
+fun main() -> i32 {
+    var iters: i32 = 5000;
+    var p: ptr<u8> = c_getenv("WJSON_FUZZ_ITERS" as ptr<u8>);
+    if (p != null) {
+        var x: i32 = 0;
+        var k: i64 = 0;
+        while (p[k] >= 48 && p[k] <= 57) {
+            x = x * 10 + ((p[k] - 48) as i32);
+            k += 1;
+        }
+        if (x > 0) {
+            iters = x;
+        }
+    }
+    // Bad arguments.
+    var d: CoreDoc = core_parse(null, 4, 0, 0);
+    var r: ptr<u8> = ffi_parse(null, 4, 0, 0);
+    check(d.err_code == ffi_error_code(r) && d.err_offset == ffi_error_offset(r) && d.err_line == ffi_error_line(r) && d.err_column == ffi_error_column(r), "null source");
+    ffi_free(r);
+    core_doc_release(&d);
+    d = core_parse("x" as ptr<u8>, 0 - 1, 0, 0);
+    r = ffi_parse("x" as ptr<u8>, 0 - 1, 0, 0);
+    check(d.err_code == ffi_error_code(r) && d.err_offset == ffi_error_offset(r), "negative length");
+    ffi_free(r);
+    core_doc_release(&d);
+    agree(null, 0, 0, 0, "null source, length 0");
+
+    test_fixed();
+    test_depth();
+    test_random(iters);
+    println("core_parse_test: {}/{} checks passed", CHECKS - FAILURES, CHECKS);
+    if (FAILURES != 0) {
+        println("core_parse_test: {} FAILED", FAILURES);
+        return 1;
+    }
+    return 0;
+}

@@ -1,0 +1,395 @@
+// SPDX-License-Identifier: MPL-2.0
+//
+// Flat, index-based document model in pure Wave (a port of core/src/dom.rs).
+//
+// Every value is a node addressed by an integer id. Node fields live in
+// parallel arrays; containers keep their children in shared side tables
+// (`elems` for arrays, the `m*` arrays for object members), so a parsed
+// document is a handful of buffers and no per-node allocation. Ids are stable
+// for the life of the document.
+
+// The document grows many buffers, so it uses the C library's malloc family:
+// Wave's std allocator maps fresh pages (one system call) for every allocation.
+extern(c, "malloc") fun c_malloc(size: i64) -> ptr<u8>;
+extern(c, "realloc") fun c_realloc(p: ptr<u8>, size: i64) -> ptr<u8>;
+extern(c, "free") fun c_free(p: ptr<u8>);
+
+pub fun core_alloc(size: i64) -> ptr<u8> { return c_malloc(size); }
+pub fun core_realloc(p: ptr<u8>, size: i64) -> ptr<u8> { return c_realloc(p, size); }
+pub fun core_free(p: ptr<u8>) { c_free(p); }
+
+pub const CORE_NULL: i32 = 0;
+pub const CORE_BOOL: i32 = 1;
+pub const CORE_NUMBER: i32 = 2;
+pub const CORE_STRING: i32 = 3;
+pub const CORE_ARRAY: i32 = 4;
+pub const CORE_OBJECT: i32 = 5;
+
+// Number flag: lexeme has no fraction and no exponent.
+pub const CORE_NUM_INTEGER: u8 = 1;
+// Number flag: lexeme starts with '-'.
+pub const CORE_NUM_NEGATIVE: u8 = 2;
+
+// Parent markers.
+pub const CORE_PARENT_ROOT: i32 = -2;
+pub const CORE_PARENT_NONE: i32 = -1;
+
+pub const CORE_NO_NODE: i32 = -1;
+
+pub struct CoreDoc {
+    kinds: ptr<u8>;
+    flags: ptr<u8>;      // bool value, or CORE_NUM_* flags for numbers
+    starts: ptr<u32>;    // string/number: offset into bytes; array: into elems; object: into members
+    lens: ptr<u32>;      // string/number: byte length (without the NUL); containers: child count
+    parents: ptr<i32>;
+    node_count: i64;
+    node_cap: i64;
+
+    elems: ptr<u32>;
+    elem_count: i64;
+    elem_cap: i64;
+
+    mkey_start: ptr<u32>;
+    mkey_len: ptr<u32>;
+    mvalue: ptr<u32>;
+    member_count: i64;
+    member_cap: i64;
+
+    // Decoded strings and raw number lexemes, each followed by a NUL so the
+    // Wave side can treat them as `str` without copying.
+    bytes: ptr<u8>;
+    byte_len: i64;
+    byte_cap: i64;
+
+    root: i64;           // -1 when there is no root
+    err_code: i32;       // 0 when the document is ok
+    err_offset: i64;
+    err_line: i64;
+    err_column: i64;
+}
+
+pub fun core_doc_empty() -> CoreDoc {
+    return CoreDoc {
+        kinds: null, flags: null, starts: null, lens: null, parents: null,
+        node_count: 0, node_cap: 0,
+        elems: null, elem_count: 0, elem_cap: 0,
+        mkey_start: null, mkey_len: null, mvalue: null, member_count: 0, member_cap: 0,
+        bytes: null, byte_len: 0, byte_cap: 0,
+        root: 0 - 1,
+        err_code: 0, err_offset: 0, err_line: 0, err_column: 0,
+    };
+}
+
+// Releases every buffer and leaves the document empty (error fields are kept).
+pub fun core_doc_release(d: ptr<CoreDoc>) {
+    var nc: i64 = deref d.node_cap;
+    if (deref d.kinds != null) { c_free(deref d.kinds); }
+    if (deref d.flags != null) { c_free(deref d.flags); }
+    if (deref d.starts != null) { c_free(deref d.starts as ptr<u8>); }
+    if (deref d.lens != null) { c_free(deref d.lens as ptr<u8>); }
+    if (deref d.parents != null) { c_free(deref d.parents as ptr<u8>); }
+    if (deref d.elems != null) { c_free(deref d.elems as ptr<u8>); }
+    var mc: i64 = deref d.member_cap;
+    if (deref d.mkey_start != null) { c_free(deref d.mkey_start as ptr<u8>); }
+    if (deref d.mkey_len != null) { c_free(deref d.mkey_len as ptr<u8>); }
+    if (deref d.mvalue != null) { c_free(deref d.mvalue as ptr<u8>); }
+    if (deref d.bytes != null) { c_free(deref d.bytes); }
+    deref d.kinds = null;
+    deref d.flags = null;
+    deref d.starts = null;
+    deref d.lens = null;
+    deref d.parents = null;
+    deref d.node_count = 0;
+    deref d.node_cap = 0;
+    deref d.elems = null;
+    deref d.elem_count = 0;
+    deref d.elem_cap = 0;
+    deref d.mkey_start = null;
+    deref d.mkey_len = null;
+    deref d.mvalue = null;
+    deref d.member_count = 0;
+    deref d.member_cap = 0;
+    deref d.bytes = null;
+    deref d.byte_len = 0;
+    deref d.byte_cap = 0;
+    deref d.root = 0 - 1;
+}
+
+fun _regrow(old: ptr<u8>, old_bytes: i64, new_bytes: i64) -> ptr<u8> {
+    return c_realloc(old, new_bytes);
+}
+
+fun _next_cap(cap: i64, min: i64) -> i64 {
+    var c: i64 = cap * 2;
+    if (c < min) {
+        c = min;
+    }
+    return c;
+}
+
+// ---- appending (used while parsing and by edits) ---------------------------------
+
+// Appends raw bytes (no NUL). Returns false when memory runs out.
+pub fun core_bytes_put(d: ptr<CoreDoc>, c: u8) -> bool {
+    var n: i64 = deref d.byte_len;
+    if (n >= deref d.byte_cap) {
+        var cap: i64 = deref d.byte_cap;
+        var nc: i64 = _next_cap(cap, 256);
+        var grown: ptr<u8> = _regrow(deref d.bytes, cap, nc);
+        if (grown == null) {
+            return false;
+        }
+        deref d.bytes = grown;
+        deref d.byte_cap = nc;
+    }
+    var b: ptr<u8> = deref d.bytes;
+    deref b[n] = c;
+    deref d.byte_len = n + 1;
+    return true;
+}
+
+// Appends `n` bytes of `src` followed by a NUL; returns the start offset or -1.
+pub fun core_bytes_push(d: ptr<CoreDoc>, src: ptr<u8>, n: i64) -> i64 {
+    var start: i64 = deref d.byte_len;
+    var i: i64 = 0;
+    while (i < n) {
+        if (!core_bytes_put(d, src[i])) {
+            return 0 - 1;
+        }
+        i += 1;
+    }
+    if (!core_bytes_put(d, 0)) {
+        return 0 - 1;
+    }
+    return start;
+}
+
+// Appends a node; returns its id or -1 when memory runs out.
+pub fun core_node_push(d: ptr<CoreDoc>, kind: u8, flag: u8, start: u32, len: u32) -> i64 {
+    var n: i64 = deref d.node_count;
+    var cap: i64 = deref d.node_cap;
+    if (n >= cap) {
+        var nc: i64 = _next_cap(cap, 64);
+        var k: ptr<u8> = _regrow(deref d.kinds, cap, nc);
+        if (k == null) { return 0 - 1; }
+        deref d.kinds = k;
+        var f: ptr<u8> = _regrow(deref d.flags, cap, nc);
+        if (f == null) { return 0 - 1; }
+        deref d.flags = f;
+        var s: ptr<u8> = _regrow(deref d.starts as ptr<u8>, cap * 4, nc * 4);
+        if (s == null) { return 0 - 1; }
+        deref d.starts = s as ptr<u32>;
+        var l: ptr<u8> = _regrow(deref d.lens as ptr<u8>, cap * 4, nc * 4);
+        if (l == null) { return 0 - 1; }
+        deref d.lens = l as ptr<u32>;
+        var p: ptr<u8> = _regrow(deref d.parents as ptr<u8>, cap * 4, nc * 4);
+        if (p == null) { return 0 - 1; }
+        deref d.parents = p as ptr<i32>;
+        deref d.node_cap = nc;
+    }
+    var kinds: ptr<u8> = deref d.kinds;
+    var flags: ptr<u8> = deref d.flags;
+    var starts: ptr<u32> = deref d.starts;
+    var lens: ptr<u32> = deref d.lens;
+    var parents: ptr<i32> = deref d.parents;
+    deref kinds[n] = kind;
+    deref flags[n] = flag;
+    deref starts[n] = start;
+    deref lens[n] = len;
+    deref parents[n] = CORE_PARENT_NONE;
+    deref d.node_count = n + 1;
+    return n;
+}
+
+// Appends `count` child ids (from `items`) to the element table; returns the
+// start offset or -1.
+pub fun core_elems_push(d: ptr<CoreDoc>, items: ptr<u32>, count: i64) -> i64 {
+    var n: i64 = deref d.elem_count;
+    var cap: i64 = deref d.elem_cap;
+    if (n + count > cap) {
+        var nc: i64 = _next_cap(cap, 64);
+        while (nc < n + count) {
+            nc = nc * 2;
+        }
+        var e: ptr<u8> = _regrow(deref d.elems as ptr<u8>, cap * 4, nc * 4);
+        if (e == null) { return 0 - 1; }
+        deref d.elems = e as ptr<u32>;
+        deref d.elem_cap = nc;
+    }
+    var elems: ptr<u32> = deref d.elems;
+    var i: i64 = 0;
+    while (i < count) {
+        deref elems[n + i] = items[i];
+        i += 1;
+    }
+    deref d.elem_count = n + count;
+    return n;
+}
+
+// Appends `count` members (parallel arrays); returns the start offset or -1.
+pub fun core_members_push(d: ptr<CoreDoc>, key_start: ptr<u32>, key_len: ptr<u32>, value: ptr<u32>, count: i64) -> i64 {
+    var n: i64 = deref d.member_count;
+    var cap: i64 = deref d.member_cap;
+    if (n + count > cap) {
+        var nc: i64 = _next_cap(cap, 64);
+        while (nc < n + count) {
+            nc = nc * 2;
+        }
+        var a: ptr<u8> = _regrow(deref d.mkey_start as ptr<u8>, cap * 4, nc * 4);
+        if (a == null) { return 0 - 1; }
+        deref d.mkey_start = a as ptr<u32>;
+        var b: ptr<u8> = _regrow(deref d.mkey_len as ptr<u8>, cap * 4, nc * 4);
+        if (b == null) { return 0 - 1; }
+        deref d.mkey_len = b as ptr<u32>;
+        var c: ptr<u8> = _regrow(deref d.mvalue as ptr<u8>, cap * 4, nc * 4);
+        if (c == null) { return 0 - 1; }
+        deref d.mvalue = c as ptr<u32>;
+        deref d.member_cap = nc;
+    }
+    var ks: ptr<u32> = deref d.mkey_start;
+    var kl: ptr<u32> = deref d.mkey_len;
+    var mv: ptr<u32> = deref d.mvalue;
+    var i: i64 = 0;
+    while (i < count) {
+        deref ks[n + i] = key_start[i];
+        deref kl[n + i] = key_len[i];
+        deref mv[n + i] = value[i];
+        i += 1;
+    }
+    deref d.member_count = n + count;
+    return n;
+}
+
+// ---- queries (mirror the wj_* accessors; all tolerate bad ids) ---------------------
+
+fun _valid(d: ptr<CoreDoc>, node: i64) -> bool {
+    return node >= 0 && node < deref d.node_count;
+}
+
+pub fun core_root(d: ptr<CoreDoc>) -> i32 {
+    if (deref d.err_code != 0) {
+        return CORE_NO_NODE;
+    }
+    var r: i64 = deref d.root;
+    if (r < 0 || r > 2147483647) {
+        return CORE_NO_NODE;
+    }
+    return r as i32;
+}
+
+// 0 null, 1 bool, 2 number, 3 string, 4 array, 5 object, -1 invalid.
+pub fun core_type(d: ptr<CoreDoc>, node: i32) -> i32 {
+    if (!_valid(d, node as i64)) {
+        return 0 - 1;
+    }
+    var kinds: ptr<u8> = deref d.kinds;
+    return kinds[node] as i32;
+}
+
+// 1 for true, 0 for false, -1 when not a bool.
+pub fun core_bool(d: ptr<CoreDoc>, node: i32) -> i32 {
+    if (core_type(d, node) != CORE_BOOL) {
+        return 0 - 1;
+    }
+    var flags: ptr<u8> = deref d.flags;
+    return flags[node] as i32;
+}
+
+// Element/member count for containers, byte length for strings, -1 otherwise.
+pub fun core_len(d: ptr<CoreDoc>, node: i32) -> i64 {
+    var t: i32 = core_type(d, node);
+    if (t == CORE_ARRAY || t == CORE_OBJECT || t == CORE_STRING) {
+        var lens: ptr<u32> = deref d.lens;
+        return lens[node] as i64;
+    }
+    return 0 - 1;
+}
+
+// Array element or object member value at `index`, or -1.
+pub fun core_at(d: ptr<CoreDoc>, node: i32, index: i64) -> i32 {
+    var t: i32 = core_type(d, node);
+    if (t != CORE_ARRAY && t != CORE_OBJECT) {
+        return CORE_NO_NODE;
+    }
+    var lens: ptr<u32> = deref d.lens;
+    var starts: ptr<u32> = deref d.starts;
+    if (index < 0 || index >= (lens[node] as i64)) {
+        return CORE_NO_NODE;
+    }
+    var at: i64 = (starts[node] as i64) + index;
+    var v: u32 = 0;
+    if (t == CORE_ARRAY) {
+        var elems: ptr<u32> = deref d.elems;
+        v = elems[at];
+    } else {
+        var mv: ptr<u32> = deref d.mvalue;
+        v = mv[at];
+    }
+    if (v > 2147483647) {
+        return CORE_NO_NODE;
+    }
+    return v as i32;
+}
+
+// Object key at `index` (decoded, NUL-terminated), or null. Stores its byte
+// length in `out_len`.
+pub fun core_key(d: ptr<CoreDoc>, node: i32, index: i64, out_len: ptr<i64>) -> ptr<u8> {
+    if (core_type(d, node) != CORE_OBJECT) {
+        if (out_len != null) { deref out_len = 0; }
+        return null;
+    }
+    var lens: ptr<u32> = deref d.lens;
+    var starts: ptr<u32> = deref d.starts;
+    if (index < 0 || index >= (lens[node] as i64)) {
+        if (out_len != null) { deref out_len = 0; }
+        return null;
+    }
+    var at: i64 = (starts[node] as i64) + index;
+    var ks: ptr<u32> = deref d.mkey_start;
+    var kl: ptr<u32> = deref d.mkey_len;
+    if (out_len != null) { deref out_len = kl[at] as i64; }
+    var bytes: ptr<u8> = deref d.bytes;
+    return &bytes[ks[at] as i64];
+}
+
+fun _lexeme(d: ptr<CoreDoc>, node: i32, kind: i32, out_len: ptr<i64>) -> ptr<u8> {
+    if (core_type(d, node) != kind) {
+        if (out_len != null) { deref out_len = 0; }
+        return null;
+    }
+    var lens: ptr<u32> = deref d.lens;
+    var starts: ptr<u32> = deref d.starts;
+    if (out_len != null) { deref out_len = lens[node] as i64; }
+    var bytes: ptr<u8> = deref d.bytes;
+    return &bytes[starts[node] as i64];
+}
+
+// Decoded string bytes (NUL-terminated), or null when not a string.
+pub fun core_str(d: ptr<CoreDoc>, node: i32, out_len: ptr<i64>) -> ptr<u8> {
+    return _lexeme(d, node, CORE_STRING, out_len);
+}
+
+// Raw number lexeme as written in the source (NUL-terminated), or null.
+pub fun core_num(d: ptr<CoreDoc>, node: i32, out_len: ptr<i64>) -> ptr<u8> {
+    return _lexeme(d, node, CORE_NUMBER, out_len);
+}
+
+// 1 when the number has no fraction/exponent, 0 when it does, -1 when not a number.
+pub fun core_num_is_int(d: ptr<CoreDoc>, node: i32) -> i32 {
+    if (core_type(d, node) != CORE_NUMBER) {
+        return 0 - 1;
+    }
+    var flags: ptr<u8> = deref d.flags;
+    if ((flags[node] & CORE_NUM_INTEGER) != 0) {
+        return 1;
+    }
+    return 0;
+}
+
+pub fun core_parent(d: ptr<CoreDoc>, node: i32) -> i32 {
+    if (!_valid(d, node as i64)) {
+        return CORE_NO_NODE;
+    }
+    var parents: ptr<i32> = deref d.parents;
+    return parents[node];
+}

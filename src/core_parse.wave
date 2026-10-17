@@ -1,0 +1,735 @@
+// SPDX-License-Identifier: MPL-2.0
+//
+// Strict RFC 8259 parser with two opt-in relaxations (trailing commas and
+// `//` / `/* */` comments), in pure Wave. A port of core/src/parser.rs and of
+// the string decoder in core/src/stream.rs; error codes, offsets, lines and
+// columns match the Rust parser.
+
+import("./escape")::{esc_utf8_check};
+import("./core_dom")::{
+    CoreDoc, core_doc_empty, core_doc_release, core_bytes_put, core_bytes_push, core_node_push,
+    core_elems_push, core_members_push, core_alloc, core_realloc, core_free,
+    CORE_NULL, CORE_BOOL, CORE_NUMBER, CORE_STRING, CORE_ARRAY, CORE_OBJECT,
+    CORE_NUM_INTEGER, CORE_NUM_NEGATIVE, CORE_PARENT_ROOT,
+};
+
+pub const CORE_OPT_TRAILING_COMMAS: u32 = 1;
+pub const CORE_OPT_COMMENTS: u32 = 2;
+pub const CORE_DEFAULT_MAX_DEPTH: i32 = 512;
+pub const CORE_MAX_DEPTH_LIMIT: i32 = 2048;
+
+// Error codes (the values of JSON_ERR_* in consts.wave).
+pub const CORE_ERR_NONE: i32 = 0;
+pub const CORE_ERR_EMPTY: i32 = 1;
+pub const CORE_ERR_UNEXPECTED_CHAR: i32 = 2;
+pub const CORE_ERR_UNEXPECTED_END: i32 = 3;
+pub const CORE_ERR_INVALID_NUMBER: i32 = 4;
+pub const CORE_ERR_INVALID_STRING: i32 = 5;
+pub const CORE_ERR_INVALID_ESCAPE: i32 = 6;
+pub const CORE_ERR_INVALID_UNICODE: i32 = 7;
+pub const CORE_ERR_CONTROL_CHAR: i32 = 8;
+pub const CORE_ERR_INVALID_UTF8: i32 = 9;
+pub const CORE_ERR_TRAILING_DATA: i32 = 10;
+pub const CORE_ERR_TOO_DEEP: i32 = 11;
+pub const CORE_ERR_TOO_LARGE: i32 = 12;
+pub const CORE_ERR_INVALID_ARGUMENT: i32 = 13;
+
+// Offsets in the parse table must stay below 2^31.
+const MAX_INPUT: i64 = 2147483647;
+
+struct CoreParser {
+    src: ptr<u8>;
+    len: i64;
+    pos: i64;
+    depth: i32;
+    max_depth: i32;
+    options: u32;
+    doc: ptr<CoreDoc>;
+    err_code: i32;
+    err_off: i64;
+    // Shared child stacks: a container pushes its children here and moves
+    // them into the document when it closes.
+    items: ptr<u32>;
+    item_count: i64;
+    item_cap: i64;
+    mkey_start: ptr<u32>;
+    mkey_len: ptr<u32>;
+    mvalue: ptr<u32>;
+    member_count: i64;
+    member_cap: i64;
+}
+
+fun _fail(p: ptr<CoreParser>, code: i32, off: i64) -> i64 {
+    if (deref p.err_code == 0) {
+        deref p.err_code = code;
+        deref p.err_off = off;
+    }
+    return 0 - 1;
+}
+
+fun _failed(p: ptr<CoreParser>) -> bool {
+    return deref p.err_code != 0;
+}
+
+fun _peek(p: ptr<CoreParser>) -> i32 {
+    var pos: i64 = deref p.pos;
+    if (pos >= deref p.len) {
+        return 0 - 1;
+    }
+    var s: ptr<u8> = deref p.src;
+    return s[pos] as i32;
+}
+
+fun _peek_at(p: ptr<CoreParser>, at: i64) -> i32 {
+    if (at >= deref p.len) {
+        return 0 - 1;
+    }
+    var s: ptr<u8> = deref p.src;
+    return s[at] as i32;
+}
+
+// ---- stacks -------------------------------------------------------------------------
+
+fun _items_push(p: ptr<CoreParser>, v: u32) -> bool {
+    var n: i64 = deref p.item_count;
+    var cap: i64 = deref p.item_cap;
+    if (n >= cap) {
+        var nc: i64 = cap * 2;
+        if (nc < 32) { nc = 32; }
+        var g: ptr<u8> = core_realloc(deref p.items as ptr<u8>, nc * 4);
+        if (g == null) { return false; }
+        deref p.items = g as ptr<u32>;
+        deref p.item_cap = nc;
+    }
+    var it: ptr<u32> = deref p.items;
+    deref it[n] = v;
+    deref p.item_count = n + 1;
+    return true;
+}
+
+fun _grow_u32(old: ptr<u32>, cap: i64, nc: i64) -> ptr<u32> {
+    return core_realloc(old as ptr<u8>, nc * 4) as ptr<u32>;
+}
+
+fun _members_push(p: ptr<CoreParser>, ks: u32, kl: u32, v: u32) -> bool {
+    var n: i64 = deref p.member_count;
+    var cap: i64 = deref p.member_cap;
+    if (n >= cap) {
+        var nc: i64 = cap * 2;
+        if (nc < 32) { nc = 32; }
+        var a: ptr<u32> = _grow_u32(deref p.mkey_start, cap, nc);
+        if (a == null) { return false; }
+        deref p.mkey_start = a;
+        var b: ptr<u32> = _grow_u32(deref p.mkey_len, cap, nc);
+        if (b == null) { return false; }
+        deref p.mkey_len = b;
+        var c: ptr<u32> = _grow_u32(deref p.mvalue, cap, nc);
+        if (c == null) { return false; }
+        deref p.mvalue = c;
+        deref p.member_cap = nc;
+    }
+    var xs: ptr<u32> = deref p.mkey_start;
+    var xl: ptr<u32> = deref p.mkey_len;
+    var xv: ptr<u32> = deref p.mvalue;
+    deref xs[n] = ks;
+    deref xl[n] = kl;
+    deref xv[n] = v;
+    deref p.member_count = n + 1;
+    return true;
+}
+
+// ---- whitespace and comments --------------------------------------------------------
+
+fun _skip_comment(p: ptr<CoreParser>) -> bool {
+    var start: i64 = deref p.pos;
+    var next: i32 = _peek_at(p, start + 1);
+    if (next == 47) {  // "//"
+        deref p.pos = start + 2;
+        while (_peek(p) >= 0) {
+            var b: i32 = _peek(p);
+            deref p.pos = deref p.pos + 1;
+            if (b == 10) {
+                break;
+            }
+        }
+        return true;
+    }
+    if (next == 42) {  // "/*"
+        deref p.pos = start + 2;
+        while (true) {
+            var b: i32 = _peek(p);
+            if (b < 0) {
+                _fail(p, CORE_ERR_UNEXPECTED_END, start);
+                return false;
+            }
+            if (b == 42 && _peek_at(p, deref p.pos + 1) == 47) {
+                deref p.pos = deref p.pos + 2;
+                return true;
+            }
+            deref p.pos = deref p.pos + 1;
+        }
+    }
+    _fail(p, CORE_ERR_UNEXPECTED_CHAR, start);
+    return false;
+}
+
+fun _skip_ws(p: ptr<CoreParser>) -> bool {
+    while (true) {
+        var b: i32 = _peek(p);
+        if (b == 32 || b == 9 || b == 10 || b == 13) {
+            deref p.pos = deref p.pos + 1;
+        } else if (b == 47 && (deref p.options & CORE_OPT_COMMENTS) != 0) {
+            if (!_skip_comment(p)) {
+                return false;
+            }
+        } else {
+            return true;
+        }
+    }
+    return true;
+}
+
+// ---- strings --------------------------------------------------------------------------
+
+// Four hex digits at raw[at..at+4] (raw has n bytes), or -1.
+fun _hex4(raw: ptr<u8>, n: i64, at: i64) -> i64 {
+    if (at + 4 > n) {
+        return 0 - 1;
+    }
+    var v: i64 = 0;
+    var i: i64 = 0;
+    while (i < 4) {
+        var b: u8 = raw[at + i];
+        var d: i64 = 0;
+        if (b >= 48 && b <= 57) {
+            d = (b - 48) as i64;
+        } else if (b >= 97 && b <= 102) {
+            d = (b - 87) as i64;
+        } else if (b >= 65 && b <= 70) {
+            d = (b - 55) as i64;
+        } else {
+            return 0 - 1;
+        }
+        v = v * 16 + d;
+        i += 1;
+    }
+    return v;
+}
+
+// Appends the UTF-8 encoding of `code` (a valid scalar value).
+fun _put_utf8(doc: ptr<CoreDoc>, code: i64) -> bool {
+    if (code < 128) {
+        return core_bytes_put(doc, code as u8);
+    }
+    if (code < 2048) {
+        return core_bytes_put(doc, (192 | (code >> 6)) as u8) && core_bytes_put(doc, (128 | (code & 63)) as u8);
+    }
+    if (code < 65536) {
+        return core_bytes_put(doc, (224 | (code >> 12)) as u8)
+            && core_bytes_put(doc, (128 | ((code >> 6) & 63)) as u8)
+            && core_bytes_put(doc, (128 | (code & 63)) as u8);
+    }
+    return core_bytes_put(doc, (240 | (code >> 18)) as u8)
+        && core_bytes_put(doc, (128 | ((code >> 12) & 63)) as u8)
+        && core_bytes_put(doc, (128 | ((code >> 6) & 63)) as u8)
+        && core_bytes_put(doc, (128 | (code & 63)) as u8);
+}
+
+// Decodes the content between the quotes (already valid UTF-8) into the
+// document's byte table. Errors carry offsets relative to the document source:
+// `base` is the offset of raw[0].
+fun _decode(p: ptr<CoreParser>, raw: ptr<u8>, n: i64, base: i64) -> bool {
+    var doc: ptr<CoreDoc> = deref p.doc;
+    var i: i64 = 0;
+    while (i < n) {
+        // Copy the run up to the next backslash or control character.
+        while (i < n && raw[i] != 92 && raw[i] >= 32) {
+            if (!core_bytes_put(doc, raw[i])) {
+                _fail(p, CORE_ERR_TOO_LARGE, base + i);
+                return false;
+            }
+            i += 1;
+        }
+        if (i == n) {
+            break;
+        }
+        if (raw[i] < 32) {
+            _fail(p, CORE_ERR_CONTROL_CHAR, base + i);
+            return false;
+        }
+        if (i + 1 >= n) {
+            _fail(p, CORE_ERR_INVALID_ESCAPE, base + i);
+            return false;
+        }
+        var esc: u8 = raw[i + 1];
+        var simple: i32 = 0 - 1;
+        if (esc == 34) { simple = 34; }
+        else if (esc == 92) { simple = 92; }
+        else if (esc == 47) { simple = 47; }
+        else if (esc == 98) { simple = 8; }
+        else if (esc == 102) { simple = 12; }
+        else if (esc == 110) { simple = 10; }
+        else if (esc == 114) { simple = 13; }
+        else if (esc == 116) { simple = 9; }
+        else if (esc != 117) {
+            _fail(p, CORE_ERR_INVALID_ESCAPE, base + i);
+            return false;
+        }
+        if (simple >= 0) {
+            if (!core_bytes_put(doc, simple as u8)) {
+                _fail(p, CORE_ERR_TOO_LARGE, base + i);
+                return false;
+            }
+            i += 2;
+            continue;
+        }
+        var hi: i64 = _hex4(raw, n, i + 2);
+        if (hi < 0) {
+            _fail(p, CORE_ERR_INVALID_UNICODE, base + i);
+            return false;
+        }
+        var used: i64 = 6;
+        var code: i64 = hi;
+        if (hi >= 55296 && hi < 56320) {
+            if (i + 7 >= n || raw[i + 6] != 92 || raw[i + 7] != 117) {
+                _fail(p, CORE_ERR_INVALID_UNICODE, base + i);
+                return false;
+            }
+            var lo: i64 = _hex4(raw, n, i + 8);
+            if (lo < 56320 || lo >= 57344) {
+                _fail(p, CORE_ERR_INVALID_UNICODE, base + i);
+                return false;
+            }
+            used = 12;
+            code = 65536 + ((hi - 55296) << 10) + (lo - 56320);
+        } else if (hi >= 56320 && hi < 57344) {
+            _fail(p, CORE_ERR_INVALID_UNICODE, base + i);
+            return false;
+        }
+        if (!_put_utf8(doc, code)) {
+            _fail(p, CORE_ERR_TOO_LARGE, base + i);
+            return false;
+        }
+        i += used;
+    }
+    return true;
+}
+
+// Parses the string at `pos` (which holds '"'), stores the decoded bytes in the
+// document and reports (offset, length) through the out parameters.
+fun _string(p: ptr<CoreParser>, out_start: ptr<u32>, out_len: ptr<u32>) -> bool {
+    var open: i64 = deref p.pos;
+    var src: ptr<u8> = deref p.src;
+    var len: i64 = deref p.len;
+    // Find the closing quote, skipping escaped characters.
+    var i: i64 = open + 1;
+    while (true) {
+        if (i >= len) {
+            _fail(p, CORE_ERR_UNEXPECTED_END, open);
+            return false;
+        }
+        var c: u8 = src[i];
+        if (c == 34) {
+            break;
+        }
+        if (c == 92) {
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    var n: i64 = i - open - 1;
+    var raw: ptr<u8> = &src[open + 1];
+    var bad: i64 = esc_utf8_check(raw, n);
+    if (bad >= 0) {
+        _fail(p, CORE_ERR_INVALID_UTF8, open + 1 + bad);
+        return false;
+    }
+    var doc: ptr<CoreDoc> = deref p.doc;
+    var start: i64 = deref doc.byte_len;
+    if (!_decode(p, raw, n, open + 1)) {
+        return false;
+    }
+    var stored: i64 = deref doc.byte_len - start;
+    if (!core_bytes_put(doc, 0)) {
+        _fail(p, CORE_ERR_TOO_LARGE, open);
+        return false;
+    }
+    deref p.pos = i + 1;
+    deref out_start = start as u32;
+    deref out_len = stored as u32;
+    return true;
+}
+
+// ---- numbers and literals --------------------------------------------------------------
+
+fun _digits(p: ptr<CoreParser>, at: i64) -> i64 {
+    var i: i64 = at;
+    var len: i64 = deref p.len;
+    var src: ptr<u8> = deref p.src;
+    while (i < len && src[i] >= 48 && src[i] <= 57) {
+        i += 1;
+    }
+    return i;
+}
+
+fun _number(p: ptr<CoreParser>) -> i64 {
+    var start: i64 = deref p.pos;
+    var src: ptr<u8> = deref p.src;
+    var i: i64 = start;
+    var flag: u8 = CORE_NUM_INTEGER;
+    if (_peek_at(p, i) == 45) {
+        flag = flag | CORE_NUM_NEGATIVE;
+        i += 1;
+    }
+    var c: i32 = _peek_at(p, i);
+    if (c == 48) {
+        i += 1;
+        var d: i32 = _peek_at(p, i);
+        if (d >= 48 && d <= 57) {
+            return _fail(p, CORE_ERR_INVALID_NUMBER, i);
+        }
+    } else if (c >= 49 && c <= 57) {
+        i = _digits(p, i);
+    } else if (c < 0) {
+        return _fail(p, CORE_ERR_UNEXPECTED_END, i);
+    } else {
+        return _fail(p, CORE_ERR_INVALID_NUMBER, i);
+    }
+    if (_peek_at(p, i) == 46) {
+        i += 1;
+        flag = flag & (255 - CORE_NUM_INTEGER);
+        var j: i64 = _digits(p, i);
+        if (j == i) {
+            return _fail(p, CORE_ERR_INVALID_NUMBER, i);
+        }
+        i = j;
+    }
+    var e: i32 = _peek_at(p, i);
+    if (e == 101 || e == 69) {
+        i += 1;
+        flag = flag & (255 - CORE_NUM_INTEGER);
+        var sg: i32 = _peek_at(p, i);
+        if (sg == 43 || sg == 45) {
+            i += 1;
+        }
+        var j2: i64 = _digits(p, i);
+        if (j2 == i) {
+            return _fail(p, CORE_ERR_INVALID_NUMBER, i);
+        }
+        i = j2;
+    }
+    deref p.pos = i;
+    var doc: ptr<CoreDoc> = deref p.doc;
+    var s: i64 = core_bytes_push(doc, &src[start], i - start);
+    if (s < 0) {
+        return _fail(p, CORE_ERR_TOO_LARGE, start);
+    }
+    var id: i64 = core_node_push(doc, CORE_NUMBER as u8, flag, s as u32, (i - start) as u32);
+    if (id < 0) {
+        return _fail(p, CORE_ERR_TOO_LARGE, start);
+    }
+    return id;
+}
+
+fun _literal(p: ptr<CoreParser>, word: str, wlen: i64, kind: i32, flag: u8) -> i64 {
+    var w: ptr<u8> = word as ptr<u8>;
+    var pos: i64 = deref p.pos;
+    var len: i64 = deref p.len;
+    var src: ptr<u8> = deref p.src;
+    var end: i64 = pos + wlen;
+    if (end > len) {
+        // A truncated prefix of the word is "unexpected end"; anything else is a bad character.
+        var k: i64 = 0;
+        while (pos + k < len) {
+            if (src[pos + k] != w[k]) {
+                return _fail(p, CORE_ERR_UNEXPECTED_CHAR, pos);
+            }
+            k += 1;
+        }
+        return _fail(p, CORE_ERR_UNEXPECTED_END, len);
+    }
+    var i: i64 = 0;
+    while (i < wlen) {
+        if (src[pos + i] != w[i]) {
+            return _fail(p, CORE_ERR_UNEXPECTED_CHAR, pos);
+        }
+        i += 1;
+    }
+    deref p.pos = end;
+    var id: i64 = core_node_push(deref p.doc, kind as u8, flag, 0, 0);
+    if (id < 0) {
+        return _fail(p, CORE_ERR_TOO_LARGE, pos);
+    }
+    return id;
+}
+
+// ---- containers -------------------------------------------------------------------------
+
+fun _enter(p: ptr<CoreParser>) -> bool {
+    deref p.depth = deref p.depth + 1;
+    if (deref p.depth > deref p.max_depth) {
+        _fail(p, CORE_ERR_TOO_DEEP, deref p.pos);
+        return false;
+    }
+    return true;
+}
+
+fun _array(p: ptr<CoreParser>) -> i64 {
+    if (!_enter(p)) {
+        return 0 - 1;
+    }
+    deref p.pos = deref p.pos + 1;  // '['
+    var base: i64 = deref p.item_count;
+    if (!_skip_ws(p)) { return 0 - 1; }
+    if (_peek(p) == 93) {
+        deref p.pos = deref p.pos + 1;
+    } else {
+        while (true) {
+            var v: i64 = _value(p);
+            if (v < 0) { return 0 - 1; }
+            if (!_items_push(p, v as u32)) { return _fail(p, CORE_ERR_TOO_LARGE, deref p.pos); }
+            if (!_skip_ws(p)) { return 0 - 1; }
+            var c: i32 = _peek(p);
+            if (c == 44) {
+                deref p.pos = deref p.pos + 1;
+                if (!_skip_ws(p)) { return 0 - 1; }
+                if (_peek(p) == 93 && (deref p.options & CORE_OPT_TRAILING_COMMAS) != 0) {
+                    deref p.pos = deref p.pos + 1;
+                    break;
+                }
+            } else if (c == 93) {
+                deref p.pos = deref p.pos + 1;
+                break;
+            } else if (c < 0) {
+                return _fail(p, CORE_ERR_UNEXPECTED_END, deref p.pos);
+            } else {
+                return _fail(p, CORE_ERR_UNEXPECTED_CHAR, deref p.pos);
+            }
+        }
+    }
+    deref p.depth = deref p.depth - 1;
+    var doc: ptr<CoreDoc> = deref p.doc;
+    var items: ptr<u32> = deref p.items;
+    var count: i64 = deref p.item_count - base;
+    var start: i64 = 0;
+    if (count > 0) {
+        start = core_elems_push(doc, &items[base], count);
+        if (start < 0) { return _fail(p, CORE_ERR_TOO_LARGE, deref p.pos); }
+    } else {
+        start = deref doc.elem_count;
+    }
+    var id: i64 = core_node_push(doc, CORE_ARRAY as u8, 0, start as u32, count as u32);
+    if (id < 0) { return _fail(p, CORE_ERR_TOO_LARGE, deref p.pos); }
+    var parents: ptr<i32> = deref doc.parents;
+    var k: i64 = 0;
+    while (k < count) {
+        var child: u32 = items[base + k];
+        deref parents[child] = id as i32;
+        k += 1;
+    }
+    deref p.item_count = base;
+    return id;
+}
+
+fun _object(p: ptr<CoreParser>) -> i64 {
+    if (!_enter(p)) {
+        return 0 - 1;
+    }
+    deref p.pos = deref p.pos + 1;  // '{'
+    var base: i64 = deref p.member_count;
+    if (!_skip_ws(p)) { return 0 - 1; }
+    if (_peek(p) == 125) {
+        deref p.pos = deref p.pos + 1;
+    } else {
+        while (true) {
+            var c0: i32 = _peek(p);
+            if (c0 < 0) {
+                return _fail(p, CORE_ERR_UNEXPECTED_END, deref p.pos);
+            }
+            if (c0 != 34) {
+                return _fail(p, CORE_ERR_UNEXPECTED_CHAR, deref p.pos);
+            }
+            var key_start: u32 = 0;
+            var key_len: u32 = 0;
+            if (!_string(p, &key_start, &key_len)) { return 0 - 1; }
+            if (!_skip_ws(p)) { return 0 - 1; }
+            var colon: i32 = _peek(p);
+            if (colon == 58) {
+                deref p.pos = deref p.pos + 1;
+            } else if (colon < 0) {
+                return _fail(p, CORE_ERR_UNEXPECTED_END, deref p.pos);
+            } else {
+                return _fail(p, CORE_ERR_UNEXPECTED_CHAR, deref p.pos);
+            }
+            if (!_skip_ws(p)) { return 0 - 1; }
+            var v: i64 = _value(p);
+            if (v < 0) { return 0 - 1; }
+            if (!_members_push(p, key_start, key_len, v as u32)) {
+                return _fail(p, CORE_ERR_TOO_LARGE, deref p.pos);
+            }
+            if (!_skip_ws(p)) { return 0 - 1; }
+            var c: i32 = _peek(p);
+            if (c == 44) {
+                deref p.pos = deref p.pos + 1;
+                if (!_skip_ws(p)) { return 0 - 1; }
+                if (_peek(p) == 125 && (deref p.options & CORE_OPT_TRAILING_COMMAS) != 0) {
+                    deref p.pos = deref p.pos + 1;
+                    break;
+                }
+            } else if (c == 125) {
+                deref p.pos = deref p.pos + 1;
+                break;
+            } else if (c < 0) {
+                return _fail(p, CORE_ERR_UNEXPECTED_END, deref p.pos);
+            } else {
+                return _fail(p, CORE_ERR_UNEXPECTED_CHAR, deref p.pos);
+            }
+        }
+    }
+    deref p.depth = deref p.depth - 1;
+    var doc: ptr<CoreDoc> = deref p.doc;
+    var count: i64 = deref p.member_count - base;
+    var xs: ptr<u32> = deref p.mkey_start;
+    var xl: ptr<u32> = deref p.mkey_len;
+    var xv: ptr<u32> = deref p.mvalue;
+    var start: i64 = 0;
+    if (count > 0) {
+        start = core_members_push(doc, &xs[base], &xl[base], &xv[base], count);
+        if (start < 0) { return _fail(p, CORE_ERR_TOO_LARGE, deref p.pos); }
+    } else {
+        start = deref doc.member_count;
+    }
+    var id: i64 = core_node_push(doc, CORE_OBJECT as u8, 0, start as u32, count as u32);
+    if (id < 0) { return _fail(p, CORE_ERR_TOO_LARGE, deref p.pos); }
+    var parents: ptr<i32> = deref doc.parents;
+    var k: i64 = 0;
+    while (k < count) {
+        var child: u32 = xv[base + k];
+        deref parents[child] = id as i32;
+        k += 1;
+    }
+    deref p.member_count = base;
+    return id;
+}
+
+fun _value(p: ptr<CoreParser>) -> i64 {
+    var c: i32 = _peek(p);
+    if (c < 0) {
+        return _fail(p, CORE_ERR_UNEXPECTED_END, deref p.pos);
+    }
+    if (c == 123) { return _object(p); }
+    if (c == 91) { return _array(p); }
+    if (c == 34) {
+        var start: u32 = 0;
+        var len: u32 = 0;
+        var at: i64 = deref p.pos;
+        if (!_string(p, &start, &len)) { return 0 - 1; }
+        var id: i64 = core_node_push(deref p.doc, CORE_STRING as u8, 0, start, len);
+        if (id < 0) { return _fail(p, CORE_ERR_TOO_LARGE, at); }
+        return id;
+    }
+    if (c == 116) { return _literal(p, "true", 4, CORE_BOOL, 1); }
+    if (c == 102) { return _literal(p, "false", 5, CORE_BOOL, 0); }
+    if (c == 110) { return _literal(p, "null", 4, CORE_NULL, 0); }
+    if (c == 45 || (c >= 48 && c <= 57)) { return _number(p); }
+    return _fail(p, CORE_ERR_UNEXPECTED_CHAR, deref p.pos);
+}
+
+// ---- entry point ----------------------------------------------------------------------------
+
+// Fills the error fields: line (1-based) and column (1-based, in code points).
+fun _error_position(d: ptr<CoreDoc>, src: ptr<u8>, len: i64, code: i32, offset: i64) {
+    var off: i64 = offset;
+    if (off > len) {
+        off = len;
+    }
+    var line: i64 = 1;
+    var line_start: i64 = 0;
+    var i: i64 = 0;
+    while (i < off) {
+        if (src[i] == 10) {
+            line += 1;
+            line_start = i + 1;
+        }
+        i += 1;
+    }
+    var column: i64 = 1;
+    var k: i64 = line_start;
+    while (k < off) {
+        if ((src[k] & 192) != 128) {
+            column += 1;
+        }
+        k += 1;
+    }
+    deref d.err_code = code;
+    deref d.err_offset = off;
+    deref d.err_line = line;
+    deref d.err_column = column;
+}
+
+// Parses `len` bytes. `max_depth` 0 selects the default; larger values are
+// clamped to CORE_MAX_DEPTH_LIMIT. On failure the returned document is empty
+// and carries the error (code, offset, line, column).
+pub fun core_parse(src: ptr<u8>, len: i64, max_depth: i32, flags: u32) -> CoreDoc {
+    var doc: CoreDoc = core_doc_empty();
+    if (len < 0 || (len > 0 && src == null)) {
+        doc.err_code = CORE_ERR_INVALID_ARGUMENT;
+        doc.err_offset = 0;
+        doc.err_line = 1;
+        doc.err_column = 1;
+        return doc;
+    }
+    if (len >= MAX_INPUT) {
+        _error_position(&doc, src, len, CORE_ERR_TOO_LARGE, 0);
+        return doc;
+    }
+    var depth: i32 = CORE_DEFAULT_MAX_DEPTH;
+    if (max_depth > 0) {
+        depth = max_depth;
+        if (depth > CORE_MAX_DEPTH_LIMIT) {
+            depth = CORE_MAX_DEPTH_LIMIT;
+        }
+    }
+    var start: i64 = 0;
+    if (len >= 3 && src[0] == 239 && src[1] == 187 && src[2] == 191) {
+        start = 3;  // skip a UTF-8 BOM
+    }
+    var p: CoreParser = CoreParser {
+        src: src, len: len, pos: start, depth: 0, max_depth: depth, options: flags,
+        doc: &doc, err_code: 0, err_off: 0,
+        items: null, item_count: 0, item_cap: 0,
+        mkey_start: null, mkey_len: null, mvalue: null, member_count: 0, member_cap: 0,
+    };
+    var root: i64 = 0 - 1;
+    if (_skip_ws(&p)) {
+        if (p.pos >= len) {
+            _fail(&p, CORE_ERR_EMPTY, p.pos);
+        } else {
+            root = _value(&p);
+            if (root >= 0 && _skip_ws(&p)) {
+                if (p.pos < len) {
+                    _fail(&p, CORE_ERR_TRAILING_DATA, p.pos);
+                }
+            }
+        }
+    }
+    if (p.items != null) { core_free(p.items as ptr<u8>); }
+    if (p.mkey_start != null) { core_free(p.mkey_start as ptr<u8>); }
+    if (p.mkey_len != null) { core_free(p.mkey_len as ptr<u8>); }
+    if (p.mvalue != null) { core_free(p.mvalue as ptr<u8>); }
+    if (p.err_code != 0 || root < 0) {
+        var code: i32 = p.err_code;
+        var off: i64 = p.err_off;
+        if (code == 0) {
+            code = CORE_ERR_UNEXPECTED_CHAR;
+        }
+        core_doc_release(&doc);
+        _error_position(&doc, src, len, code, off);
+        return doc;
+    }
+    doc.root = root;
+    var parents: ptr<i32> = doc.parents;
+    deref parents[root] = CORE_PARENT_ROOT;
+    return doc;
+}
