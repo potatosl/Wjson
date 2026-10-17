@@ -32,7 +32,7 @@ jobs:
         run: |
           rustup update stable --no-self-update
           rustup component add clippy
-          rustup target add x86_64-pc-windows-msvc
+          rustup target add x86_64-pc-windows-msvc aarch64-pc-windows-msvc
           rustc --version
       - name: Install wavec
         run: |
@@ -52,6 +52,8 @@ jobs:
         run: |
           cargo clippy --manifest-path chain/Cargo.toml --target x86_64-pc-windows-msvc -- -D warnings
           cargo check --manifest-path core/Cargo.toml --target x86_64-pc-windows-msvc
+          cargo clippy --manifest-path chain/Cargo.toml --target aarch64-pc-windows-msvc -- -D warnings
+          cargo check --manifest-path core/Cargo.toml --target aarch64-pc-windows-msvc
       - name: Build and test
         run: wavec --std-root="$WAVE_STD" run build.wave
       # The curl installer: install this very commit and use the wrapper.
@@ -159,7 +161,16 @@ jobs:
           grep -qx "0.0.0.0:8080" hello.out
 
   windows:
-    runs-on: windows-2025
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows
+            os: windows-2025
+          - name: windows-arm64
+            os: windows-11-arm
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:

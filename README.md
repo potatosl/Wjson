@@ -304,7 +304,8 @@ Wave's own Windows installer finishes with a smoke compile that, according to
 its documentation, needs the Windows SDK and MSVC/UCRT libraries to be visible
 (on GitHub's `windows-2025` runner it passes). That check belongs to the Wave
 installer, not to wjson's build. If you have no SDK, download the
-`wave-<version>-x86_64-pc-windows-msvc.zip` from
+`wave-<version>-x86_64-pc-windows-msvc.zip` (`aarch64-pc-windows-msvc` on
+Windows on ARM) from
 [Wave's releases](https://github.com/wavefnd/Wave/releases), extract it keeping
 its layout (`wavec.exe`, `std`, `llvm`), add that folder to `PATH` and pass
 `--std-root` as below.
@@ -321,6 +322,7 @@ cargo build --release --manifest-path chain/Cargo.toml --target-dir build/chain 
   --config "target.x86_64-pc-windows-msvc.linker='rust-lld'" `
   --config "target.x86_64-pc-windows-msvc.rustflags=['-Clink-arg=/NODEFAULTLIB']"
 build\chain\release\wjlink.exe init --lld "$(rustc --print sysroot)\lib\rustlib\x86_64-pc-windows-msvc\bin\rust-lld.exe"
+# (on Windows on ARM use aarch64-pc-windows-msvc in all three places)
 
 # then
 $wj = "-Clinker=build\chain\release\wjlink.exe", "-L", "build\chain\release\lib"
@@ -490,15 +492,17 @@ build.wave     build driver (Wave)
   `src/ffi.wave` always uses the `extern(c, "symbol")` form.
 - Verified on Linux x86-64 and Windows 11 x64 (without MSVC). CI builds and
   runs the full test suite on every push on Linux x64 and ARM64
-  (`ubuntu-26.04`, `ubuntu-26.04-arm`), Windows x64 (`windows-2025`) and macOS
-  Apple Silicon and Intel (`macos-26`, `macos-26-intel`). Windows on ARM is not
-  supported: wjlink only produces x86-64 code.
+  (`ubuntu-26.04`, `ubuntu-26.04-arm`), Windows x64 and ARM64 (`windows-2025`,
+  `windows-11-arm`) and macOS Apple Silicon and Intel (`macos-26`,
+  `macos-26-intel`). On Windows the build targets the machine it runs on;
+  wjlink produces x86-64 or ARM64 code (`WJSON_TARGET` overrides the choice,
+  `wjlink init --arch x64|arm64` the architecture of the generated files).
 - Before 1.0 the API may change; changes are listed in `CHANGELOG.md`.
 - The Windows build uses the system `msvcrt.dll` as its C runtime (as MinGW
   does), which Microsoft does not recommend for applications. Only a few C99
   math functions (`fma`) come from `ucrtbase.dll`.
-- `wjlink` is verified for what wjson needs (x86-64 console programs); it is
-  not yet a general-purpose linker.
+- `wjlink` is verified for what wjson needs (x64 and ARM64 console programs);
+  it is not yet a general-purpose linker.
 
 ## Contributing and security
 

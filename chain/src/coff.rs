@@ -1,11 +1,73 @@
 // SPDX-License-Identifier: MPL-2.0
-//! Minimal COFF object writer (x86-64): sections with relocations, a symbol
-//! table and a string table. Enough for import descriptors and the runtime
-//! object; no line numbers, no COMDATs.
+//! Minimal COFF object writer (x86-64 and ARM64): sections with relocations, a
+//! symbol table and a string table. Enough for import descriptors and the
+//! runtime object; no line numbers, no COMDATs.
 
 use alloc::vec::Vec;
 
 pub const MACHINE_AMD64: u16 = 0x8664;
+pub const MACHINE_ARM64: u16 = 0xAA64;
+
+/// The CPU architecture the generated objects and libraries are for. It is a
+/// value, not a compile-time choice, so any host can produce either kind.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Arch {
+    X64,
+    Arm64,
+}
+
+impl Arch {
+    /// The architecture wjlink itself was built for.
+    pub fn host() -> Arch {
+        if cfg!(target_arch = "aarch64") { Arch::Arm64 } else { Arch::X64 }
+    }
+
+    pub fn machine(self) -> u16 {
+        match self {
+            Arch::X64 => MACHINE_AMD64,
+            Arch::Arm64 => MACHINE_ARM64,
+        }
+    }
+
+    pub fn from_machine(machine: u16) -> Option<Arch> {
+        match machine {
+            MACHINE_AMD64 => Some(Arch::X64),
+            MACHINE_ARM64 => Some(Arch::Arm64),
+            _ => None,
+        }
+    }
+
+    pub fn parse(name: &str) -> Option<Arch> {
+        match name {
+            "x64" | "x86_64" | "amd64" => Some(Arch::X64),
+            "arm64" | "aarch64" => Some(Arch::Arm64),
+            _ => None,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Arch::X64 => "x64",
+            Arch::Arm64 => "arm64",
+        }
+    }
+
+    /// 64-bit absolute address.
+    pub fn rel_addr64(self) -> u16 {
+        match self {
+            Arch::X64 => REL_AMD64_ADDR64,
+            Arch::Arm64 => REL_ARM64_ADDR64,
+        }
+    }
+
+    /// 32-bit image-relative address (an RVA).
+    pub fn rel_addr32nb(self) -> u16 {
+        match self {
+            Arch::X64 => REL_AMD64_ADDR32NB,
+            Arch::Arm64 => REL_ARM64_ADDR32NB,
+        }
+    }
+}
 
 pub const SCN_CNT_CODE: u32 = 0x0000_0020;
 pub const SCN_CNT_INITIALIZED_DATA: u32 = 0x0000_0040;
@@ -20,6 +82,12 @@ pub const SCN_MEM_WRITE: u32 = 0x8000_0000;
 pub const REL_AMD64_ADDR64: u16 = 0x0001;
 pub const REL_AMD64_ADDR32NB: u16 = 0x0003;
 pub const REL_AMD64_REL32: u16 = 0x0004;
+
+pub const REL_ARM64_ADDR32NB: u16 = 0x0002;
+pub const REL_ARM64_BRANCH26: u16 = 0x0003;
+pub const REL_ARM64_PAGEBASE_REL21: u16 = 0x0004;
+pub const REL_ARM64_PAGEOFFSET_12L: u16 = 0x0007;
+pub const REL_ARM64_ADDR64: u16 = 0x000E;
 
 pub const SYM_CLASS_EXTERNAL: u8 = 2;
 pub const SYM_CLASS_STATIC: u8 = 3;
@@ -61,6 +129,7 @@ impl Symbol {
 }
 
 pub struct Object {
+    pub arch: Arch,
     pub sections: Vec<Section>,
     pub symbols: Vec<Symbol>,
 }
@@ -90,7 +159,7 @@ impl Object {
         let symtab_at = offset;
 
         let mut out = Vec::with_capacity(offset + 18 * self.symbols.len() + 64);
-        put16(&mut out, MACHINE_AMD64);
+        put16(&mut out, self.arch.machine());
         put16(&mut out, self.sections.len() as u16);
         put32(&mut out, 0); // TimeDateStamp: 0 keeps builds reproducible
         put32(&mut out, symtab_at as u32);

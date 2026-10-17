@@ -2,13 +2,13 @@
 //! wjlink — wjson's Windows link driver. It replaces the parts of MSVC a
 //! Rust + Wave build needs:
 //!
-//!   wjlink init [DIR] [--lld PATH] [--system-dir DIR]
+//!   wjlink init [DIR] [--lld PATH] [--system-dir DIR] [--arch x64|arm64]
 //!       Writes import libraries generated from the system DLLs' export
 //!       tables (kernel32.lib, msvcrt.lib, ...), empty stand-ins for MSVC-only
 //!       libraries, and the runtime startup object wjrt.obj. DIR defaults to
 //!       `lib` next to wjlink.exe.
-//!   wjlink implib DLL OUT.lib       one import library
-//!   wjlink runtime OUT.obj          only the runtime object
+//!   wjlink implib DLL OUT.lib [--arch A]   one import library
+//!   wjlink runtime OUT.obj [--arch A]      only the runtime object
 //!   wjlink exports DLL              list a DLL's exports
 //!   wjlink lib /OUT:X.lib A.obj...  archive objects into a library
 //!   wjlink <link.exe arguments>     link: runs rust-lld with the given
@@ -75,18 +75,35 @@ fn usage() -> i32 {
         "wjlink ",
         env!("CARGO_PKG_VERSION"),
         " - MSVC-free link driver for wjson\n\n",
-        "  wjlink init [DIR] [--lld PATH] [--system-dir DIR]\n",
-        "  wjlink implib DLL OUT.lib\n",
-        "  wjlink runtime OUT.obj\n",
+        "  wjlink init [DIR] [--lld PATH] [--system-dir DIR] [--arch x64|arm64]\n",
+        "  wjlink implib DLL OUT.lib [--arch x64|arm64]\n",
+        "  wjlink runtime OUT.obj [--arch x64|arm64]\n",
         "  wjlink exports DLL\n",
         "  wjlink lib /OUT:LIB OBJ...      (archive objects, like lib.exe)\n",
-        "  wjlink <link.exe arguments...>"
+        "  wjlink <link.exe arguments...>\n\n",
+        "--arch defaults to the architecture wjlink itself was built for."
     ));
     0
 }
 
+/// Removes `--arch NAME` from `args` and returns it (default: the host's).
+fn take_arch(args: &mut Vec<String>) -> Result<coff::Arch, String> {
+    let mut arch = coff::Arch::host();
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "--arch" {
+            let Some(name) = args.get(i + 1) else { return Err("--arch needs x64 or arm64".to_string()) };
+            arch = coff::Arch::parse(name).ok_or_else(|| format!("unknown architecture {name} (use x64 or arm64)"))?;
+            args.drain(i..i + 2);
+        } else {
+            i += 1;
+        }
+    }
+    Ok(arch)
+}
+
 /// Builds the import library for one DLL image.
-fn implib_for(dll_path: &str, dll_name: &str) -> Result<(Vec<u8>, usize), String> {
+fn implib_for(dll_path: &str, dll_name: &str, arch: coff::Arch) -> Result<(Vec<u8>, usize), String> {
     let image = os::read(dll_path)?;
     let table = pe::read_exports(&image).map_err(|e| format!("{dll_path}: {e}"))?;
     let imports: Vec<implib::Import> = table
@@ -96,7 +113,7 @@ fn implib_for(dll_path: &str, dll_name: &str) -> Result<(Vec<u8>, usize), String
         .map(|e| implib::Import { name: e.name, hint: e.hint, data: e.data })
         .collect();
     let count = imports.len();
-    Ok((implib::import_library(dll_name, &imports), count))
+    Ok((implib::import_library(arch, dll_name, &imports), count))
 }
 
 fn lib_dir() -> String {
@@ -104,6 +121,12 @@ fn lib_dir() -> String {
 }
 
 fn cmd_init(args: &[String]) -> i32 {
+    let mut owned = args.to_vec();
+    let arch = match take_arch(&mut owned) {
+        Ok(a) => a,
+        Err(e) => return fail(&format!("init: {e}")),
+    };
+    let args = &owned[..];
     let mut dir = None;
     let mut lld = None;
     let mut system = None;
@@ -140,7 +163,7 @@ fn cmd_init(args: &[String]) -> i32 {
             say(&format!("  {name}.lib: skipped ({dll} not found)"));
             continue;
         }
-        match implib_for(&path, &dll) {
+        match implib_for(&path, &dll, arch) {
             Ok((bytes, count)) => {
                 if let Err(e) = os::write(&os::join_path(&dir, &format!("{name}.lib")), &bytes) {
                     return fail(&e);
@@ -156,7 +179,7 @@ fn cmd_init(args: &[String]) -> i32 {
             return fail(&e);
         }
     }
-    if let Err(e) = os::write(&os::join_path(&dir, "wjrt.obj"), &runtime::runtime_object()) {
+    if let Err(e) = os::write(&os::join_path(&dir, "wjrt.obj"), &runtime::runtime_object(arch)) {
         return fail(&e);
     }
     if let Some(lld) = lld
@@ -165,7 +188,7 @@ fn cmd_init(args: &[String]) -> i32 {
         return fail(&e);
     }
     say(&format!("  wjrt.obj: runtime startup object; {} empty stand-ins", EMPTY.len()));
-    say(&format!("wjlink: {made} import libraries in {dir}"));
+    say(&format!("wjlink: {made} import libraries ({}) in {dir}", arch.name()));
     if made == 0 {
         return fail("init: no system DLLs found");
     }
@@ -288,12 +311,20 @@ fn real_main(args: Vec<String>) -> i32 {
             0
         }
         "init" => cmd_init(&args[1..]),
-        "implib" if args.len() == 3 => {
-            let dll = args[1].rsplit(['/', '\\']).next().unwrap_or(&args[1]).to_string();
-            match implib_for(&args[1], &dll) {
-                Ok((bytes, count)) => match os::write(&args[2], &bytes) {
+        "implib" if args.len() >= 3 => {
+            let mut rest = args.clone();
+            let arch = match take_arch(&mut rest) {
+                Ok(a) => a,
+                Err(e) => return fail(&format!("implib: {e}")),
+            };
+            if rest.len() != 3 {
+                return usage();
+            }
+            let dll = rest[1].rsplit(['/', '\\']).next().unwrap_or(&rest[1]).to_string();
+            match implib_for(&rest[1], &dll, arch) {
+                Ok((bytes, count)) => match os::write(&rest[2], &bytes) {
                     Ok(()) => {
-                        say(&format!("{}: {count} imports", args[2]));
+                        say(&format!("{}: {count} imports ({})", rest[2], arch.name()));
                         0
                     }
                     Err(e) => fail(&e),
@@ -302,10 +333,20 @@ fn real_main(args: Vec<String>) -> i32 {
             }
         }
         "lib" => cmd_lib(&args[1..]),
-        "runtime" if args.len() == 2 => match os::write(&args[1], &runtime::runtime_object()) {
-            Ok(()) => 0,
-            Err(e) => fail(&e),
-        },
+        "runtime" if args.len() >= 2 => {
+            let mut rest = args.clone();
+            let arch = match take_arch(&mut rest) {
+                Ok(a) => a,
+                Err(e) => return fail(&format!("runtime: {e}")),
+            };
+            if rest.len() != 2 {
+                return usage();
+            }
+            match os::write(&rest[1], &runtime::runtime_object(arch)) {
+                Ok(()) => 0,
+                Err(e) => fail(&e),
+            }
+        }
         "exports" if args.len() == 2 => match os::read(&args[1]).map(|img| pe::read_exports(&img)) {
             Ok(Ok(t)) => {
                 say(&format!("{} ({} exports)", t.dll, t.exports.len()));
@@ -418,6 +459,21 @@ mod rt {
     }
 
     // Stack probe for frames over 4 KiB (same code as in wjrt.obj).
+    #[cfg(target_arch = "aarch64")]
+    core::arch::global_asm!(
+        ".globl __chkstk",
+        "__chkstk:",
+        "lsl x16, x15, #4",
+        "mov x17, sp",
+        "2:",
+        "sub x17, x17, #4096",
+        "subs x16, x16, #4096",
+        "ldr xzr, [x17]",
+        "b.gt 2b",
+        "ret",
+    );
+
+    #[cfg(target_arch = "x86_64")]
     core::arch::global_asm!(
         ".globl __chkstk",
         "__chkstk:",

@@ -14,9 +14,9 @@ fn u32_at(b: &[u8], at: usize) -> u32 {
     u32::from_le_bytes(b[at..at + 4].try_into().unwrap())
 }
 
-/// Symbol names of a COFF object, resolving long names.
+/// Symbol names of a COFF object, resolving long names (x64 or ARM64).
 fn coff_symbols(obj: &[u8]) -> Vec<(String, i16, u8)> {
-    assert_eq!(u16_at(obj, 0), 0x8664);
+    assert!(matches!(u16_at(obj, 0), 0x8664 | 0xAA64));
     let symtab = u32_at(obj, 8) as usize;
     let count = u32_at(obj, 12) as usize;
     let strtab = symtab + 18 * count;
@@ -83,9 +83,17 @@ fn imports() -> Vec<implib::Import> {
     ]
 }
 
+const ARCHES: [coff::Arch; 2] = [coff::Arch::X64, coff::Arch::Arm64];
+
 #[test]
 fn import_library_layout() {
-    let lib = implib::import_library("msvcrt.dll", &imports());
+    for arch in ARCHES {
+        import_library_layout_for(arch);
+    }
+}
+
+fn import_library_layout_for(arch: coff::Arch) {
+    let lib = implib::import_library(arch, "msvcrt.dll", &imports());
     let (members, symbols, offsets) = archive(&lib);
     assert_eq!(members.len(), 6, "descriptor, null descriptor, null thunk, 3 imports");
     assert_eq!(offsets.len(), 6);
@@ -119,6 +127,7 @@ fn import_library_layout() {
             assert!(sym == name || *sym == std::format!("__imp_{name}"), "{sym} -> import {name}");
             let dll = &data[20 + name_end + 1..data.len() - 1];
             assert_eq!(dll, b"msvcrt.dll");
+            assert_eq!(u16_at(data, 6), arch.machine(), "import header machine");
             let kind = u16_at(data, 18) & 3;
             assert_eq!(kind == 1, name == "_environ");
             assert_eq!(u16_at(data, 18) >> 2 & 7, 1, "import by name");
@@ -129,7 +138,16 @@ fn import_library_layout() {
         }
     }
 
-    // The descriptor references the null descriptor and the null thunk.
+    // The descriptor references the null descriptor and the null thunk, and
+    // its three RVA fields use the architecture's image-relative relocation.
+    assert_eq!(u16_at(&members[0], 0), arch.machine(), "descriptor machine");
+    let section_header = 20; // first (only) section header: .idata$2
+    let reloc_at = u32_at(&members[0], section_header + 24) as usize;
+    let nrelocs = u16_at(&members[0], section_header + 32) as usize;
+    assert_eq!(nrelocs, 3);
+    for k in 0..nrelocs {
+        assert_eq!(u16_at(&members[0], reloc_at + 10 * k + 8), arch.rel_addr32nb(), "descriptor relocation");
+    }
     let desc = coff_symbols(&members[0]);
     assert!(desc.iter().any(|(n, s, _)| n == "__NULL_IMPORT_DESCRIPTOR" && *s == 0));
     assert!(desc.iter().any(|(n, s, _)| n == "\x7fmsvcrt_NULL_THUNK_DATA" && *s == 0));
@@ -137,16 +155,122 @@ fn import_library_layout() {
 
 #[test]
 fn long_dll_names_use_the_longnames_member() {
-    let lib = implib::import_library("bcryptprimitives.dll", &imports());
+    let lib = implib::import_library(coff::Arch::host(), "bcryptprimitives.dll", &imports());
     assert!(lib.windows(4).any(|w| w == b"//  "), "has a // member");
     let (members, symbols, _) = archive(&lib);
     assert_eq!(members.len(), 6);
     assert!(symbols.iter().any(|(s, _)| s == "__IMPORT_DESCRIPTOR_bcryptprimitives"));
 }
 
+/// The .text section of a COFF object: (bytes, [(offset, symbol, type)]).
+fn text_section(obj: &[u8]) -> (Vec<u8>, Vec<(u32, u32, u16)>) {
+    let h = &obj[20..60];
+    assert_eq!(&h[..5], b".text");
+    let size = u32_at(h, 16) as usize;
+    let data_at = u32_at(h, 20) as usize;
+    let relocs_at = u32_at(h, 24) as usize;
+    let nrelocs = u16_at(h, 32) as usize;
+    let relocs = (0..nrelocs)
+        .map(|k| {
+            let r = relocs_at + 10 * k;
+            (u32_at(obj, r), u32_at(obj, r + 4), u16_at(obj, r + 8))
+        })
+        .collect();
+    (obj[data_at..data_at + size].to_vec(), relocs)
+}
+
+fn symbol_value(obj: &[u8], name: &str) -> u32 {
+    let symtab = u32_at(obj, 8) as usize;
+    let syms = coff_symbols(obj);
+    let i = syms.iter().position(|(n, _, _)| n == name).unwrap();
+    u32_at(obj, symtab + 18 * i + 8)
+}
+
+#[test]
+fn arm64_runtime_matches_the_assembler() {
+    // Words and relocation kinds as produced by
+    //   llvm-mc -triple=aarch64-pc-windows-msvc -filetype=obj
+    // for the assembly in runtime.rs.
+    let obj = runtime::runtime_object(coff::Arch::Arm64);
+    assert_eq!(u16_at(&obj, 0), 0xAA64);
+    let (text, relocs) = text_section(&obj);
+    let words: Vec<u32> = text.chunks(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
+    assert_eq!(
+        words,
+        [
+            0xA9BF7BFD, 0x910003FD, 0x52800000, 0xD2800001, 0xD2800002, 0x94000000, 0x90000010, 0xF9400210,
+            0xD63F0200, 0xD43E0000, 0xD503201F, 0xD503201F, 0xD37CEDF0, 0x910003F1, 0xD1400631, 0xF1400610,
+            0xF940023F, 0x54FFFFAC, 0xD65F03C0,
+        ]
+    );
+    let syms = coff_symbols(&obj);
+    let index = |n: &str| syms.iter().position(|(s, _, _)| s == n).unwrap() as u32;
+    assert_eq!(
+        relocs,
+        [
+            (0x14, index("main"), 0x0003),       // IMAGE_REL_ARM64_BRANCH26
+            (0x18, index("__imp_exit"), 0x0004), // IMAGE_REL_ARM64_PAGEBASE_REL21
+            (0x1C, index("__imp_exit"), 0x0007), // IMAGE_REL_ARM64_PAGEOFFSET_12L
+        ]
+    );
+    assert_eq!(symbol_value(&obj, "mainCRTStartup"), 0);
+    assert_eq!(symbol_value(&obj, "__chkstk"), 0x30);
+    // The b.gt (word 17) jumps back to the sub (word 14): 3 instructions.
+    assert_eq!(words[17] & 0xFF00_001F, 0x5400_000C, "b.gt");
+    let imm19 = ((words[17] >> 5) & 0x7FFFF) as i32;
+    assert_eq!((imm19 << 13) >> 13, -3, "branch offset");
+}
+
+#[test]
+fn x64_runtime_is_unchanged() {
+    let obj = runtime::runtime_object(coff::Arch::X64);
+    assert_eq!(u16_at(&obj, 0), 0x8664);
+    let (text, relocs) = text_section(&obj);
+    assert_eq!(text.len(), 0x50);
+    assert_eq!(&text[..4], &[0x48, 0x83, 0xEC, 0x28]);
+    let syms = coff_symbols(&obj);
+    let index = |n: &str| syms.iter().position(|(s, _, _)| s == n).unwrap() as u32;
+    assert_eq!(relocs, [(0x0C, index("main"), 0x0004), (0x14, index("__imp_exit"), 0x0004)]);
+    assert_eq!(symbol_value(&obj, "__chkstk"), 0x20);
+}
+
+#[test]
+fn tls_directory_relocations_follow_the_architecture() {
+    for arch in ARCHES {
+        let obj = runtime::runtime_object(arch);
+        // .rdata$T is the third section: four 64-bit absolute addresses.
+        let h = &obj[20 + 80..20 + 120];
+        assert_eq!(&h[..8], b".rdata$T");
+        let relocs_at = u32_at(h, 24) as usize;
+        assert_eq!(u16_at(h, 32), 4);
+        for k in 0..4 {
+            assert_eq!(u16_at(&obj, relocs_at + 10 * k + 8), arch.rel_addr64());
+        }
+    }
+}
+
+#[test]
+fn archive_symbols_accept_both_machines() {
+    for arch in ARCHES {
+        let obj = runtime::runtime_object(arch);
+        let syms = implib::object_symbols(&obj).unwrap();
+        assert!(syms.iter().any(|s| s == b"mainCRTStartup"));
+    }
+    let mut bad = runtime::runtime_object(coff::Arch::X64);
+    bad[0] = 0x4C; // i386
+    bad[1] = 0x01;
+    assert!(implib::object_symbols(&bad).is_err());
+}
+
 #[test]
 fn runtime_object_symbols() {
-    let obj = runtime::runtime_object();
+    for arch in ARCHES {
+        runtime_object_symbols_for(arch);
+    }
+}
+
+fn runtime_object_symbols_for(arch: coff::Arch) {
+    let obj = runtime::runtime_object(arch);
     let syms = coff_symbols(&obj);
     let defined = |n: &str| syms.iter().any(|(s, sec, class)| s == n && *sec > 0 && *class == 2);
     for name in ["mainCRTStartup", "__chkstk", "_tls_used", "_tls_index", "_fltused", "??_7type_info@@6B@"] {
@@ -202,7 +326,7 @@ fn real_dll_exports() {
     assert!(find(&kernel32, "CreateFileW").is_some());
     // kernel32 exports __chkstk, which wjrt.obj defines; generated libraries skip it.
     assert!(find(&kernel32, "__chkstk").is_some());
-    let (lib, _) = crate::implib_for(&std::format!("{dir}/kernel32.dll"), "kernel32.dll").unwrap();
+    let (lib, _) = crate::implib_for(&std::format!("{dir}/kernel32.dll"), "kernel32.dll", coff::Arch::host()).unwrap();
     let (members, symbols, _) = archive(&lib);
     assert!(members.len() > 1000);
     assert!(!symbols.iter().any(|(s, _)| s == "__chkstk" || s == "__imp___chkstk"));

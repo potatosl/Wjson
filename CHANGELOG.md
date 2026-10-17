@@ -60,6 +60,16 @@ minor releases.
   edits (including invalid ones) to a Rust document and a Wave document and
   compares every returned code, the whole tree and the answers of key lookups
   and JSON Pointers (1.2 million checks at 300 sequences).
+- Windows on ARM64 is supported, natively and without MSVC like x64. `wjlink`
+  (the MSVC-free link driver) now takes the architecture as a value: import
+  libraries use the matching machine type and RVA relocation, and the startup
+  object `wjrt.obj` has ARM64 machine code for `mainCRTStartup` and `__chkstk`
+  (assembled with llvm-mc; `wjlink init --arch x64|arm64` overrides the default,
+  the architecture wjlink runs on). `build.wave` and `setup-windows.ps1` pick the
+  Rust/clang target from the machine (`WJSON_TARGET` overrides). A new CI job on
+  `windows-11-arm` runs the whole suite there (Rust and C++ tests, every Wave
+  test and example). The x64 object and libraries are unchanged byte for byte,
+  checked by a unit test.
 - `.gitattributes` marks `*.wave` as Wave for GitHub's language statistics.
 
 ### Native

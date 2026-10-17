@@ -10,6 +10,7 @@
 //!                       takes no arguments and Rust's std reads the command
 //!                       line from GetCommandLineW, so argv is not built.
 //!   __chkstk            stack probe for frames over 4 KiB (LLVM emits calls).
+//!                       x64: size in rax; ARM64: size in 16-byte units in x15.
 //!   _tls_used & co.     the TLS directory the loader needs for `.tls`
 //!                       sections (Rust's thread_local! uses them).
 //!   _fltused            marker the compiler references when floats are used.
@@ -68,11 +69,51 @@ const TEXT: [u8; 0x50] = [
     0xC3, // ret
 ];
 
+/// ARM64 machine code. The words were assembled with llvm-mc
+/// (`-triple=aarch64-pc-windows-msvc`) from:
+///
+/// ```text
+/// mainCRTStartup:                     __chkstk:   (x15 = bytes / 16)
+///   stp  x29, x30, [sp, #-16]!          lsl  x16, x15, #4
+///   mov  x29, sp                        mov  x17, sp
+///   mov  w0, #0                       1: sub  x17, x17, #4096
+///   mov  x1, #0                          subs x16, x16, #4096
+///   mov  x2, #0                          ldr  xzr, [x17]
+///   bl   main                            b.gt 1b
+///   adrp x16, __imp_exit                 ret
+///   ldr  x16, [x16, :lo12:__imp_exit]
+///   blr  x16
+///   brk  #0xf000
+/// ```
+const TEXT_ARM64: [u32; 19] = [
+    // mainCRTStartup (0x00)
+    0xA9BF7BFD, // stp x29, x30, [sp, #-16]!
+    0x910003FD, // mov x29, sp
+    0x52800000, // mov w0, #0
+    0xD2800001, // mov x1, #0
+    0xD2800002, // mov x2, #0
+    0x94000000, // bl main                      (BRANCH26 at 0x14)
+    0x90000010, // adrp x16, __imp_exit         (PAGEBASE_REL21 at 0x18)
+    0xF9400210, // ldr x16, [x16, #lo12]        (PAGEOFFSET_12L at 0x1C)
+    0xD63F0200, // blr x16
+    0xD43E0000, // brk #0xf000
+    0xD503201F, // nop (padding to 0x30)
+    0xD503201F, // nop
+    // __chkstk (0x30)
+    0xD37CEDF0, // lsl x16, x15, #4
+    0x910003F1, // mov x17, sp
+    0xD1400631, // sub x17, x17, #4096
+    0xF1400610, // subs x16, x16, #4096
+    0xF940023F, // ldr xzr, [x17]
+    0x54FFFFAC, // b.gt -12 (back to the sub)
+    0xD65F03C0, // ret
+];
+
 /// Names wjrt.obj defines. Some system DLLs export the same names
 /// (kernel32 and ntdll export `__chkstk`), so import libraries leave them out.
 pub const DEFINES: &[&str] = &["mainCRTStartup", "__chkstk", "_tls_used", "_tls_index", "_fltused", "??_7type_info@@6B@"];
 
-pub fn runtime_object() -> Vec<u8> {
+pub fn runtime_object(arch: Arch) -> Vec<u8> {
     let code = SCN_CNT_CODE | SCN_ALIGN_16BYTES | SCN_MEM_EXECUTE | SCN_MEM_READ;
     let rw8 = SCN_CNT_INITIALIZED_DATA | SCN_ALIGN_8BYTES | SCN_MEM_READ | SCN_MEM_WRITE;
     let ro8 = SCN_CNT_INITIALIZED_DATA | SCN_ALIGN_8BYTES | SCN_MEM_READ;
@@ -91,17 +132,31 @@ pub fn runtime_object() -> Vec<u8> {
     let mut tls_dir = vec![0u8; 40];
     tls_dir[24..32].copy_from_slice(&8u64.to_le_bytes()); // addend for __xl_a
 
+    let addr64 = arch.rel_addr64();
+    let (text, text_relocs, chkstk_at) = match arch {
+        Arch::X64 => (
+            TEXT.to_vec(),
+            vec![
+                Reloc { offset: 0x0C, symbol: MAIN, kind: REL_AMD64_REL32 },
+                Reloc { offset: 0x14, symbol: IMP_EXIT, kind: REL_AMD64_REL32 },
+            ],
+            0x20,
+        ),
+        Arch::Arm64 => (
+            TEXT_ARM64.iter().flat_map(|w| w.to_le_bytes()).collect(),
+            vec![
+                Reloc { offset: 0x14, symbol: MAIN, kind: REL_ARM64_BRANCH26 },
+                Reloc { offset: 0x18, symbol: IMP_EXIT, kind: REL_ARM64_PAGEBASE_REL21 },
+                Reloc { offset: 0x1C, symbol: IMP_EXIT, kind: REL_ARM64_PAGEOFFSET_12L },
+            ],
+            0x30,
+        ),
+    };
+
     let obj = Object {
+        arch,
         sections: vec![
-            Section {
-                name: b".text",
-                data: TEXT.to_vec(),
-                characteristics: code,
-                relocs: vec![
-                    Reloc { offset: 0x0C, symbol: MAIN, kind: REL_AMD64_REL32 },
-                    Reloc { offset: 0x14, symbol: IMP_EXIT, kind: REL_AMD64_REL32 },
-                ],
-            },
+            Section { name: b".text", data: text, characteristics: code, relocs: text_relocs },
             // _tls_index (u32) at 0, _fltused (i32) at 4, type_info vtable at 8.
             Section { name: b".data", data: vec![0; 16], characteristics: rw8, relocs: vec![] },
             Section {
@@ -109,10 +164,10 @@ pub fn runtime_object() -> Vec<u8> {
                 data: tls_dir,
                 characteristics: ro8,
                 relocs: vec![
-                    Reloc { offset: 0, symbol: TLS_START, kind: REL_AMD64_ADDR64 },
-                    Reloc { offset: 8, symbol: TLS_END, kind: REL_AMD64_ADDR64 },
-                    Reloc { offset: 16, symbol: TLS_INDEX, kind: REL_AMD64_ADDR64 },
-                    Reloc { offset: 24, symbol: XL_A, kind: REL_AMD64_ADDR64 },
+                    Reloc { offset: 0, symbol: TLS_START, kind: addr64 },
+                    Reloc { offset: 8, symbol: TLS_END, kind: addr64 },
+                    Reloc { offset: 16, symbol: TLS_INDEX, kind: addr64 },
+                    Reloc { offset: 24, symbol: XL_A, kind: addr64 },
                 ],
             },
             Section { name: b".tls", data: vec![0; 8], characteristics: rw8, relocs: vec![] },
@@ -122,7 +177,7 @@ pub fn runtime_object() -> Vec<u8> {
         ],
         symbols: vec![
             Symbol::function(b"mainCRTStartup", 0x00, 1), // 0
-            Symbol::function(b"__chkstk", 0x20, 1),       // 1
+            Symbol::function(b"__chkstk", chkstk_at, 1),  // 1
             Symbol::external(b"main"),                    // 2
             Symbol::external(b"__imp_exit"),              // 3
             Symbol::new(b"_tls_index", 0, 2, SYM_CLASS_EXTERNAL), // 4

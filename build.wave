@@ -46,6 +46,8 @@ const WJLINK: str = "build/chain/release/wjlink.exe";
 const WJLINK_LIB: str = "build/chain/release/lib";
 
 static WINDOWS: bool = false;
+// The Rust/clang target triple on Windows (see detect_target in main).
+static TRIPLE: str = "x86_64-pc-windows-msvc";
 // Optimization level for Wave programs (see detect_opt in main).
 static OPT: str = "-O2";
 static DRY: bool = false;
@@ -158,7 +160,9 @@ fun read_text(path: str, size_out: ptr<i64>) -> ptr<u8> {
 
 // The `--config` arguments that make cargo link with the given linker.
 fun add_cargo_linker(b: ptr<Buffer>, linker: str) {
-    add(b, " --config \"target.x86_64-pc-windows-msvc.linker='");
+    add(b, " --config \"target.");
+    add(b, TRIPLE);
+    add(b, ".linker='");
     add(b, linker);
     add(b, "'\"");
 }
@@ -170,7 +174,9 @@ fun build_toolchain(b: ptr<Buffer>) -> bool {
     add(b, env_or("CARGO", "cargo"));
     add(b, " build --release --quiet --manifest-path chain/Cargo.toml --target-dir build/chain");
     add_cargo_linker(b, "rust-lld");
-    add(b, " --config \"target.x86_64-pc-windows-msvc.rustflags=['-Clink-arg=/NODEFAULTLIB']\"");
+    add(b, " --config \"target.");
+    add(b, TRIPLE);
+    add(b, ".rustflags=['-Clink-arg=/NODEFAULTLIB']\"");
     if (!must(b)) {
         return false;
     }
@@ -197,7 +203,9 @@ fun build_toolchain(b: ptr<Buffer>) -> bool {
         add_bytes(b, root, n);
         mem_free(root, size);
     }
-    add(b, "\\lib\\rustlib\\x86_64-pc-windows-msvc\\bin\\rust-lld.exe\"");
+    add(b, "\\lib\\rustlib\\");
+    add(b, TRIPLE);
+    add(b, "\\bin\\rust-lld.exe\"");
     return must(b);
 }
 
@@ -205,7 +213,9 @@ fun build_toolchain(b: ptr<Buffer>) -> bool {
 // Windows SDK's headers are needed; dynamic CRT naming (msvcrt.lib).
 fun add_win_cxx(b: ptr<Buffer>) {
     add(b, env_or("CXX", "clang++"));
-    add(b, " --target=x86_64-pc-windows-msvc -std=c++20 -ffreestanding -nostdlibinc -fno-exceptions -fno-rtti -fms-runtime-lib=dll -Wall -Wextra");
+    add(b, " --target=");
+    add(b, TRIPLE);
+    add(b, " -std=c++20 -ffreestanding -nostdlibinc -fno-exceptions -fno-rtti -fms-runtime-lib=dll -Wall -Wextra");
 }
 
 // ---- library builds -----------------------------------------------------------------
@@ -680,9 +690,22 @@ fun detect_opt() {
     }
 }
 
+// On Windows the build targets the machine it runs on: x64 or ARM64.
+// WJSON_TARGET overrides the detection (the Rust host triple is what cargo uses).
+fun detect_target() {
+    if (env_set("WJSON_TARGET")) {
+        TRIPLE = env_or("WJSON_TARGET", "x86_64-pc-windows-msvc");
+    } else if (streq(env_or("PROCESSOR_ARCHITECTURE", ""), "ARM64")) {
+        TRIPLE = "aarch64-pc-windows-msvc";
+    }
+}
+
 fun main() -> i32 {
     WINDOWS = streq(env_or("OS", ""), "Windows_NT");
     DRY = env_set("WJSON_DRY_RUN");
+    if (WINDOWS) {
+        detect_target();
+    }
     detect_opt();
     var b: Buffer = buffer_new(512);
     var flags: Buffer = buffer_new(256);

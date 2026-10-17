@@ -27,23 +27,25 @@ fn stem(dll: &str) -> &str {
     }
 }
 
-fn descriptor(dll: &str) -> (Vec<u8>, Vec<Vec<u8>>) {
+fn descriptor(arch: Arch, dll: &str) -> (Vec<u8>, Vec<Vec<u8>>) {
     let lib = stem(dll);
     let rw = SCN_CNT_INITIALIZED_DATA | SCN_MEM_READ | SCN_MEM_WRITE;
     let mut name = dll.as_bytes().to_vec();
     name.push(0);
     let desc = format!("__IMPORT_DESCRIPTOR_{lib}").into_bytes();
     let thunk = format!("\x7f{lib}_NULL_THUNK_DATA").into_bytes();
+    let rva = arch.rel_addr32nb();
     let obj = Object {
+        arch,
         sections: vec![
             Section {
                 name: b".idata$2",
                 data: vec![0; 20],
                 characteristics: SCN_ALIGN_4BYTES | rw,
                 relocs: vec![
-                    Reloc { offset: 12, symbol: 2, kind: REL_AMD64_ADDR32NB }, // Name
-                    Reloc { offset: 0, symbol: 3, kind: REL_AMD64_ADDR32NB },  // lookup table
-                    Reloc { offset: 16, symbol: 4, kind: REL_AMD64_ADDR32NB }, // address table
+                    Reloc { offset: 12, symbol: 2, kind: rva }, // Name
+                    Reloc { offset: 0, symbol: 3, kind: rva },  // lookup table
+                    Reloc { offset: 16, symbol: 4, kind: rva }, // address table
                 ],
             },
             Section { name: b".idata$6", data: name, characteristics: SCN_ALIGN_2BYTES | rw, relocs: vec![] },
@@ -61,8 +63,9 @@ fn descriptor(dll: &str) -> (Vec<u8>, Vec<Vec<u8>>) {
     (obj.to_bytes(), vec![desc])
 }
 
-fn null_descriptor() -> (Vec<u8>, Vec<Vec<u8>>) {
+fn null_descriptor(arch: Arch) -> (Vec<u8>, Vec<Vec<u8>>) {
     let obj = Object {
+        arch,
         sections: vec![Section {
             name: b".idata$3",
             data: vec![0; 20],
@@ -74,10 +77,11 @@ fn null_descriptor() -> (Vec<u8>, Vec<Vec<u8>>) {
     (obj.to_bytes(), vec![b"__NULL_IMPORT_DESCRIPTOR".to_vec()])
 }
 
-fn null_thunk(dll: &str) -> (Vec<u8>, Vec<Vec<u8>>) {
+fn null_thunk(arch: Arch, dll: &str) -> (Vec<u8>, Vec<Vec<u8>>) {
     let thunk = format!("\x7f{}_NULL_THUNK_DATA", stem(dll)).into_bytes();
     let rw8 = SCN_ALIGN_8BYTES | SCN_CNT_INITIALIZED_DATA | SCN_MEM_READ | SCN_MEM_WRITE;
     let obj = Object {
+        arch,
         sections: vec![
             Section { name: b".idata$5", data: vec![0; 8], characteristics: rw8, relocs: vec![] },
             Section { name: b".idata$4", data: vec![0; 8], characteristics: rw8, relocs: vec![] },
@@ -89,13 +93,13 @@ fn null_thunk(dll: &str) -> (Vec<u8>, Vec<Vec<u8>>) {
 
 /// One import header: the linker synthesizes `__imp_name` (and for code a
 /// `name` jump thunk) from it.
-fn short_import(dll: &str, imp: &Import) -> (Vec<u8>, Vec<Vec<u8>>) {
+fn short_import(arch: Arch, dll: &str, imp: &Import) -> (Vec<u8>, Vec<Vec<u8>>) {
     let size = imp.name.len() + 1 + dll.len() + 1;
     let mut out = Vec::with_capacity(20 + size);
     out.extend_from_slice(&0u16.to_le_bytes()); // Sig1
     out.extend_from_slice(&0xFFFFu16.to_le_bytes()); // Sig2
     out.extend_from_slice(&0u16.to_le_bytes()); // Version
-    out.extend_from_slice(&MACHINE_AMD64.to_le_bytes());
+    out.extend_from_slice(&arch.machine().to_le_bytes());
     out.extend_from_slice(&0u32.to_le_bytes()); // TimeDateStamp
     out.extend_from_slice(&(size as u32).to_le_bytes());
     out.extend_from_slice(&imp.hint.to_le_bytes());
@@ -114,10 +118,10 @@ fn short_import(dll: &str, imp: &Import) -> (Vec<u8>, Vec<Vec<u8>>) {
 }
 
 /// Builds a complete import library for `dll` (e.g. "kernel32.dll").
-pub fn import_library(dll: &str, imports: &[Import]) -> Vec<u8> {
-    let mut members = vec![descriptor(dll), null_descriptor(), null_thunk(dll)];
+pub fn import_library(arch: Arch, dll: &str, imports: &[Import]) -> Vec<u8> {
+    let mut members = vec![descriptor(arch, dll), null_descriptor(arch), null_thunk(arch, dll)];
     for imp in imports {
-        members.push(short_import(dll, imp));
+        members.push(short_import(arch, dll, imp));
     }
     write_archive(dll, &members)
 }
@@ -257,14 +261,14 @@ fn find_longname(table: &[u8], name: &[u8]) -> Option<usize> {
     None
 }
 
-/// External symbols an x86-64 COFF object defines (what an archive's
-/// symbol table must list so the linker pulls the member in).
+/// External symbols an x86-64 or ARM64 COFF object defines (what an
+/// archive's symbol table must list so the linker pulls the member in).
 pub fn object_symbols(obj: &[u8]) -> Result<Vec<Vec<u8>>, &'static str> {
     let u16_at = |at: usize| obj.get(at..at + 2).map(|b| u16::from_le_bytes([b[0], b[1]]));
     let u32_at = |at: usize| obj.get(at..at + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
     let machine = u16_at(0).ok_or("not a COFF object")?;
-    if machine != crate::coff::MACHINE_AMD64 {
-        return Err("not an x86-64 COFF object");
+    if Arch::from_machine(machine).is_none() {
+        return Err("not an x86-64 or ARM64 COFF object");
     }
     let symtab = u32_at(8).ok_or("truncated COFF header")? as usize;
     let count = u32_at(12).ok_or("truncated COFF header")? as usize;

@@ -65,8 +65,15 @@ try {
     }
     & cargo --version 2>&1 | Out-String | Write-Host
     $sysroot = (& rustc --print sysroot).Trim()
-    $lld = Join-Path $sysroot 'lib\rustlib\x86_64-pc-windows-msvc\bin\rust-lld.exe'
-    if (-not (Test-Path $lld)) { throw "rust-lld not found at $lld (is the x86_64-pc-windows-msvc toolchain the default?)" }
+    # The build targets the machine it runs on: x86_64 or aarch64 (Windows on ARM).
+    $hostTriple = ((& rustc -vV | Select-String '^host:').Line -replace '^host:\s*', '').Trim()
+    if ($hostTriple -notin 'x86_64-pc-windows-msvc', 'aarch64-pc-windows-msvc') {
+        throw "unsupported Rust host $hostTriple (wjson builds on x86_64-pc-windows-msvc and aarch64-pc-windows-msvc)"
+    }
+    $env:WJSON_TARGET = $hostTriple
+    Write-Host "    target: $hostTriple"
+    $lld = Join-Path $sysroot "lib\rustlib\$hostTriple\bin\rust-lld.exe"
+    if (-not (Test-Path $lld)) { throw "rust-lld not found at $lld (is the $hostTriple toolchain the default?)" }
     Write-Host "    linker: $lld"
 
     # 2. clang --------------------------------------------------------------------
@@ -124,8 +131,8 @@ try {
     # generates the import libraries it needs from the system DLLs.
     Step 'wjlink: MSVC-free linker (Rust)'
     & cargo build --release --quiet --manifest-path chain/Cargo.toml --target-dir build/chain `
-        --config "target.x86_64-pc-windows-msvc.linker='rust-lld'" `
-        --config "target.x86_64-pc-windows-msvc.rustflags=['-Clink-arg=/NODEFAULTLIB']"
+        --config "target.$hostTriple.linker='rust-lld'" `
+        --config "target.$hostTriple.rustflags=['-Clink-arg=/NODEFAULTLIB']"
     if ($LASTEXITCODE -ne 0) { throw "building wjlink failed (exit code $LASTEXITCODE)" }
     $wjlink = Join-Path $root 'build\chain\release\wjlink.exe'
     & $wjlink init --lld $lld | Select-Object -Last 1 | Write-Host
