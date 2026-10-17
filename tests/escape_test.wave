@@ -1,0 +1,254 @@
+// SPDX-License-Identifier: MPL-2.0
+//
+// Differential test for the pure-Wave string escaping and UTF-8 checks
+// (src/escape.wave) against the C++ implementation (native/src/escape.cpp).
+// Run from the repository root:  wavec run build.wave
+
+extern(c, "getenv") fun c_getenv(name: ptr<u8>) -> ptr<u8>;
+import("wjson::ffi")::{ffi_escape, ffi_utf8_check, ffi_utf8_count};
+import("wjson::escape")::{esc_escape, esc_utf8_check, esc_utf8_count};
+
+static CHECKS: i32 = 0;
+static FAILURES: i32 = 0;
+static RNG: u64 = 88172645463325252;
+
+fun check(cond: bool, label: str) {
+    CHECKS += 1;
+    if (!cond) {
+        FAILURES += 1;
+        if (FAILURES <= 20) {
+            println("FAIL: {}", label);
+        }
+    }
+}
+
+fun next() -> u64 {
+    var x: u64 = RNG;
+    x = x ^ (x << 13);
+    x = x ^ (x >> 7);
+    x = x ^ (x << 17);
+    RNG = x;
+    return x * 2685821657736338717;
+}
+
+fun below(n: u64) -> u64 {
+    return (next() >> 11) % n;
+}
+
+fun len_of(s: str) -> i64 {
+    var p: ptr<u8> = s as ptr<u8>;
+    var n: i64 = 0;
+    while (p[n] != 0) {
+        n += 1;
+    }
+    return n;
+}
+
+fun same_bytes(a: ptr<u8>, b: ptr<u8>, n: i64) -> bool {
+    var i: i64 = 0;
+    while (i < n) {
+        if (a[i] != b[i]) {
+            return false;
+        }
+        i += 1;
+    }
+    return true;
+}
+
+// Both implementations must return the same value and leave the same bytes in
+// a destination of `cap` bytes (sentinel-filled beyond what they write).
+fun escape_agrees(src: ptr<u8>, len: i64, flags: u32, cap: i64) -> bool {
+    var a: array<u8, 4096>;
+    var b: array<u8, 4096>;
+    var i: i32 = 0;
+    while (i < 4096) {
+        a[i] = 170;
+        b[i] = 170;
+        i += 1;
+    }
+    var ra: i64 = esc_escape(src, len, &a[0], cap, flags);
+    var rb: i64 = ffi_escape(src, len, &b[0], cap, flags);
+    if (ra != rb) {
+        return false;
+    }
+    return same_bytes(&a[0], &b[0], 4096);
+}
+
+fun size_query_agrees(src: ptr<u8>, len: i64, flags: u32) -> bool {
+    return esc_escape(src, len, null, 0, flags) == ffi_escape(src, len, null, 0, flags);
+}
+
+fun both(s: str) {
+    var p: ptr<u8> = s as ptr<u8>;
+    var n: i64 = len_of(s);
+    check(esc_utf8_check(p, n) == ffi_utf8_check(p, n), s);
+    check(esc_utf8_count(p, n) == ffi_utf8_count(p, n), s);
+    var flags: u32 = 0;
+    while (flags < 8) {
+        check(size_query_agrees(p, n, flags), s);
+        var need: i64 = esc_escape(p, n, null, 0, flags);
+        if (need >= 0 && need < 3000) {
+            check(escape_agrees(p, n, flags, need + 1), s);
+            check(escape_agrees(p, n, flags, need), s);
+            if (need > 0) {
+                check(escape_agrees(p, n, flags, need - 1), s);
+            }
+            check(escape_agrees(p, n, flags, 0), s);
+        } else {
+            check(escape_agrees(p, n, flags, 64), s);
+        }
+        flags += 1;
+    }
+}
+
+fun test_fixed() {
+    both("");
+    both("plain");
+    both("a\"b\\c");
+    both("\n\t\r\x08\x0c");
+    both("\x01\x1f\x7f");
+    both("é😀");
+    both("<a&'>");
+    both("héllo😀 wörld");
+    both("日本語 テキスト");
+    // Invalid sequences.
+    both("\xff");
+    both("\xed\xa0\x80");          // surrogate
+    both("\xc0\xaf");              // overlong
+    both("\xe0\x80\xaf");          // overlong 3-byte
+    both("\xf0\x80\x80\xaf");      // overlong 4-byte
+    both("\xf4\x90\x80\x80");      // above U+10FFFF
+    both("\xf8\x88\x80\x80\x80");  // 5-byte lead
+    both("ab\xe2\x82");            // truncated
+    both("\x80");                  // stray continuation
+    both("ok\xc3");                // truncated at end
+
+    // Argument validation.
+    check(esc_escape(null, 4, null, 0, 0) == ffi_escape(null, 4, null, 0, 0), "null src");
+    check(esc_escape(null, 0, null, 0, 0) == ffi_escape(null, 0, null, 0, 0), "null src, len 0");
+    check(esc_escape("x" as ptr<u8>, 0 - 1, null, 0, 0) == ffi_escape("x" as ptr<u8>, 0 - 1, null, 0, 0), "negative len");
+    check(esc_escape("x" as ptr<u8>, 1, null, 0 - 1, 0) == ffi_escape("x" as ptr<u8>, 1, null, 0 - 1, 0), "negative cap");
+    check(esc_utf8_check(null, 0) == ffi_utf8_check(null, 0), "check null 0");
+    check(esc_utf8_check(null, 4) == ffi_utf8_check(null, 4), "check null 4");
+    check(esc_utf8_check("ok" as ptr<u8>, 0 - 1) == ffi_utf8_check("ok" as ptr<u8>, 0 - 1), "check negative");
+    check(esc_utf8_count(null, 4) == ffi_utf8_count(null, 4), "count null 4");
+    check(esc_utf8_count(null, 0) == ffi_utf8_count(null, 0), "count null 0");
+}
+
+// Appends the UTF-8 encoding of cp and returns the new length.
+fun append_utf8(buf: ptr<u8>, at: i64, cp: u32) -> i64 {
+    if (cp < 128) {
+        deref buf[at] = cp as u8;
+        return at + 1;
+    }
+    if (cp < 2048) {
+        deref buf[at] = (192 | (cp >> 6)) as u8;
+        deref buf[at + 1] = (128 | (cp & 63)) as u8;
+        return at + 2;
+    }
+    if (cp < 65536) {
+        deref buf[at] = (224 | (cp >> 12)) as u8;
+        deref buf[at + 1] = (128 | ((cp >> 6) & 63)) as u8;
+        deref buf[at + 2] = (128 | (cp & 63)) as u8;
+        return at + 3;
+    }
+    deref buf[at] = (240 | (cp >> 18)) as u8;
+    deref buf[at + 1] = (128 | ((cp >> 12) & 63)) as u8;
+    deref buf[at + 2] = (128 | ((cp >> 6) & 63)) as u8;
+    deref buf[at + 3] = (128 | (cp & 63)) as u8;
+    return at + 4;
+}
+
+fun random_cp() -> u32 {
+    var k: u64 = below(8);
+    if (k < 3) {
+        return below(128) as u32;                         // ASCII, controls included
+    }
+    if (k == 3) {
+        return (128 + below(1920)) as u32;                // 2-byte
+    }
+    if (k == 4) {
+        return (2048 + below(63488)) as u32;              // 3-byte below the surrogates
+    }
+    if (k == 5) {
+        return (57344 + below(8192)) as u32;              // 3-byte above the surrogates
+    }
+    if (k == 6) {
+        return (65536 + below(1048576)) as u32;          // 4-byte
+    }
+    var edge: u64 = below(6);
+    if (edge == 0) { return 127; }
+    if (edge == 1) { return 128; }
+    if (edge == 2) { return 2047; }
+    if (edge == 3) { return 65535; }
+    if (edge == 4) { return 1114111; }
+    return 55295;
+}
+
+fun test_random(iters: i32) {
+    var text: array<u8, 600>;
+    var i: i32 = 0;
+    while (i < iters) {
+        // Valid text, then possibly damaged.
+        var n: i64 = 0;
+        var chars: u64 = below(40);
+        var c: u64 = 0;
+        while (c < chars && n < 500) {
+            n = append_utf8(&text[0], n, random_cp());
+            c += 1;
+        }
+        var damage: u64 = below(5);
+        if (damage == 0 && n > 0) {
+            text[below(n as u64) as i32] = below(256) as u8;      // random byte
+        } else if (damage == 1 && n > 1) {
+            n -= 1;                                               // cut a sequence short
+        } else if (damage == 2) {
+            text[n as i32] = (128 + below(64)) as u8;             // stray continuation
+            n += 1;
+        } else if (damage == 3) {
+            n = 0;
+            var m: u64 = below(24);
+            while (m > 0) {
+                text[n as i32] = below(256) as u8;                // pure noise
+                n += 1;
+                m -= 1;
+            }
+        }
+        text[n as i32] = 0;
+        var flags: u32 = below(8) as u32;
+        check(esc_utf8_check(&text[0], n) == ffi_utf8_check(&text[0], n), "random utf8_check");
+        check(esc_utf8_count(&text[0], n) == ffi_utf8_count(&text[0], n), "random utf8_count");
+        check(size_query_agrees(&text[0], n, flags), "random size query");
+        var need: i64 = esc_escape(&text[0], n, null, 0, flags);
+        if (need >= 0 && need < 3000) {
+            check(escape_agrees(&text[0], n, flags, need + 1), "random fill");
+            var cap: i64 = below((need + 2) as u64) as i64;
+            check(escape_agrees(&text[0], n, flags, cap), "random partial cap");
+        }
+        i += 1;
+    }
+}
+
+fun main() -> i32 {
+    var iters: i32 = 20000;
+    var p: ptr<u8> = c_getenv("WJSON_FUZZ_ITERS" as ptr<u8>);
+    if (p != null) {
+        var x: i32 = 0;
+        var k: i64 = 0;
+        while (p[k] >= 48 && p[k] <= 57) {
+            x = x * 10 + ((p[k] - 48) as i32);
+            k += 1;
+        }
+        if (x > 0) {
+            iters = x;
+        }
+    }
+    test_fixed();
+    test_random(iters);
+    println("escape_test: {}/{} checks passed", CHECKS - FAILURES, CHECKS);
+    if (FAILURES != 0) {
+        println("escape_test: {} FAILED", FAILURES);
+        return 1;
+    }
+    return 0;
+}

@@ -1,0 +1,216 @@
+// SPDX-License-Identifier: MPL-2.0
+//
+// JSON string escaping and UTF-8 validation in pure Wave (a port of
+// native/src/escape.cpp).
+//
+// esc_escape writes into `dst` only while the output fits and always returns
+// the number of bytes the full result needs, so one pass both sizes and fills
+// a buffer: call once with cap == 0, then again with a buffer. When the result
+// is shorter than `cap` it is also NUL-terminated. Negative returns are
+// JSON_NUM_* codes.
+
+import("./consts")::{JSON_NUM_INVALID, JSON_ESCAPE_ASCII, JSON_ESCAPE_HTML, JSON_ESCAPE_QUOTES};
+
+// Decodes one UTF-8 sequence at p, with `avail` bytes remaining (> 0). Returns
+// its length (1..4) and stores the code point, or returns 0 for an invalid,
+// overlong, surrogate or truncated sequence.
+fun _decode_utf8(p: ptr<u8>, avail: i64, cp: ptr<u32>) -> i32 {
+    var b0: u32 = p[0] as u32;
+    if (b0 < 128) {
+        deref cp = b0;
+        return 1;
+    }
+    var n: i32 = 0;
+    var min: u32 = 0;
+    var c: u32 = 0;
+    if ((b0 & 224) == 192) {
+        n = 2;
+        min = 128;
+        c = b0 & 31;
+    } else if ((b0 & 240) == 224) {
+        n = 3;
+        min = 2048;
+        c = b0 & 15;
+    } else if ((b0 & 248) == 240) {
+        n = 4;
+        min = 65536;
+        c = b0 & 7;
+    } else {
+        return 0;
+    }
+    if (avail < (n as i64)) {
+        return 0;
+    }
+    var i: i32 = 1;
+    while (i < n) {
+        var b: u32 = p[i] as u32;
+        if ((b & 192) != 128) {
+            return 0;
+        }
+        c = (c << 6) | (b & 63);
+        i += 1;
+    }
+    if (c < min || c > 1114111 || (c >= 55296 && c <= 57343)) {
+        return 0;
+    }
+    deref cp = c;
+    return n;
+}
+
+// Output sink that counts everything but only writes while it fits.
+struct Sink {
+    dst: ptr<u8>;
+    cap: i64;
+    len: i64;
+}
+
+fun _put(s: ptr<Sink>, c: u8) {
+    var len: i64 = deref s.len;
+    if (len < deref s.cap) {
+        var d: ptr<u8> = deref s.dst;
+        deref d[len] = c;
+    }
+    deref s.len = len + 1;
+}
+
+fun _hex(n: u32) -> u8 {
+    if (n < 10) {
+        return (48 + n) as u8;
+    }
+    return (87 + n) as u8;
+}
+
+fun _unicode_escape(s: ptr<Sink>, unit: u32) {
+    _put(s, 92);
+    _put(s, 117);
+    _put(s, _hex((unit >> 12) & 15));
+    _put(s, _hex((unit >> 8) & 15));
+    _put(s, _hex((unit >> 4) & 15));
+    _put(s, _hex(unit & 15));
+}
+
+fun _put_escape(s: ptr<Sink>, letter: u8) {
+    _put(s, 92);
+    _put(s, letter);
+}
+
+// JSON-escapes UTF-8 `src`. Returns the needed length or JSON_NUM_INVALID.
+pub fun esc_escape(src: ptr<u8>, len: i64, dst: ptr<u8>, cap: i64, flags: u32) -> i64 {
+    if (len < 0 || (len > 0 && src == null) || cap < 0) {
+        return JSON_NUM_INVALID as i64;
+    }
+    var ascii: bool = (flags & JSON_ESCAPE_ASCII) != 0;
+    var html: bool = (flags & JSON_ESCAPE_HTML) != 0;
+    var quotes: bool = (flags & JSON_ESCAPE_QUOTES) != 0;
+
+    var s: Sink = Sink { dst: dst, cap: cap, len: 0 };
+    if (dst == null) {
+        s.cap = 0;
+    }
+    if (quotes) {
+        _put(&s, 34);
+    }
+
+    var p: i64 = 0;
+    while (p < len) {
+        var b: u8 = src[p];
+        if (b >= 128) {
+            var cp: u32 = 0;
+            var n: i32 = _decode_utf8(&src[p], len - p, &cp);
+            if (n == 0) {
+                return JSON_NUM_INVALID as i64;
+            }
+            if (!ascii) {
+                var k: i32 = 0;
+                while (k < n) {
+                    _put(&s, src[p + (k as i64)]);
+                    k += 1;
+                }
+            } else if (cp < 65536) {
+                _unicode_escape(&s, cp);
+            } else {
+                var v: u32 = cp - 65536;
+                _unicode_escape(&s, 55296 + (v >> 10));
+                _unicode_escape(&s, 56320 + (v & 1023));
+            }
+            p += n as i64;
+            continue;
+        }
+        if (b == 34) {
+            _put_escape(&s, 34);
+        } else if (b == 92) {
+            _put_escape(&s, 92);
+        } else if (b == 8) {
+            _put_escape(&s, 98);
+        } else if (b == 12) {
+            _put_escape(&s, 102);
+        } else if (b == 10) {
+            _put_escape(&s, 110);
+        } else if (b == 13) {
+            _put_escape(&s, 114);
+        } else if (b == 9) {
+            _put_escape(&s, 116);
+        } else if (b == 60 || b == 62 || b == 38 || b == 39) {  // < > & '
+            if (html) {
+                _unicode_escape(&s, b as u32);
+            } else {
+                _put(&s, b);
+            }
+        } else if (b < 32 || b == 127) {
+            _unicode_escape(&s, b as u32);
+        } else {
+            _put(&s, b);
+        }
+        p += 1;
+    }
+    if (quotes) {
+        _put(&s, 34);
+    }
+    var total: i64 = s.len;
+    if (total < s.cap) {
+        var d: ptr<u8> = s.dst;
+        deref d[total] = 0;
+    }
+    return total;
+}
+
+// Returns -1 when `src` is valid UTF-8 (an empty range is valid), else the
+// offset of the first bad byte. A negative `len`, or a null `src` with
+// `len > 0`, is not valid input and yields 0.
+pub fun esc_utf8_check(src: ptr<u8>, len: i64) -> i64 {
+    if (len == 0) {
+        return 0 - 1;
+    }
+    if (len < 0 || src == null) {
+        return 0;
+    }
+    var p: i64 = 0;
+    while (p < len) {
+        var cp: u32 = 0;
+        var n: i32 = _decode_utf8(&src[p], len - p, &cp);
+        if (n == 0) {
+            return p;
+        }
+        p += n as i64;
+    }
+    return 0 - 1;
+}
+
+// Number of Unicode code points in valid UTF-8 `src`, or JSON_NUM_INVALID.
+pub fun esc_utf8_count(src: ptr<u8>, len: i64) -> i64 {
+    if (len < 0 || (len > 0 && src == null)) {
+        return JSON_NUM_INVALID as i64;
+    }
+    var p: i64 = 0;
+    var count: i64 = 0;
+    while (p < len) {
+        var cp: u32 = 0;
+        var n: i32 = _decode_utf8(&src[p], len - p, &cp);
+        if (n == 0) {
+            return JSON_NUM_INVALID as i64;
+        }
+        p += n as i64;
+        count += 1;
+    }
+    return count;
+}
