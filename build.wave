@@ -499,9 +499,9 @@ fun task_test(b: ptr<Buffer>, flags: ptr<Buffer>) {
     }
     cxx_test(b, flags);
 
-    var tests: array<str, 7> = ["wjson_test", "edit_test", "stream_test", "number_test", "escape_test", "core_parse_test", "core_lookup_test"];
+    var tests: array<str, 8> = ["wjson_test", "edit_test", "stream_test", "number_test", "escape_test", "core_parse_test", "core_lookup_test", "core_edit_test"];
     var t: i32 = 0;
-    while (t < 7) {
+    while (t < 8) {
         var tsrc: Buffer = buffer_new(64);
         add(&tsrc, "tests/");
         add(&tsrc, tests[t]);

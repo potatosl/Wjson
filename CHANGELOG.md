@@ -52,6 +52,14 @@ minor releases.
   compiler and says how to install what is missing; it prints the SHA-256 of
   the download and can verify it (`WJSON_SHA256`). CI installs the commit under
   test with it on Linux and macOS and runs a program through the wrapper.
+- New `src/core_edit.wave`: the editing operations (new values, `set_root`,
+  array insert/set/remove/push, object set/remove/clear, deep copy including
+  copying a document into itself), a port of `edit.rs`. It keeps the key index
+  of large objects current as members are added and removed. Not used by the
+  Wave API yet. `tests/core_edit_test.wave` applies the same random sequences of
+  edits (including invalid ones) to a Rust document and a Wave document and
+  compares every returned code, the whole tree and the answers of key lookups
+  and JSON Pointers (1.2 million checks at 300 sequences).
 - `.gitattributes` marks `*.wave` as Wave for GitHub's language statistics.
 
 ### Native

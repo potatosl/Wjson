@@ -1,0 +1,587 @@
+// SPDX-License-Identifier: MPL-2.0
+//
+// In-place editing of a parsed (or freshly created) document, in pure Wave. A
+// port of core/src/edit.rs and of the editing entry points in lib.rs.
+//
+// Model:
+// * New values are created detached (no parent). Attaching puts a detached
+//   value under exactly one parent; attaching an already attached value is
+//   refused (copy it first), so the document always stays a tree.
+// * Attaching a container under one of its own descendants is refused.
+// * Replacing or removing a child detaches it; it can be attached again.
+// * Child lists live in shared side tables. A list that must grow and is not
+//   at the end of its table is moved to the end with doubled capacity, so
+//   repeated appends are amortized O(1). The old slots become garbage that is
+//   reclaimed when the document is freed.
+//
+// Creation functions return the new node id, or a negative code; mutations
+// return 0 or a negative code:
+//   -1 invalid document/node/argument   -2 value already attached
+//   -3 would create a cycle             -4 no such key/index
+//   -5 wrong container kind            -6 bad number / not valid UTF-8
+//   -7 copy nests too deep
+
+import("./escape")::{esc_utf8_check};
+import("./core_dom")::{
+    CoreDoc, core_doc_empty, core_node_push, core_text, core_extra_push, core_elems_extend,
+    core_members_extend, core_caps_ensure, core_find_member, core_index_drop, core_index_add,
+    core_index_build, core_type, core_at,
+    CORE_NULL, CORE_BOOL, CORE_NUMBER, CORE_STRING, CORE_ARRAY, CORE_OBJECT,
+    CORE_NUM_INTEGER, CORE_NUM_NEGATIVE, CORE_PARENT_ROOT, CORE_PARENT_NONE,
+    CORE_INDEX_THRESHOLD,
+};
+
+pub const CORE_EDIT_OK: i32 = 0;
+pub const CORE_EDIT_INVALID: i32 = -1;
+pub const CORE_EDIT_ATTACHED: i32 = -2;
+pub const CORE_EDIT_CYCLE: i32 = -3;
+pub const CORE_EDIT_NOT_FOUND: i32 = -4;
+pub const CORE_EDIT_WRONG_TYPE: i32 = -5;
+pub const CORE_EDIT_BAD_VALUE: i32 = -6;
+pub const CORE_EDIT_TOO_DEEP: i32 = -7;
+
+// Copying stops nesting at this depth (JSON_MAX_DEPTH_LIMIT).
+const MAX_COPY_DEPTH: i32 = 2048;
+
+// An empty, editable document with no root.
+pub fun core_new_doc() -> CoreDoc {
+    return core_doc_empty();
+}
+
+// ---- checks -------------------------------------------------------------------------
+
+fun _ok_doc(d: ptr<CoreDoc>) -> bool {
+    return deref d.err_code == 0;
+}
+
+// Node id as i32 when it addresses an existing node, else -1.
+fun _check(d: ptr<CoreDoc>, id: i64) -> i32 {
+    if (id < 0 || id >= deref d.node_count) {
+        return CORE_EDIT_INVALID;
+    }
+    return id as i32;
+}
+
+fun _kind(d: ptr<CoreDoc>, id: i32) -> i32 {
+    var kinds: ptr<u8> = deref d.kinds;
+    return kinds[id] as i32;
+}
+
+// `id` must exist and have the given kind: id, or -1 / -5.
+fun _check_kind(d: ptr<CoreDoc>, id: i64, kind: i32) -> i32 {
+    var c: i32 = _check(d, id);
+    if (c < 0) {
+        return c;
+    }
+    if (_kind(d, c) != kind) {
+        return CORE_EDIT_WRONG_TYPE;
+    }
+    return c;
+}
+
+// `value` must be detached and must not be `container` or an ancestor of it.
+fun _check_attach(d: ptr<CoreDoc>, container: i32, value: i32) -> i32 {
+    var parents: ptr<i32> = deref d.parents;
+    if (parents[value] != CORE_PARENT_NONE) {
+        return CORE_EDIT_ATTACHED;
+    }
+    var cur: i32 = container;
+    while (cur >= 0) {
+        if (cur == value) {
+            return CORE_EDIT_CYCLE;
+        }
+        cur = parents[cur];
+    }
+    return CORE_EDIT_OK;
+}
+
+fun _detach(d: ptr<CoreDoc>, value: i32) {
+    var parents: ptr<i32> = deref d.parents;
+    deref parents[value] = CORE_PARENT_NONE;
+}
+
+// ---- creating detached values ---------------------------------------------------------
+
+fun _wrap(id: i64) -> i32 {
+    if (id < 0 || id > 2147483647) {
+        return CORE_EDIT_INVALID;
+    }
+    return id as i32;
+}
+
+pub fun core_new_null(d: ptr<CoreDoc>) -> i32 {
+    if (!_ok_doc(d)) { return CORE_EDIT_INVALID; }
+    return _wrap(core_node_push(d, CORE_NULL as u8, 0, 0, 0));
+}
+
+pub fun core_new_bool(d: ptr<CoreDoc>, value: i32) -> i32 {
+    if (!_ok_doc(d)) { return CORE_EDIT_INVALID; }
+    var flag: u8 = 0;
+    if (value != 0) { flag = 1; }
+    return _wrap(core_node_push(d, CORE_BOOL as u8, flag, 0, 0));
+}
+
+fun _is_digit(c: u8) -> bool {
+    return c >= 48 && c <= 57;
+}
+
+// RFC 8259 number grammar.
+fun _is_json_number(s: ptr<u8>, n: i64) -> bool {
+    var i: i64 = 0;
+    if (i < n && s[i] == 45) { i += 1; }
+    if (i >= n) { return false; }
+    if (s[i] == 48) {
+        i += 1;
+    } else if (s[i] >= 49 && s[i] <= 57) {
+        while (i < n && _is_digit(s[i])) { i += 1; }
+    } else {
+        return false;
+    }
+    if (i < n && s[i] == 46) {
+        i += 1;
+        var st: i64 = i;
+        while (i < n && _is_digit(s[i])) { i += 1; }
+        if (i == st) { return false; }
+    }
+    if (i < n && (s[i] == 101 || s[i] == 69)) {
+        i += 1;
+        if (i < n && (s[i] == 43 || s[i] == 45)) { i += 1; }
+        var st2: i64 = i;
+        while (i < n && _is_digit(s[i])) { i += 1; }
+        if (i == st2) { return false; }
+    }
+    return i == n;
+}
+
+fun _number_flags(s: ptr<u8>, n: i64) -> u8 {
+    var flag: u8 = CORE_NUM_INTEGER;
+    var i: i64 = 0;
+    while (i < n) {
+        if (s[i] == 46 || s[i] == 101 || s[i] == 69) {
+            flag = flag & (255 - CORE_NUM_INTEGER);
+        }
+        i += 1;
+    }
+    if (n > 0 && s[0] == 45) {
+        flag = flag | CORE_NUM_NEGATIVE;
+    }
+    return flag;
+}
+
+fun _bytes_ok(p: ptr<u8>, len: i64) -> bool {
+    return len >= 0 && (len == 0 || p != null);
+}
+
+// `lexeme` must be a JSON number ("12", "-0.5", "1e9"); -6 otherwise.
+pub fun core_new_number(d: ptr<CoreDoc>, lexeme: ptr<u8>, len: i64) -> i32 {
+    if (!_ok_doc(d) || !_bytes_ok(lexeme, len)) { return CORE_EDIT_INVALID; }
+    if (!_is_json_number(lexeme, len)) { return CORE_EDIT_BAD_VALUE; }
+    var flag: u8 = _number_flags(lexeme, len);
+    var start: i64 = core_extra_push(d, lexeme, len);
+    if (start < 0) { return CORE_EDIT_INVALID; }
+    return _wrap(core_node_push(d, CORE_NUMBER as u8, flag, start as u32, len as u32));
+}
+
+// `text` is the raw (unescaped) UTF-8 content; -6 for invalid UTF-8.
+pub fun core_new_string(d: ptr<CoreDoc>, text: ptr<u8>, len: i64) -> i32 {
+    if (!_ok_doc(d) || !_bytes_ok(text, len)) { return CORE_EDIT_INVALID; }
+    if (esc_utf8_check(text, len) >= 0) { return CORE_EDIT_BAD_VALUE; }
+    var start: i64 = core_extra_push(d, text, len);
+    if (start < 0) { return CORE_EDIT_INVALID; }
+    return _wrap(core_node_push(d, CORE_STRING as u8, 0, start as u32, len as u32));
+}
+
+pub fun core_new_array(d: ptr<CoreDoc>) -> i32 {
+    if (!_ok_doc(d)) { return CORE_EDIT_INVALID; }
+    return _wrap(core_node_push(d, CORE_ARRAY as u8, 0, deref d.elem_count as u32, 0));
+}
+
+pub fun core_new_object(d: ptr<CoreDoc>) -> i32 {
+    if (!_ok_doc(d)) { return CORE_EDIT_INVALID; }
+    return _wrap(core_node_push(d, CORE_OBJECT as u8, 0, deref d.member_count as u32, 0));
+}
+
+// ---- root and parent ---------------------------------------------------------------------
+
+// Makes a detached value the root; the previous root becomes detached.
+pub fun core_set_root(d: ptr<CoreDoc>, node: i32) -> i32 {
+    if (!_ok_doc(d)) { return CORE_EDIT_INVALID; }
+    var v: i32 = _check(d, node as i64);
+    if (v < 0) { return v; }
+    if ((v as i64) == deref d.root) { return CORE_EDIT_OK; }
+    var parents: ptr<i32> = deref d.parents;
+    if (parents[v] != CORE_PARENT_NONE) { return CORE_EDIT_ATTACHED; }
+    if (deref d.root >= 0) {
+        _detach(d, deref d.root as i32);
+    }
+    deref d.root = v as i64;
+    deref parents[v] = CORE_PARENT_ROOT;
+    return CORE_EDIT_OK;
+}
+
+// ---- growing child lists ----------------------------------------------------------------
+
+fun _capacity(d: ptr<CoreDoc>, id: i32) -> i64 {
+    var lens: ptr<u32> = deref d.lens;
+    if (deref d.caps != null) {
+        var caps: ptr<u32> = deref d.caps;
+        if (caps[id] != 0) {
+            return caps[id] as i64;
+        }
+    }
+    return lens[id] as i64;
+}
+
+fun _set_capacity(d: ptr<CoreDoc>, id: i32, cap: i64) -> bool {
+    if (!core_caps_ensure(d)) { return false; }
+    var caps: ptr<u32> = deref d.caps;
+    deref caps[id] = cap as u32;
+    return true;
+}
+
+// Makes room for one more element in array `arr`, relocating if needed.
+fun _reserve_elem(d: ptr<CoreDoc>, arr: i32) -> bool {
+    var starts: ptr<u32> = deref d.starts;
+    var lens: ptr<u32> = deref d.lens;
+    var start: i64 = starts[arr] as i64;
+    var len: i64 = lens[arr] as i64;
+    if (len < _capacity(d, arr)) {
+        return true;
+    }
+    if (start + len == deref d.elem_count) {
+        if (core_elems_extend(d, 1) < 0) { return false; }  // at the tail: grow in place
+        return _set_capacity(d, arr, len + 1);
+    }
+    var cap: i64 = len * 2;
+    if (cap < 4) { cap = 4; }
+    var new_start: i64 = core_elems_extend(d, cap);
+    if (new_start < 0) { return false; }
+    var elems: ptr<u32> = deref d.elems;
+    var i: i64 = 0;
+    while (i < len) {
+        deref elems[new_start + i] = elems[start + i];
+        i += 1;
+    }
+    starts = deref d.starts;
+    deref starts[arr] = new_start as u32;
+    return _set_capacity(d, arr, cap);
+}
+
+fun _reserve_member(d: ptr<CoreDoc>, obj: i32) -> bool {
+    var starts: ptr<u32> = deref d.starts;
+    var lens: ptr<u32> = deref d.lens;
+    var start: i64 = starts[obj] as i64;
+    var len: i64 = lens[obj] as i64;
+    if (len < _capacity(d, obj)) {
+        return true;
+    }
+    if (start + len == deref d.member_count) {
+        if (core_members_extend(d, 1) < 0) { return false; }
+        return _set_capacity(d, obj, len + 1);
+    }
+    var cap: i64 = len * 2;
+    if (cap < 4) { cap = 4; }
+    var new_start: i64 = core_members_extend(d, cap);
+    if (new_start < 0) { return false; }
+    var ks: ptr<u32> = deref d.mkey_start;
+    var kl: ptr<u32> = deref d.mkey_len;
+    var mv: ptr<u32> = deref d.mvalue;
+    var i: i64 = 0;
+    while (i < len) {
+        deref ks[new_start + i] = ks[start + i];
+        deref kl[new_start + i] = kl[start + i];
+        deref mv[new_start + i] = mv[start + i];
+        i += 1;
+    }
+    starts = deref d.starts;
+    deref starts[obj] = new_start as u32;
+    return _set_capacity(d, obj, cap);
+}
+
+// ---- arrays -------------------------------------------------------------------------------
+
+// Inserts `value` at `index` (index == len appends).
+pub fun core_arr_insert(d: ptr<CoreDoc>, arr_in: i32, index: i64, value_in: i32) -> i32 {
+    if (!_ok_doc(d)) { return CORE_EDIT_INVALID; }
+    var arr: i32 = _check_kind(d, arr_in as i64, CORE_ARRAY);
+    if (arr < 0) { return arr; }
+    var value: i32 = _check(d, value_in as i64);
+    if (value < 0) { return value; }
+    var lens: ptr<u32> = deref d.lens;
+    var len: i64 = lens[arr] as i64;
+    if (index < 0 || index > len) { return CORE_EDIT_NOT_FOUND; }
+    var att: i32 = _check_attach(d, arr, value);
+    if (att < 0) { return att; }
+    if (!_reserve_elem(d, arr)) { return CORE_EDIT_INVALID; }
+    var starts: ptr<u32> = deref d.starts;
+    var elems: ptr<u32> = deref d.elems;
+    var start: i64 = starts[arr] as i64;
+    var i: i64 = len;
+    while (i > index) {
+        deref elems[start + i] = elems[start + i - 1];
+        i -= 1;
+    }
+    deref elems[start + index] = value as u32;
+    lens = deref d.lens;
+    deref lens[arr] = (len + 1) as u32;
+    var parents: ptr<i32> = deref d.parents;
+    deref parents[value] = arr;
+    return CORE_EDIT_OK;
+}
+
+pub fun core_arr_push(d: ptr<CoreDoc>, arr: i32, value: i32) -> i32 {
+    if (!_ok_doc(d)) { return CORE_EDIT_INVALID; }
+    var a: i32 = _check_kind(d, arr as i64, CORE_ARRAY);
+    if (a < 0) { return a; }
+    var lens: ptr<u32> = deref d.lens;
+    return core_arr_insert(d, arr, lens[a] as i64, value);
+}
+
+// Replaces element `index`; the old element becomes detached.
+pub fun core_arr_set(d: ptr<CoreDoc>, arr_in: i32, index: i64, value_in: i32) -> i32 {
+    if (!_ok_doc(d)) { return CORE_EDIT_INVALID; }
+    var arr: i32 = _check_kind(d, arr_in as i64, CORE_ARRAY);
+    if (arr < 0) { return arr; }
+    var value: i32 = _check(d, value_in as i64);
+    if (value < 0) { return value; }
+    var lens: ptr<u32> = deref d.lens;
+    var starts: ptr<u32> = deref d.starts;
+    if (index < 0 || index >= (lens[arr] as i64)) { return CORE_EDIT_NOT_FOUND; }
+    var slot: i64 = (starts[arr] as i64) + index;
+    var elems: ptr<u32> = deref d.elems;
+    var old: u32 = elems[slot];
+    if ((old as i64) == (value as i64)) { return CORE_EDIT_OK; }
+    var att: i32 = _check_attach(d, arr, value);
+    if (att < 0) { return att; }
+    deref elems[slot] = value as u32;
+    _detach(d, old as i32);
+    var parents: ptr<i32> = deref d.parents;
+    deref parents[value] = arr;
+    return CORE_EDIT_OK;
+}
+
+// Removes element `index`; returns the detached element's id (or < 0).
+pub fun core_arr_remove(d: ptr<CoreDoc>, arr_in: i32, index: i64) -> i32 {
+    if (!_ok_doc(d)) { return CORE_EDIT_INVALID; }
+    var arr: i32 = _check_kind(d, arr_in as i64, CORE_ARRAY);
+    if (arr < 0) { return arr; }
+    var lens: ptr<u32> = deref d.lens;
+    var starts: ptr<u32> = deref d.starts;
+    var len: i64 = lens[arr] as i64;
+    if (index < 0 || index >= len) { return CORE_EDIT_NOT_FOUND; }
+    var start: i64 = starts[arr] as i64;
+    var elems: ptr<u32> = deref d.elems;
+    var old: u32 = elems[start + index];
+    var i: i64 = index;
+    while (i + 1 < len) {
+        deref elems[start + i] = elems[start + i + 1];
+        i += 1;
+    }
+    deref lens[arr] = (len - 1) as u32;
+    _detach(d, old as i32);
+    return _wrap(old as i64);
+}
+
+// ---- objects -------------------------------------------------------------------------------
+
+// Appends a member (duplicate keys allowed) and keeps the key index current.
+fun _obj_append(d: ptr<CoreDoc>, obj: i32, key_start: u32, key_len: u32, value: i32) -> i32 {
+    if (!_reserve_member(d, obj)) { return CORE_EDIT_INVALID; }
+    var starts: ptr<u32> = deref d.starts;
+    var lens: ptr<u32> = deref d.lens;
+    var n: i64 = lens[obj] as i64;
+    var at: i64 = (starts[obj] as i64) + n;
+    var ks: ptr<u32> = deref d.mkey_start;
+    var kl: ptr<u32> = deref d.mkey_len;
+    var mv: ptr<u32> = deref d.mvalue;
+    deref ks[at] = key_start;
+    deref kl[at] = key_len;
+    deref mv[at] = value as u32;
+    deref lens[obj] = (n + 1) as u32;
+    var parents: ptr<i32> = deref d.parents;
+    deref parents[value] = obj;
+    if (!core_index_add(d, obj, n)) { return CORE_EDIT_INVALID; }
+    return CORE_EDIT_OK;
+}
+
+// Sets `key` to `value`: replaces the value of the last member with that key,
+// or appends a new member. A replaced value becomes detached.
+pub fun core_obj_set(d: ptr<CoreDoc>, obj_in: i32, key: ptr<u8>, key_len: i64, value_in: i32) -> i32 {
+    if (!_ok_doc(d) || !_bytes_ok(key, key_len)) { return CORE_EDIT_INVALID; }
+    var obj: i32 = _check_kind(d, obj_in as i64, CORE_OBJECT);
+    if (obj < 0) { return obj; }
+    var value: i32 = _check(d, value_in as i64);
+    if (value < 0) { return value; }
+    if (esc_utf8_check(key, key_len) >= 0) { return CORE_EDIT_BAD_VALUE; }
+    var pos: i64 = core_find_member(d, obj, key, key_len);
+    if (pos >= 0) {
+        var starts: ptr<u32> = deref d.starts;
+        var slot: i64 = (starts[obj] as i64) + pos;
+        var mv: ptr<u32> = deref d.mvalue;
+        var old: u32 = mv[slot];
+        if ((old as i64) == (value as i64)) { return CORE_EDIT_OK; }
+        var att: i32 = _check_attach(d, obj, value);
+        if (att < 0) { return att; }
+        deref mv[slot] = value as u32;
+        _detach(d, old as i32);
+        var parents: ptr<i32> = deref d.parents;
+        deref parents[value] = obj;
+        return CORE_EDIT_OK;
+    }
+    var att2: i32 = _check_attach(d, obj, value);
+    if (att2 < 0) { return att2; }
+    var key_start: i64 = core_extra_push(d, key, key_len);
+    if (key_start < 0) { return CORE_EDIT_INVALID; }
+    return _obj_append(d, obj, key_start as u32, key_len as u32, value);
+}
+
+fun _same_key(d: ptr<CoreDoc>, pos: i64, key: ptr<u8>, klen: i64) -> bool {
+    var kl: ptr<u32> = deref d.mkey_len;
+    if ((kl[pos] as i64) != klen) {
+        return false;
+    }
+    var ks: ptr<u32> = deref d.mkey_start;
+    var kp: ptr<u8> = core_text(d, ks[pos]);
+    var i: i64 = 0;
+    while (i < klen) {
+        if (kp[i] != key[i]) {
+            return false;
+        }
+        i += 1;
+    }
+    return true;
+}
+
+// Removes every member named `key`; returns how many were removed (or < 0).
+pub fun core_obj_remove(d: ptr<CoreDoc>, obj_in: i32, key: ptr<u8>, key_len: i64) -> i32 {
+    if (!_ok_doc(d) || !_bytes_ok(key, key_len)) { return CORE_EDIT_INVALID; }
+    var obj: i32 = _check_kind(d, obj_in as i64, CORE_OBJECT);
+    if (obj < 0) { return obj; }
+    var starts: ptr<u32> = deref d.starts;
+    var lens: ptr<u32> = deref d.lens;
+    var start: i64 = starts[obj] as i64;
+    var len: i64 = lens[obj] as i64;
+    var ks: ptr<u32> = deref d.mkey_start;
+    var kl: ptr<u32> = deref d.mkey_len;
+    var mv: ptr<u32> = deref d.mvalue;
+    var kept: i64 = 0;
+    var removed: i64 = 0;
+    var i: i64 = 0;
+    while (i < len) {
+        if (_same_key(d, start + i, key, key_len)) {
+            _detach(d, mv[start + i] as i32);
+            removed += 1;
+        } else {
+            deref ks[start + kept] = ks[start + i];
+            deref kl[start + kept] = kl[start + i];
+            deref mv[start + kept] = mv[start + i];
+            kept += 1;
+        }
+        i += 1;
+    }
+    if (removed == 0) { return 0; }
+    deref lens[obj] = kept as u32;
+    core_index_drop(d, obj);
+    if (kept >= CORE_INDEX_THRESHOLD) {
+        if (!core_index_build(d, obj)) { return CORE_EDIT_INVALID; }
+    }
+    return removed as i32;
+}
+
+// Removes every member of an object at once; returns how many there were.
+pub fun core_obj_clear(d: ptr<CoreDoc>, obj_in: i32) -> i32 {
+    if (!_ok_doc(d)) { return CORE_EDIT_INVALID; }
+    var obj: i32 = _check_kind(d, obj_in as i64, CORE_OBJECT);
+    if (obj < 0) { return obj; }
+    var starts: ptr<u32> = deref d.starts;
+    var lens: ptr<u32> = deref d.lens;
+    var start: i64 = starts[obj] as i64;
+    var len: i64 = lens[obj] as i64;
+    var mv: ptr<u32> = deref d.mvalue;
+    var i: i64 = 0;
+    while (i < len) {
+        _detach(d, mv[start + i] as i32);
+        i += 1;
+    }
+    deref lens[obj] = 0;
+    core_index_drop(d, obj);
+    if (len > 2147483647) { return 2147483647; }
+    return len as i32;
+}
+
+// ---- copying --------------------------------------------------------------------------------
+
+// Deep-copies `src_node` of `src` into `dst` (which may be the same document)
+// as a detached value. Pointers into either document are re-read after every
+// step that can grow a table, so copying a document into itself is safe.
+fun _copy_nested(dst: ptr<CoreDoc>, src: ptr<CoreDoc>, src_node: i64, depth: i32) -> i32 {
+    if (depth > MAX_COPY_DEPTH) { return CORE_EDIT_TOO_DEEP; }
+    var id: i32 = _check(src, src_node);
+    if (id < 0) { return id; }
+    var kinds: ptr<u8> = deref src.kinds;
+    var kind: i32 = kinds[id] as i32;
+    var flags: ptr<u8> = deref src.flags;
+    var flag: u8 = flags[id];
+    var starts: ptr<u32> = deref src.starts;
+    var lens: ptr<u32> = deref src.lens;
+    var n_start: u32 = starts[id];
+    var n_len: u32 = lens[id];
+    if (kind == CORE_NULL) {
+        return core_new_null(dst);
+    }
+    if (kind == CORE_BOOL) {
+        return core_new_bool(dst, flag as i32);
+    }
+    if (kind == CORE_NUMBER || kind == CORE_STRING) {
+        var text: ptr<u8> = core_text(src, n_start);
+        var start: i64 = core_extra_push(dst, text, n_len as i64);
+        if (start < 0) { return CORE_EDIT_INVALID; }
+        var fl: u8 = 0;
+        if (kind == CORE_NUMBER) { fl = flag; }
+        return _wrap(core_node_push(dst, kind as u8, fl, start as u32, n_len));
+    }
+    if (kind == CORE_ARRAY) {
+        var arr: i32 = core_new_array(dst);
+        if (arr < 0) { return arr; }
+        var i: i64 = 0;
+        while (i < (n_len as i64)) {
+            var child: i32 = core_at(src, id, i);
+            if (child < 0) { return CORE_EDIT_INVALID; }
+            var copy: i32 = _copy_nested(dst, src, child as i64, depth + 1);
+            if (copy < 0) { return copy; }
+            var r: i32 = core_arr_push(dst, arr, copy);
+            if (r < 0) { return r; }
+            i += 1;
+        }
+        return arr;
+    }
+    var obj: i32 = core_new_object(dst);
+    if (obj < 0) { return obj; }
+    var j: i64 = 0;
+    while (j < (n_len as i64)) {
+        // Re-read the member tables each time: they may have moved.
+        var ss: ptr<u32> = deref src.starts;
+        var m: i64 = (ss[id] as i64) + j;
+        var mks: ptr<u32> = deref src.mkey_start;
+        var mkl: ptr<u32> = deref src.mkey_len;
+        var mmv: ptr<u32> = deref src.mvalue;
+        var key_start: u32 = mks[m];
+        var key_len: u32 = mkl[m];
+        var value: i64 = mmv[m] as i64;
+        var vcopy: i32 = _copy_nested(dst, src, value, depth + 1);
+        if (vcopy < 0) { return vcopy; }
+        // Append directly so duplicate keys survive the copy.
+        var kp: ptr<u8> = core_text(src, key_start);
+        var kstart: i64 = core_extra_push(dst, kp, key_len as i64);
+        if (kstart < 0) { return CORE_EDIT_INVALID; }
+        var ar: i32 = _obj_append(dst, obj, kstart as u32, key_len, vcopy);
+        if (ar < 0) { return ar; }
+        j += 1;
+    }
+    return obj;
+}
+
+pub fun core_copy(dst: ptr<CoreDoc>, src: ptr<CoreDoc>, src_node: i32) -> i32 {
+    if (!_ok_doc(dst) || !_ok_doc(src)) { return CORE_EDIT_INVALID; }
+    return _copy_nested(dst, src, src_node as i64, 0);
+}

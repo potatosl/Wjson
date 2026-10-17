@@ -1,0 +1,366 @@
+// SPDX-License-Identifier: MPL-2.0
+//
+// Differential test for the pure-Wave editing code (src/core_edit.wave)
+// against the Rust core (core/src/edit.rs, reached through its C ABI). The same
+// random sequence of edits, including invalid ones, is applied to a Rust
+// document and a Wave document: every call must return the same code, and the
+// documents must stay identical (tree, parents, keys, and the answers of key
+// lookups and JSON Pointers, which exercise the hash index of large objects).
+// Run from the repository root:  wavec run build.wave
+
+import("std::mem::alloc")::{mem_alloc, mem_free};
+extern(c, "getenv") fun c_getenv(name: ptr<u8>) -> ptr<u8>;
+import("wjson::ffi")::{
+    ffi_parse, ffi_free, ffi_root, ffi_node_count, ffi_type, ffi_bool, ffi_len, ffi_at, ffi_key, ffi_str,
+    ffi_num, ffi_num_is_int, ffi_parent, ffi_get, ffi_pointer, ffi_new_doc, ffi_new_null, ffi_new_bool,
+    ffi_new_number, ffi_new_string, ffi_new_array, ffi_new_object, ffi_set_root, ffi_arr_push,
+    ffi_arr_insert, ffi_arr_set, ffi_arr_remove, ffi_obj_set, ffi_obj_remove, ffi_obj_clear, ffi_copy,
+};
+import("wjson::core_dom")::{
+    CoreDoc, core_doc_release, core_root, core_type, core_bool, core_len, core_at, core_key, core_str,
+    core_num, core_num_is_int, core_parent, core_get, core_pointer,
+};
+import("wjson::core_parse")::{core_parse};
+import("wjson::core_edit")::{
+    core_new_doc, core_new_null, core_new_bool, core_new_number, core_new_string, core_new_array,
+    core_new_object, core_set_root, core_arr_push, core_arr_insert, core_arr_set, core_arr_remove,
+    core_obj_set, core_obj_remove, core_obj_clear, core_copy,
+};
+
+static CHECKS: i32 = 0;
+static FAILURES: i32 = 0;
+static RNG: u64 = 88172645463325252;
+static OPS: i32 = 0;
+static LAST_OP: i32 = 0;
+
+fun check(cond: bool, label: str) {
+    CHECKS += 1;
+    if (!cond) {
+        FAILURES += 1;
+        if (FAILURES <= 20) {
+            println("FAIL: {} (operation #{} of kind {})", label, OPS, LAST_OP);
+        }
+    }
+}
+
+fun next() -> u64 {
+    var x: u64 = RNG;
+    x = x ^ (x << 13);
+    x = x ^ (x >> 7);
+    x = x ^ (x << 17);
+    RNG = x;
+    return x * 2685821657736338717;
+}
+
+fun below(n: u64) -> u64 {
+    return (next() >> 11) % n;
+}
+
+fun len_of(s: str) -> i64 {
+    var p: ptr<u8> = s as ptr<u8>;
+    var n: i64 = 0;
+    while (p[n] != 0) {
+        n += 1;
+    }
+    return n;
+}
+
+fun same_text(a: ptr<u8>, la: i64, b: ptr<u8>, lb: i64) -> bool {
+    if (la != lb) {
+        return false;
+    }
+    if (a == null || b == null) {
+        return a == b;
+    }
+    var i: i64 = 0;
+    while (i < la) {
+        if (a[i] != b[i]) {
+            return false;
+        }
+        i += 1;
+    }
+    return a[la] == 0 && b[la] == 0;
+}
+
+// ---- comparing whole documents ---------------------------------------------------------
+
+fun compare_trees(r: ptr<u8>, d: ptr<CoreDoc>) -> i32 {
+    var bad: i32 = 0;
+    var count: i64 = ffi_node_count(r);
+    if (count != deref d.node_count) {
+        return 1;
+    }
+    if (ffi_root(r) != core_root(d)) {
+        bad += 1;
+    }
+    var id: i32 = 0;
+    while (id < (count as i32)) {
+        var t: i32 = ffi_type(r, id);
+        if (t != core_type(d, id)) { bad += 1; }
+        if (ffi_bool(r, id) != core_bool(d, id)) { bad += 1; }
+        if (ffi_len(r, id) != core_len(d, id)) { bad += 1; }
+        if (ffi_num_is_int(r, id) != core_num_is_int(d, id)) { bad += 1; }
+        if (ffi_parent(r, id) != core_parent(d, id)) { bad += 1; }
+        var la: i64 = 0;
+        var lb: i64 = 0;
+        var pa: ptr<u8> = ffi_str(r, id, &la);
+        var pb: ptr<u8> = core_str(d, id, &lb);
+        if (!same_text(pa, la, pb, lb)) { bad += 1; }
+        pa = ffi_num(r, id, &la);
+        pb = core_num(d, id, &lb);
+        if (!same_text(pa, la, pb, lb)) { bad += 1; }
+        if (t == 4 || t == 5) {
+            var n: i64 = ffi_len(r, id);
+            var i: i64 = 0;
+            while (i < n) {
+                if (ffi_at(r, id, i) != core_at(d, id, i)) { bad += 1; }
+                if (t == 5) {
+                    pa = ffi_key(r, id, i, &la);
+                    pb = core_key(d, id, i, &lb);
+                    if (!same_text(pa, la, pb, lb)) { bad += 1; }
+                }
+                i += 1;
+            }
+        }
+        id += 1;
+    }
+    return bad;
+}
+
+fun put_key(buf: ptr<u8>, k: u64) -> i64 {
+    deref buf[0] = 107;
+    var n: i64 = 1;
+    if (k >= 10) {
+        deref buf[n] = (48 + k / 10) as u8;
+        n += 1;
+    }
+    deref buf[n] = (48 + k % 10) as u8;
+    n += 1;
+    deref buf[n] = 0;
+    return n;
+}
+
+// Key lookups on every object and a few pointers must agree.
+fun compare_lookups(r: ptr<u8>, d: ptr<CoreDoc>) {
+    var count: i32 = ffi_node_count(r) as i32;
+    var key: array<u8, 8>;
+    var id: i32 = 0;
+    while (id < count) {
+        if (ffi_type(r, id) == 5) {
+            var k: u64 = 0;
+            while (k < 44) {
+                var n: i64 = put_key(&key[0], k);
+                check(ffi_get(r, id, &key[0], n) == core_get(d, id, &key[0], n), "get after edits");
+                k += 1;
+            }
+        }
+        if (ffi_type(r, id) == 4 || ffi_type(r, id) == 5) {
+            var p1: str = "/k1";
+            check(ffi_pointer(r, id, p1 as ptr<u8>, len_of(p1)) == core_pointer(d, id, p1 as ptr<u8>, len_of(p1)), "pointer /k1");
+            var p2: str = "/0";
+            check(ffi_pointer(r, id, p2 as ptr<u8>, len_of(p2)) == core_pointer(d, id, p2 as ptr<u8>, len_of(p2)), "pointer /0");
+            var p3: str = "/k2/k3";
+            check(ffi_pointer(r, id, p3 as ptr<u8>, len_of(p3)) == core_pointer(d, id, p3 as ptr<u8>, len_of(p3)), "pointer /k2/k3");
+        }
+        id += 1;
+    }
+}
+
+fun compare_all(r: ptr<u8>, d: ptr<CoreDoc>, label: str) {
+    check(compare_trees(r, d) == 0, label);
+    compare_lookups(r, d);
+}
+
+// ---- random arguments -------------------------------------------------------------------------
+
+// A node id: mostly an existing one, sometimes invalid.
+fun pick_id(r: ptr<u8>) -> i32 {
+    var count: i64 = ffi_node_count(r);
+    var k: u64 = below(20);
+    if (k == 0) { return 0 - 1; }
+    if (k == 1) { return count as i32; }
+    if (k == 2) { return (count + 7) as i32; }
+    if (count == 0) { return 0 - 1; }
+    return below(count as u64) as i32;
+}
+
+// A node of the given kind (type code), or -1 when there is none.
+fun pick_kind(r: ptr<u8>, kind: i32) -> i32 {
+    var count: i32 = ffi_node_count(r) as i32;
+    var seen: u64 = 0;
+    var chosen: i32 = 0 - 1;
+    var id: i32 = 0;
+    while (id < count) {
+        if (ffi_type(r, id) == kind) {
+            seen += 1;
+            if (below(seen) == 0) {
+                chosen = id;
+            }
+        }
+        id += 1;
+    }
+    if (below(25) == 0) { return pick_id(r); }
+    return chosen;
+}
+
+fun pick_index(len: i64) -> i64 {
+    var k: u64 = below(12);
+    if (k == 0) { return 0 - 1; }
+    if (k == 1) { return len + 1; }
+    if (len <= 0) { return 0; }
+    return below((len + 1) as u64) as i64;
+}
+
+fun pick_key(buf: ptr<u8>) -> i64 {
+    if (below(30) == 0) {
+        deref buf[0] = 255;       // not UTF-8
+        deref buf[1] = 0;
+        return 1;
+    }
+    if (below(20) == 0) {
+        deref buf[0] = 0;         // empty key
+        return 0;
+    }
+    return put_key(buf, below(40));
+}
+
+// ---- one random operation on both documents --------------------------------------------------
+
+fun lexeme(i: u64) -> str {
+    var pool: array<str, 13> = ["0", "-1", "12.5", "1e9", "-0.5E+3", "10", "", "01", "1.", "-", "abc", "1e", "+1"];
+    return pool[i as i32];
+}
+
+fun text(i: u64) -> str {
+    var pool: array<str, 8> = ["", "a", "hello", "é", "日本語", "\xff", "\xc3", "\xed\xa0\x80"];
+    return pool[i as i32];
+}
+
+fun step(r: ptr<u8>, d: ptr<CoreDoc>, r2: ptr<u8>, d2: ptr<CoreDoc>) {
+    var key: array<u8, 8>;
+    var op: u64 = below(20);
+    LAST_OP = op as i32;
+    OPS += 1;
+    if (op == 0) {
+        check(ffi_new_null(r) == core_new_null(d), "new_null");
+    } else if (op == 1) {
+        var b: i32 = below(2) as i32;
+        check(ffi_new_bool(r, b) == core_new_bool(d, b), "new_bool");
+    } else if (op == 2) {
+        var s: str = lexeme(below(13));
+        check(ffi_new_number(r, s as ptr<u8>, len_of(s)) == core_new_number(d, s as ptr<u8>, len_of(s)), "new_number");
+    } else if (op == 3) {
+        var s2: str = text(below(8));
+        check(ffi_new_string(r, s2 as ptr<u8>, len_of(s2)) == core_new_string(d, s2 as ptr<u8>, len_of(s2)), "new_string");
+    } else if (op == 4) {
+        check(ffi_new_array(r) == core_new_array(d), "new_array");
+    } else if (op == 5) {
+        check(ffi_new_object(r) == core_new_object(d), "new_object");
+    } else if (op == 6) {
+        var n: i32 = pick_id(r);
+        check(ffi_set_root(r, n) == core_set_root(d, n), "set_root");
+    } else if (op == 7) {
+        var a: i32 = pick_kind(r, 4);
+        var v: i32 = pick_id(r);
+        check(ffi_arr_push(r, a, v) == core_arr_push(d, a, v), "arr_push");
+    } else if (op == 8) {
+        var a2: i32 = pick_kind(r, 4);
+        var v2: i32 = pick_id(r);
+        var i2: i64 = pick_index(ffi_len(r, a2));
+        check(ffi_arr_insert(r, a2, i2, v2) == core_arr_insert(d, a2, i2, v2), "arr_insert");
+    } else if (op == 9) {
+        var a3: i32 = pick_kind(r, 4);
+        var v3: i32 = pick_id(r);
+        var i3: i64 = pick_index(ffi_len(r, a3));
+        check(ffi_arr_set(r, a3, i3, v3) == core_arr_set(d, a3, i3, v3), "arr_set");
+    } else if (op == 10) {
+        var a4: i32 = pick_kind(r, 4);
+        var i4: i64 = pick_index(ffi_len(r, a4));
+        check(ffi_arr_remove(r, a4, i4) == core_arr_remove(d, a4, i4), "arr_remove");
+    } else if (op >= 11 && op <= 14) {
+        // Objects are edited more often: they grow past the index threshold.
+        var o: i32 = pick_kind(r, 5);
+        var v4: i32 = pick_id(r);
+        var kn: i64 = pick_key(&key[0]);
+        check(ffi_obj_set(r, o, &key[0], kn, v4) == core_obj_set(d, o, &key[0], kn, v4), "obj_set");
+    } else if (op == 15) {
+        var o2: i32 = pick_kind(r, 5);
+        var kn2: i64 = pick_key(&key[0]);
+        check(ffi_obj_remove(r, o2, &key[0], kn2) == core_obj_remove(d, o2, &key[0], kn2), "obj_remove");
+    } else if (op == 16) {
+        if (below(4) == 0) {
+            var o3: i32 = pick_kind(r, 5);
+            check(ffi_obj_clear(r, o3) == core_obj_clear(d, o3), "obj_clear");
+        }
+    } else if (op == 17) {
+        var src: i32 = pick_id(r2);
+        check(ffi_copy(r, r2, src) == core_copy(d, d2, src), "copy from another document");
+    } else if (op == 18) {
+        var src2: i32 = pick_id(r);
+        check(ffi_copy(r, r, src2) == core_copy(d, d, src2), "copy within the document");
+    } else {
+        // Attach a freshly made value somewhere (the common, successful case).
+        var o4: i32 = pick_kind(r, 5);
+        var fresh_r: i32 = ffi_new_number(r, "7" as ptr<u8>, 1);
+        var fresh_d: i32 = core_new_number(d, "7" as ptr<u8>, 1);
+        check(fresh_r == fresh_d, "fresh number");
+        var kn3: i64 = put_key(&key[0], below(40));
+        check(ffi_obj_set(r, o4, &key[0], kn3, fresh_r) == core_obj_set(d, o4, &key[0], kn3, fresh_d), "obj_set fresh");
+    }
+}
+
+fun test_sequence(ops: i32, start_parsed: bool) {
+    var r: ptr<u8> = null;
+    var d: CoreDoc = core_new_doc();
+    if (start_parsed) {
+        // Begin from a parsed document so edits meet parser-built tables.
+        var src: str = "{\"k1\":[1,2,3],\"k2\":{\"k3\":true,\"k4\":null},\"k5\":\"x\",\"k6\":1,\"k7\":2,\"k8\":3,\"k9\":4,\"k10\":5,\"k11\":6,\"k12\":7,\"k13\":8,\"k14\":9,\"k15\":10,\"k16\":11,\"k17\":12}";
+        r = ffi_parse(src as ptr<u8>, len_of(src), 0, 0);
+        core_doc_release(&d);
+        d = core_parse(src as ptr<u8>, len_of(src), 0, 0);
+    } else {
+        r = ffi_new_doc();
+    }
+    var r2: ptr<u8> = ffi_parse("[{\"a\":1},[true,null],\"s\",12.5]" as ptr<u8>, 29, 0, 0);
+    var d2: CoreDoc = core_parse("[{\"a\":1},[true,null],\"s\",12.5]" as ptr<u8>, 29, 0, 0);
+    var i: i32 = 0;
+    while (i < ops) {
+        step(r, &d, r2, &d2);
+        if (i % 25 == 24) {
+            compare_all(r, &d, "documents differ");
+        }
+        i += 1;
+    }
+    compare_all(r, &d, "documents differ at the end");
+    ffi_free(r);
+    ffi_free(r2);
+    core_doc_release(&d);
+    core_doc_release(&d2);
+}
+
+fun main() -> i32 {
+    var iters: i32 = 300;
+    var p: ptr<u8> = c_getenv("WJSON_FUZZ_ITERS" as ptr<u8>);
+    if (p != null) {
+        var x: i32 = 0;
+        var k: i64 = 0;
+        while (p[k] >= 48 && p[k] <= 57) {
+            x = x * 10 + ((p[k] - 48) as i32);
+            k += 1;
+        }
+        if (x > 0) {
+            iters = x;
+        }
+    }
+    var i: i32 = 0;
+    while (i < iters) {
+        test_sequence(150 + (below(150) as i32), i % 3 == 0);
+        i += 1;
+    }
+    println("core_edit_test: {}/{} checks passed", CHECKS - FAILURES, CHECKS);
+    if (FAILURES != 0) {
+        println("core_edit_test: {} FAILED", FAILURES);
+        return 1;
+    }
+    return 0;
+}
