@@ -28,6 +28,13 @@ minor releases.
   310 MB/s on a 30 MB record file); with `-O0` it is 2.5x slower. It allocates
   through the C library, because Wave's std allocator maps fresh pages for every
   allocation.
+- `num_format_f64` has the same fast path for short decimals as the C++ code
+  (a decimal of at most 15 digits is unique for its double, so `m / 10^k`
+  dividing back to the value exactly is also the shortest form), and the powers
+  of ten come from a table. Formatting 300,000 prices-like values went from
+  29 ms to 6 ms with `-O2` (C++: 6 ms) and from 55 ms to 21 ms with `-O0`.
+  `tests/number_test.wave` compares short decimals, their neighbouring doubles
+  and values with trailing zeros with the C++ code.
 - `.gitattributes` marks `*.wave` as Wave for GitHub's language statistics.
 
 ### Native

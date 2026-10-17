@@ -236,9 +236,11 @@ fixed formatting of numbers) and `src/escape.wave` (string escaping, UTF-8
 check and count) re-implement the C++ layer in Wave, and the Wave API uses them
 (through `src/ffi.wave`); the C++ code stays for C and C++ users. The tests above
 compare the Wave code bit for bit with the C++ code. Built
-with `-O2` they run at about the speed of the C++ code (for 200,000 values: short
-numbers 17 ms vs 20 ms, random doubles 336 ms vs 322 ms); built with `-O0` they
-are about 4x slower.
+with `-O2` they run at about the speed of the C++ code (300,000 values, Wave vs
+C++: formatting short decimals such as prices 6 ms vs 6 ms, parsing them 3 ms vs
+4 ms, formatting random doubles 461 ms vs 439 ms); built with `-O0` they are
+about 3x slower on short decimals (21 ms vs 7 ms formatting) and about 4x
+slower on random doubles.
 
 Performance (Linux, Xeon 2.8 GHz, one core, `WJSON_TASK=bench`):
 

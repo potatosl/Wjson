@@ -294,6 +294,75 @@ fun random_lexeme(buf: ptr<u8>) -> i64 {
     return n;
 }
 
+// Appends the decimal digits of v and returns the new length.
+fun put_u64(buf: ptr<u8>, at: i64, v: u64) -> i64 {
+    var tmp: array<u8, 24>;
+    var n: i32 = 0;
+    var x: u64 = v;
+    var more: bool = true;
+    while (more) {
+        tmp[n] = (48 + (x % 10)) as u8;
+        n += 1;
+        x = x / 10;
+        more = x != 0;
+    }
+    var at2: i64 = at;
+    while (n > 0) {
+        n -= 1;
+        deref buf[at2] = tmp[n];
+        at2 += 1;
+    }
+    return at2;
+}
+
+// Short decimals (the case the formatter has a fast path for), the doubles
+// next to them, and values with trailing zeros: formatting must match C++.
+fun test_short_decimals(iters: i32) {
+    var txt: array<u8, 64>;
+    var i: i32 = 0;
+    while (i < iters) {
+        var m: u64 = next() % 100000000000000000;
+        var cut: u64 = below(17);
+        while (cut > 0) {
+            m = m / 10;
+            cut -= 1;
+        }
+        if (m == 0) {
+            m = 1 + below(9);
+        }
+        var n: i64 = put_u64(&txt[0], 0, m);
+        deref txt[n] = 101;
+        n += 1;
+        var ex: i64 = (below(60) as i64) - 30;
+        if (ex < 0) {
+            deref txt[n] = 45;
+            n += 1;
+            ex = 0 - ex;
+        }
+        n = put_u64(&txt[0], n, ex as u64);
+        deref txt[n] = 0;
+        var v: f64 = 0.0;
+        if (ffi_parse_f64(&txt[0], n, &v) == 0 && v > 0.0) {
+            var bits: u64 = float_to_bits_f64(v);
+            check(format_agrees(v), "short decimal");
+            check(format_agrees(float_from_bits_f64(bits + 1)), "short decimal +1 ulp");
+            check(format_agrees(float_from_bits_f64(bits - 1)), "short decimal -1 ulp");
+            check(format_agrees(0.0 - v), "short decimal negative");
+        }
+        // Small integers times powers of ten: trailing zeros, round values.
+        var base: u64 = 1 + below(999);
+        var j: u64 = below(23);
+        var w: f64 = base as f64;
+        while (j > 0) {
+            w = w * 10.0;
+            j -= 1;
+        }
+        check(format_agrees(w), "integer with trailing zeros");
+        check(format_agrees((base as f64) / 1000.0), "thousandths");
+        i += 1;
+    }
+}
+
 fun test_random(iters: i32) {
     var buf: array<u8, 2000>;
     var i: i32 = 0;
@@ -355,6 +424,7 @@ fun main() -> i32 {
     test_fixed_cases();
     test_integers();
     test_random(iters);
+    test_short_decimals(iters);
     println("number_test: {}/{} checks passed", CHECKS - FAILURES, CHECKS);
     if (FAILURES != 0) {
         println("number_test: {} FAILED", FAILURES);

@@ -6,7 +6,7 @@
 //           integer arithmetic that yields the correctly rounded double
 //           (round to nearest, ties to even) for any number of digits.
 //   format  shortest round-trip digits (Steele & White / Burger & Dybvig
-//           free-format algorithm on big integers), laid res like C++17
+//           free-format algorithm on big integers), laid out like C++17
 //           std::to_chars: fixed or scientific, whichever is shorter.
 //   fixed   exact decimal expansion rounded half to even, like printf("%.*f").
 //
@@ -64,17 +64,20 @@ fun _pow10_u32(k: i32) -> u32 {
     return v;
 }
 
-// 10^k for 0 <= k <= 22: every step is an exact double.
+// 10^k for 0 <= k <= 22: exactly representable doubles.
+static POW10_F64: array<f64, 23> = [
+    1.0, 10.0, 100.0, 1000.0, 10000.0, 100000.0, 1000000.0, 10000000.0, 100000000.0,
+    1000000000.0, 10000000000.0, 100000000000.0, 1000000000000.0, 10000000000000.0,
+    100000000000000.0, 1000000000000000.0, 10000000000000000.0, 100000000000000000.0,
+    1000000000000000000.0, 10000000000000000000.0, 100000000000000000000.0,
+    1000000000000000000000.0, 10000000000000000000000.0
+];
+
 fun _pow10_f64(k: i32) -> f64 {
-    var v: f64 = 1.0;
-    var ten: f64 = 10.0;
-    var i: i32 = 0;
-    while (i < k) {
-        v = v * ten;
-        i += 1;
-    }
-    return v;
+    return POW10_F64[k];
 }
+
+const DIGITS15_LIMIT: f64 = 1000000000000000.0;  // 10^15
 
 // ---------------------------------------------------------------------------
 // Big unsigned integer with fixed capacity (little-endian 32-bit limbs).
@@ -947,7 +950,39 @@ fun _put(res: ptr<u8>, at: i32, c: u8) -> i32 {
     return at + 1;
 }
 
-// Lays res digits like std::to_chars: fixed or scientific, whichever is
+// Fast path for short decimals such as 12.5 or 0.001234. A decimal with at
+// most 15 significant digits is unique for its double (DBL_DIG), so when
+// m / 10^k with m < 10^15 divides back to exactly `a`, that decimal is the
+// only one of at most 15 digits that reads as `a` and therefore also the
+// shortest. m and 10^k (k <= 22) are exact doubles and the division is
+// correctly rounded, so the check is exact. Returns the digit count (trailing
+// zeros removed) and sets *k_out like _shortest_digits, or 0 when `a` is not of
+// that form (the caller then uses the general algorithm).
+fun _short_decimal_digits(a: f64, digits: ptr<u8>, k_out: ptr<i32>) -> i32 {
+    var k: i32 = 0;
+    while (k <= 22) {
+        var p: f64 = POW10_F64[k];
+        var t: f64 = a * p;
+        if (t >= DIGITS15_LIMIT) {
+            return 0;  // too many digits, and only more with a larger k
+        }
+        var m: u64 = (t + 0.5) as u64;
+        if (m != 0 && (m as f64) / p == a) {
+            var scale: i32 = k;  // value = m * 10^-scale
+            while (m % 10 == 0) {
+                m = m / 10;
+                scale -= 1;
+            }
+            var n: i32 = _u64_digits(m, digits);
+            deref k_out = n - scale;  // value ~ 0.DIGITS * 10^(n - scale)
+            return n;
+        }
+        k += 1;
+    }
+    return 0;
+}
+
+// Lays out digits like std::to_chars: fixed or scientific, whichever is
 // shorter (fixed on a tie). Returns the length written to `res`.
 // `exact` holds the full integer digits of the value when exact_n > 0; when
 // fixed notation is chosen for an integer at or above 2^53, those are printed
@@ -1118,7 +1153,10 @@ pub fun num_format_f64(value: f64, dst: ptr<u8>, cap: i64) -> i64 {
     } else {
         var digits: array<u8, 24>;
         var k: i32 = 0;
-        var n: i32 = _shortest_digits(mag, &digits[0], &k);
+        var n: i32 = _short_decimal_digits(float_from_bits_f64(mag), &digits[0], &k);
+        if (n == 0) {
+            n = _shortest_digits(mag, &digits[0], &k);
+        }
         var exact: array<u8, 24>;
         var exact_n: i32 = 0;
         var be: i32 = ((bits >> 52) & 2047) as i32;
