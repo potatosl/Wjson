@@ -35,6 +35,16 @@ minor releases.
   29 ms to 6 ms with `-O2` (C++: 6 ms) and from 55 ms to 21 ms with `-O0`.
   `tests/number_test.wave` compares short decimals, their neighbouring doubles
   and values with trailing zeros with the C++ code.
+- `src/core_dom.wave` also has object lookup (`core_get`, the last duplicate key
+  wins) and RFC 6901 JSON Pointer (`core_pointer`), ports of `dom.rs`.
+  Objects with 16 or more members get a hash index that is built when the
+  document is parsed, not on first lookup as in the Rust core: Wave's std has no
+  mutex or atomics, and building the index up front means lookups never modify
+  the document, so reading from several threads stays safe. The price is a
+  somewhat slower parse of documents with large objects (4.8 ms vs 3.7 ms for a
+  100,000-key object with `-O2`); lookups are faster (1M lookups: 35 ms vs 72 ms).
+  `tests/core_lookup_test.wave` compares every key and many pointers (including
+  `~0`/`~1`, leading zeros and out-of-range indexes) with the Rust core.
 - `.gitattributes` marks `*.wave` as Wave for GitHub's language statistics.
 
 ### Native

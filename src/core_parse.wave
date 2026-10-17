@@ -8,7 +8,7 @@
 import("./escape")::{esc_utf8_check};
 import("./core_dom")::{
     CoreDoc, core_doc_empty, core_doc_release, core_bytes_put, core_bytes_push, core_node_push,
-    core_elems_push, core_members_push, core_alloc, core_realloc, core_free,
+    core_elems_push, core_members_push, core_index_build, CORE_INDEX_THRESHOLD, core_alloc, core_realloc, core_free,
     CORE_NULL, CORE_BOOL, CORE_NUMBER, CORE_STRING, CORE_ARRAY, CORE_OBJECT,
     CORE_NUM_INTEGER, CORE_NUM_NEGATIVE, CORE_PARENT_ROOT,
 };
@@ -602,6 +602,9 @@ fun _object(p: ptr<CoreParser>) -> i64 {
     }
     var id: i64 = core_node_push(doc, CORE_OBJECT as u8, 0, start as u32, count as u32);
     if (id < 0) { return _fail(p, CORE_ERR_TOO_LARGE, deref p.pos); }
+    if (count >= CORE_INDEX_THRESHOLD) {
+        if (!core_index_build(doc, id)) { return _fail(p, CORE_ERR_TOO_LARGE, deref p.pos); }
+    }
     var parents: ptr<i32> = deref doc.parents;
     var k: i64 = 0;
     while (k < count) {

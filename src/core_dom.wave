@@ -36,6 +36,12 @@ pub const CORE_PARENT_NONE: i32 = -1;
 
 pub const CORE_NO_NODE: i32 = -1;
 
+// `start` values with this bit refer to `extra` (text created by edits).
+pub const CORE_EXTRA_BIT: u32 = 2147483648;
+
+// Objects with at least this many members get a hash index.
+pub const CORE_INDEX_THRESHOLD: i64 = 16;
+
 pub struct CoreDoc {
     kinds: ptr<u8>;
     flags: ptr<u8>;      // bool value, or CORE_NUM_* flags for numbers
@@ -61,6 +67,26 @@ pub struct CoreDoc {
     byte_len: i64;
     byte_cap: i64;
 
+    // Text created by edits: one stable allocation per string (also
+    // NUL-terminated), addressed by `start` values with CORE_EXTRA_BIT set.
+    extra: ptr<ptr<u8>>;
+    extra_count: i64;
+    extra_cap: i64;
+
+    // Key indexes of large objects, built when the document is parsed or
+    // edited so that lookups never modify the document. The indexed objects
+    // are kept sorted by node id: ix_node[i] is the object, its table lives in
+    // pool[ix_off[i] .. ix_off[i] + ix_size[i]) (ix_size is a power of two; an
+    // entry is member position + 1, 0 means empty).
+    ix_node: ptr<u32>;
+    ix_off: ptr<u32>;
+    ix_size: ptr<u32>;
+    ix_count: i64;
+    ix_cap: i64;
+    pool: ptr<u32>;
+    pool_len: i64;
+    pool_cap: i64;
+
     root: i64;           // -1 when there is no root
     err_code: i32;       // 0 when the document is ok
     err_offset: i64;
@@ -75,6 +101,9 @@ pub fun core_doc_empty() -> CoreDoc {
         elems: null, elem_count: 0, elem_cap: 0,
         mkey_start: null, mkey_len: null, mvalue: null, member_count: 0, member_cap: 0,
         bytes: null, byte_len: 0, byte_cap: 0,
+        extra: null, extra_count: 0, extra_cap: 0,
+        ix_node: null, ix_off: null, ix_size: null, ix_count: 0, ix_cap: 0,
+        pool: null, pool_len: 0, pool_cap: 0,
         root: 0 - 1,
         err_code: 0, err_offset: 0, err_line: 0, err_column: 0,
     };
@@ -94,6 +123,30 @@ pub fun core_doc_release(d: ptr<CoreDoc>) {
     if (deref d.mkey_len != null) { c_free(deref d.mkey_len as ptr<u8>); }
     if (deref d.mvalue != null) { c_free(deref d.mvalue as ptr<u8>); }
     if (deref d.bytes != null) { c_free(deref d.bytes); }
+    if (deref d.extra != null) {
+        var ex: ptr<ptr<u8>> = deref d.extra;
+        var e: i64 = 0;
+        while (e < deref d.extra_count) {
+            c_free(ex[e]);
+            e += 1;
+        }
+        c_free(ex as ptr<u8>);
+    }
+    if (deref d.ix_node != null) { c_free(deref d.ix_node as ptr<u8>); }
+    if (deref d.ix_off != null) { c_free(deref d.ix_off as ptr<u8>); }
+    if (deref d.ix_size != null) { c_free(deref d.ix_size as ptr<u8>); }
+    if (deref d.pool != null) { c_free(deref d.pool as ptr<u8>); }
+    deref d.extra = null;
+    deref d.extra_count = 0;
+    deref d.extra_cap = 0;
+    deref d.ix_node = null;
+    deref d.ix_off = null;
+    deref d.ix_size = null;
+    deref d.ix_count = 0;
+    deref d.ix_cap = 0;
+    deref d.pool = null;
+    deref d.pool_len = 0;
+    deref d.pool_cap = 0;
     deref d.kinds = null;
     deref d.flags = null;
     deref d.starts = null;
@@ -262,6 +315,17 @@ pub fun core_members_push(d: ptr<CoreDoc>, key_start: ptr<u32>, key_len: ptr<u32
 
 // ---- queries (mirror the wj_* accessors; all tolerate bad ids) ---------------------
 
+// Address of NUL-terminated text: the parse table, or an edit-created string
+// when `start` has CORE_EXTRA_BIT set.
+pub fun core_text(d: ptr<CoreDoc>, start: u32) -> ptr<u8> {
+    if ((start & CORE_EXTRA_BIT) != 0) {
+        var ex: ptr<ptr<u8>> = deref d.extra;
+        return ex[(start & (CORE_EXTRA_BIT - 1)) as i64];
+    }
+    var bytes: ptr<u8> = deref d.bytes;
+    return &bytes[start as i64];
+}
+
 fun _valid(d: ptr<CoreDoc>, node: i64) -> bool {
     return node >= 0 && node < deref d.node_count;
 }
@@ -348,8 +412,7 @@ pub fun core_key(d: ptr<CoreDoc>, node: i32, index: i64, out_len: ptr<i64>) -> p
     var ks: ptr<u32> = deref d.mkey_start;
     var kl: ptr<u32> = deref d.mkey_len;
     if (out_len != null) { deref out_len = kl[at] as i64; }
-    var bytes: ptr<u8> = deref d.bytes;
-    return &bytes[ks[at] as i64];
+    return core_text(d, ks[at]);
 }
 
 fun _lexeme(d: ptr<CoreDoc>, node: i32, kind: i32, out_len: ptr<i64>) -> ptr<u8> {
@@ -360,8 +423,7 @@ fun _lexeme(d: ptr<CoreDoc>, node: i32, kind: i32, out_len: ptr<i64>) -> ptr<u8>
     var lens: ptr<u32> = deref d.lens;
     var starts: ptr<u32> = deref d.starts;
     if (out_len != null) { deref out_len = lens[node] as i64; }
-    var bytes: ptr<u8> = deref d.bytes;
-    return &bytes[starts[node] as i64];
+    return core_text(d, starts[node]);
 }
 
 // Decoded string bytes (NUL-terminated), or null when not a string.
@@ -392,4 +454,323 @@ pub fun core_parent(d: ptr<CoreDoc>, node: i32) -> i32 {
     }
     var parents: ptr<i32> = deref d.parents;
     return parents[node];
+}
+
+// ---- key lookup ----------------------------------------------------------------------
+
+fun _hash_bytes(p: ptr<u8>, n: i64) -> u32 {
+    var h: u32 = 2166136261;
+    var i: i64 = 0;
+    while (i < n) {
+        h = (h ^ (p[i] as u32)) * 16777619;
+        i += 1;
+    }
+    return h ^ (h >> 15);
+}
+
+// Does member `pos` (an index into the member arrays) have exactly this key?
+fun _key_eq(d: ptr<CoreDoc>, pos: i64, key: ptr<u8>, klen: i64) -> bool {
+    var kl: ptr<u32> = deref d.mkey_len;
+    if ((kl[pos] as i64) != klen) {
+        return false;
+    }
+    var ks: ptr<u32> = deref d.mkey_start;
+    var kp: ptr<u8> = core_text(d, ks[pos]);
+    var i: i64 = 0;
+    while (i < klen) {
+        if (kp[i] != key[i]) {
+            return false;
+        }
+        i += 1;
+    }
+    return true;
+}
+
+// Index entry of object `id` (position in ix_node), or -1.
+fun _index_slot(d: ptr<CoreDoc>, id: i64) -> i64 {
+    var lo: i64 = 0;
+    var hi: i64 = deref d.ix_count - 1;
+    var nodes: ptr<u32> = deref d.ix_node;
+    while (lo <= hi) {
+        var mid: i64 = (lo + hi) / 2;
+        var v: i64 = nodes[mid] as i64;
+        if (v == id) {
+            return mid;
+        }
+        if (v < id) {
+            lo = mid + 1;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    return 0 - 1;
+}
+
+// Builds (or rebuilds) the key index of object `id`. Later duplicates
+// overwrite earlier ones, so the last member with a key wins. Returns false
+// when memory runs out.
+pub fun core_index_build(d: ptr<CoreDoc>, id: i64) -> bool {
+    var starts: ptr<u32> = deref d.starts;
+    var lens: ptr<u32> = deref d.lens;
+    var first: i64 = starts[id] as i64;
+    var n: i64 = lens[id] as i64;
+    var size: i64 = 32;
+    while (size < n * 2) {
+        size = size * 2;
+    }
+
+    // The entry for this object: reuse the old table when the size matches.
+    var slot: i64 = _index_slot(d, id);
+    var off: i64 = 0;
+    if (slot >= 0) {
+        var sizes: ptr<u32> = deref d.ix_size;
+        var offs: ptr<u32> = deref d.ix_off;
+        if ((sizes[slot] as i64) == size) {
+            off = offs[slot] as i64;
+        } else {
+            slot = 0 - 1;  // abandon the old table (a new one is appended below)
+        }
+    }
+    if (slot < 0) {
+        // Make room in the pool.
+        if (deref d.pool_len + size > deref d.pool_cap) {
+            var nc: i64 = deref d.pool_cap * 2;
+            if (nc < 256) { nc = 256; }
+            while (nc < deref d.pool_len + size) { nc = nc * 2; }
+            var np: ptr<u8> = c_realloc(deref d.pool as ptr<u8>, nc * 4);
+            if (np == null) { return false; }
+            deref d.pool = np as ptr<u32>;
+            deref d.pool_cap = nc;
+        }
+        off = deref d.pool_len;
+        deref d.pool_len = off + size;
+        // Make room in the entry list (kept sorted by node id).
+        var cnt: i64 = deref d.ix_count;
+        var existing: i64 = _index_slot(d, id);
+        if (existing < 0) {
+            if (cnt >= deref d.ix_cap) {
+                var ic: i64 = deref d.ix_cap * 2;
+                if (ic < 16) { ic = 16; }
+                var a: ptr<u8> = c_realloc(deref d.ix_node as ptr<u8>, ic * 4);
+                if (a == null) { return false; }
+                deref d.ix_node = a as ptr<u32>;
+                var b: ptr<u8> = c_realloc(deref d.ix_off as ptr<u8>, ic * 4);
+                if (b == null) { return false; }
+                deref d.ix_off = b as ptr<u32>;
+                var c: ptr<u8> = c_realloc(deref d.ix_size as ptr<u8>, ic * 4);
+                if (c == null) { return false; }
+                deref d.ix_size = c as ptr<u32>;
+                deref d.ix_cap = ic;
+            }
+            var nodes: ptr<u32> = deref d.ix_node;
+            var offs2: ptr<u32> = deref d.ix_off;
+            var sizes2: ptr<u32> = deref d.ix_size;
+            // Insert at the sorted position (appending is the common case).
+            var at: i64 = cnt;
+            while (at > 0 && (nodes[at - 1] as i64) > id) {
+                deref nodes[at] = nodes[at - 1];
+                deref offs2[at] = offs2[at - 1];
+                deref sizes2[at] = sizes2[at - 1];
+                at -= 1;
+            }
+            deref nodes[at] = id as u32;
+            deref offs2[at] = off as u32;
+            deref sizes2[at] = size as u32;
+            deref d.ix_count = cnt + 1;
+        } else {
+            var offs3: ptr<u32> = deref d.ix_off;
+            var sizes3: ptr<u32> = deref d.ix_size;
+            deref offs3[existing] = off as u32;
+            deref sizes3[existing] = size as u32;
+        }
+    }
+
+    // Fill the table.
+    var pool: ptr<u32> = deref d.pool;
+    var z: i64 = 0;
+    while (z < size) {
+        deref pool[off + z] = 0;
+        z += 1;
+    }
+    var mask: i64 = size - 1;
+    var ks: ptr<u32> = deref d.mkey_start;
+    var kl: ptr<u32> = deref d.mkey_len;
+    var pos: i64 = 0;
+    while (pos < n) {
+        var key: ptr<u8> = core_text(d, ks[first + pos]);
+        var klen: i64 = kl[first + pos] as i64;
+        var h: i64 = (_hash_bytes(key, klen) as i64) & mask;
+        var placed: bool = false;
+        while (!placed) {
+            var entry: u32 = pool[off + h];
+            if (entry == 0) {
+                deref pool[off + h] = (pos + 1) as u32;
+                placed = true;
+            } else if (_key_eq(d, first + ((entry as i64) - 1), key, klen)) {
+                deref pool[off + h] = (pos + 1) as u32;  // last duplicate wins
+                placed = true;
+            } else {
+                h = (h + 1) & mask;
+            }
+        }
+        pos += 1;
+    }
+    return true;
+}
+
+// Position (within the object's member list) of the last member named `key`,
+// or -1. Small objects are scanned; large ones use their hash index, and an
+// object without an index is scanned too, so a missing index is never wrong.
+pub fun core_find_member(d: ptr<CoreDoc>, id: i64, key: ptr<u8>, klen: i64) -> i64 {
+    if (core_type(d, id as i32) != CORE_OBJECT || id > 2147483647) {
+        return 0 - 1;
+    }
+    var starts: ptr<u32> = deref d.starts;
+    var lens: ptr<u32> = deref d.lens;
+    var first: i64 = starts[id] as i64;
+    var n: i64 = lens[id] as i64;
+    if (n >= CORE_INDEX_THRESHOLD) {
+        var slot: i64 = _index_slot(d, id);
+        if (slot >= 0) {
+            var offs: ptr<u32> = deref d.ix_off;
+            var sizes: ptr<u32> = deref d.ix_size;
+            var pool: ptr<u32> = deref d.pool;
+            var off: i64 = offs[slot] as i64;
+            var mask: i64 = (sizes[slot] as i64) - 1;
+            var h: i64 = (_hash_bytes(key, klen) as i64) & mask;
+            while (true) {
+                var entry: u32 = pool[off + h];
+                if (entry == 0) {
+                    return 0 - 1;
+                }
+                var pos: i64 = (entry as i64) - 1;
+                if (_key_eq(d, first + pos, key, klen)) {
+                    return pos;
+                }
+                h = (h + 1) & mask;
+            }
+        }
+    }
+    var i: i64 = n - 1;
+    while (i >= 0) {
+        if (_key_eq(d, first + i, key, klen)) {
+            return i;
+        }
+        i -= 1;
+    }
+    return 0 - 1;
+}
+
+// Object member lookup by key bytes (the last duplicate wins, as in
+// JavaScript's JSON.parse). Returns the node id or -1.
+pub fun core_get(d: ptr<CoreDoc>, node: i32, key: ptr<u8>, key_len: i64) -> i32 {
+    if (key_len < 0 || (key_len > 0 && key == null)) {
+        return CORE_NO_NODE;
+    }
+    if (node < 0) {
+        return CORE_NO_NODE;
+    }
+    var pos: i64 = core_find_member(d, node as i64, key, key_len);
+    if (pos < 0) {
+        return CORE_NO_NODE;
+    }
+    var starts: ptr<u32> = deref d.starts;
+    var mv: ptr<u32> = deref d.mvalue;
+    var v: u32 = mv[(starts[node] as i64) + pos];
+    if (v > 2147483647) {
+        return CORE_NO_NODE;
+    }
+    return v as i32;
+}
+
+// Array index token per RFC 6901: "0" or a digit string without a leading
+// zero. Returns -1 for anything else.
+fun _array_index(t: ptr<u8>, n: i64) -> i64 {
+    if (n <= 0 || n > 18) {
+        return 0 - 1;
+    }
+    if (n > 1 && t[0] == 48) {
+        return 0 - 1;
+    }
+    var v: i64 = 0;
+    var i: i64 = 0;
+    while (i < n) {
+        if (t[i] < 48 || t[i] > 57) {
+            return 0 - 1;
+        }
+        v = v * 10 + ((t[i] - 48) as i64);
+        i += 1;
+    }
+    return v;
+}
+
+// RFC 6901 JSON Pointer ("/a/0/b", "~0" = '~', "~1" = '/') relative to `node`.
+// The empty pointer selects `node` itself. Returns the node id or -1.
+pub fun core_pointer(d: ptr<CoreDoc>, node: i32, pointer: ptr<u8>, len: i64) -> i32 {
+    if (len < 0 || (len > 0 && pointer == null)) {
+        return CORE_NO_NODE;
+    }
+    if (node < 0 || !_valid(d, node as i64)) {
+        return CORE_NO_NODE;
+    }
+    if (len == 0) {
+        return node;
+    }
+    if (pointer[0] != 47) {
+        return CORE_NO_NODE;
+    }
+    var token: ptr<u8> = c_malloc(len + 1);
+    if (token == null) {
+        return CORE_NO_NODE;
+    }
+    var cur: i32 = node;
+    var i: i64 = 1;
+    var result: i32 = CORE_NO_NODE;
+    var done: bool = false;
+    while (!done) {
+        // Decode one reference token up to the next '/' or the end.
+        var tn: i64 = 0;
+        while (i < len && pointer[i] != 47) {
+            if (pointer[i] == 126) {
+                if (i + 1 >= len || (pointer[i + 1] != 48 && pointer[i + 1] != 49)) {
+                    c_free(token);
+                    return CORE_NO_NODE;
+                }
+                if (pointer[i + 1] == 48) {
+                    deref token[tn] = 126;
+                } else {
+                    deref token[tn] = 47;
+                }
+                tn += 1;
+                i += 2;
+            } else {
+                deref token[tn] = pointer[i];
+                tn += 1;
+                i += 1;
+            }
+        }
+        var t: i32 = core_type(d, cur);
+        var next: i32 = CORE_NO_NODE;
+        if (t == CORE_OBJECT) {
+            next = core_get(d, cur, token, tn);
+        } else if (t == CORE_ARRAY) {
+            var index: i64 = _array_index(token, tn);
+            if (index >= 0) {
+                next = core_at(d, cur, index);
+            }
+        }
+        if (next < 0) {
+            c_free(token);
+            return CORE_NO_NODE;
+        }
+        cur = next;
+        if (i >= len) {
+            result = cur;
+            done = true;
+        } else {
+            i += 1;  // skip the '/'
+        }
+    }
+    c_free(token);
+    return result;
 }
