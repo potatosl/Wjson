@@ -5,12 +5,12 @@
 #
 #   curl -fsSL https://raw.githubusercontent.com/potatosl/wjson/main/install.sh | sh
 #
-# Downloads the wjson sources, builds its two static libraries and writes a
-# small wrapper, `wjson-wavec`, that compiles a Wave program against them:
+# Downloads the wjson sources, builds its small C++ support library and writes a
+# small wrapper, `wjson-wavec`, that compiles a Wave program against it:
 #
 #   ~/.wjson/bin/wjson-wavec hello.wave --run
 #
-# It does not install the tools wjson needs (the Wave compiler, Rust and a
+# It does not install the tools wjson needs (the Wave compiler and a
 # C++ compiler); if one is missing it says how to get it and stops.
 #
 # Read it before piping it into a shell; it is short. Settings (environment):
@@ -58,11 +58,6 @@ if ! need wavec; then
     die "the Wave compiler (wavec) is not on PATH. Install it with
     curl -fsSL https://wave-lang.dev/install.sh | bash
 and open a new shell."
-fi
-if ! need cargo; then
-    die "Rust (cargo) is not on PATH. Install it with
-    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-and open a new shell (wjson needs Rust 1.99 or newer)."
 fi
 need "${CXX:-c++}" || die "a C++20 compiler (${CXX:-c++}) is required (Xcode command line tools on macOS, g++ or clang++ on Linux)"
 
@@ -127,7 +122,7 @@ mkdir -p "$SRC"
 tar -xzf "$tarball" -C "$SRC" --strip-components=1 || die "could not unpack the download"
 [ -f "$SRC/build.wave" ] || die "the download does not look like wjson (no build.wave)"
 
-say "building the libraries (this takes a minute or two)"
+say "building the library"
 log="$DIR/build.log"
 (
     cd "$SRC"
@@ -143,9 +138,8 @@ log="$DIR/build.log"
 
 # The build prints the library paths and the linker flags for this machine.
 link_flags="$(sed -n 's/^link[[:space:]]*:[[:space:]]*//p' "$log" | tail -n 1)"
-core_lib="$SRC/$(sed -n 's/^core[[:space:]]*:[[:space:]]*//p' "$log" | tail -n 1)"
 native_lib="$SRC/$(sed -n 's/^native[[:space:]]*:[[:space:]]*//p' "$log" | tail -n 1)"
-[ -f "$core_lib" ] && [ -f "$native_lib" ] || die "the build did not produce the libraries (see $log)"
+[ -f "$native_lib" ] || die "the build did not produce the library (see $log)"
 
 # ---- the wrapper ----------------------------------------------------------------------
 
@@ -162,11 +156,11 @@ wrapper="$DIR/bin/wjson-wavec"
     printf 'fi\n'
     if [ -n "$STD_ROOT" ]; then
         printf 'std="${WAVE_STD:-%s}"\n' "$STD_ROOT"
-        printf 'exec wavec --std-root="$std" $opt build "$@" "%s" "%s" --dep=wjson="%s" %s\n' \
-            "$native_lib" "$core_lib" "$SRC" "$link_flags"
+        printf 'exec wavec --std-root="$std" $opt build "$@" "%s" --dep=wjson="%s" %s\n' \
+            "$native_lib" "$SRC" "$link_flags"
     else
-        printf 'exec wavec $opt build "$@" "%s" "%s" --dep=wjson="%s" %s\n' \
-            "$native_lib" "$core_lib" "$SRC" "$link_flags"
+        printf 'exec wavec $opt build "$@" "%s" --dep=wjson="%s" %s\n' \
+            "$native_lib" "$SRC" "$link_flags"
     fi
 } > "$wrapper"
 chmod +x "$wrapper"

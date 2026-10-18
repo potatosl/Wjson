@@ -31,8 +31,8 @@ wjson is used from source: build its two static libraries once, then compile
 your own program against them.
 
 **Quick install (Linux, macOS).** One command downloads the sources, builds the
-libraries and writes a wrapper that compiles a Wave program against them (it
-needs `wavec`, Rust and a C++ compiler on your `PATH`, see step 1 below; it
+library and writes a wrapper that compiles a Wave program against it (it
+needs `wavec` and a C++ compiler on your `PATH`, see step 1 below; it
 tells you if one is missing and never installs them for you):
 
 ```sh
@@ -48,7 +48,8 @@ printed). The steps below do the same by hand; on Windows use them or
 `setup-windows.cmd`.
 
 **1. Install the tools** — the Wave compiler `wavec` (0.2.1-pre-beta, the
-newest release), Rust 1.99 or newer, and a C++20 compiler. Wave's official
+newest release) and a C++20 compiler; Rust 1.99 or newer is only needed to run the
+full test suite (the Rust core is the reference the Wave code is tested against). Wave's official
 installer (see its [install page](https://wave-lang.dev/docs/en/getting-started/install)):
 
 ```sh

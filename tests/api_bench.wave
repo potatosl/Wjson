@@ -1,0 +1,186 @@
+// SPDX-License-Identifier: MPL-2.0
+//
+// Throughput of the Wave document model and pull parser (src/ffi.wave) next to
+// the Rust core (src/ffi_rust.wave) on the same generated records file: DOM
+// parse, key lookups, and pulling every event with 64 KiB chunks. Best of
+// several runs, CPU time. Not part of the test run:
+//   WJSON_TASK=apibench wavec run build.wave
+
+import("std::mem::alloc")::{mem_alloc, mem_free};
+extern(c, "clock") fun c_clock() -> i64;
+import("wjson::ffi");
+import("wjson::ffi_rust");
+
+static N: i64 = 0;
+
+fun put(buf: ptr<u8>, at: i64, c: u8) -> i64 {
+    deref buf[at] = c;
+    return at + 1;
+}
+
+fun put_str(buf: ptr<u8>, at: i64, s: str) -> i64 {
+    var p: ptr<u8> = s as ptr<u8>;
+    var n: i64 = at;
+    var i: i64 = 0;
+    while (p[i] != 0) {
+        deref buf[n] = p[i];
+        n += 1;
+        i += 1;
+    }
+    return n;
+}
+
+fun put_int(buf: ptr<u8>, at: i64, v: i64) -> i64 {
+    if (v >= 10) {
+        var m: i64 = put_int(buf, at, v / 10);
+        return put(buf, m, (48 + v % 10) as u8);
+    }
+    return put(buf, at, (48 + v) as u8);
+}
+
+fun make_records(buf: ptr<u8>, count: i64) -> i64 {
+    var n: i64 = put(buf, 0, 91);
+    var i: i64 = 0;
+    while (i < count) {
+        if (i > 0) { n = put(buf, n, 44); }
+        n = put_str(buf, n, "{\"id\":");
+        n = put_int(buf, n, i);
+        n = put_str(buf, n, ",\"name\":\"user ");
+        n = put_int(buf, n, i);
+        n = put_str(buf, n, "\",\"email\":\"user");
+        n = put_int(buf, n, i);
+        n = put_str(buf, n, "@example.com\",\"tags\":[\"wave\",\"rust\",\"c++\"],\"score\":");
+        n = put_int(buf, n, i % 1000);
+        n = put_str(buf, n, ".5,\"active\":");
+        if (i % 2 == 0) { n = put_str(buf, n, "true"); } else { n = put_str(buf, n, "false"); }
+        n = put_str(buf, n, ",\"address\":{\"city\":\"Seoul\",\"zip\":\"0");
+        n = put_int(buf, n, 4500 + i % 500);
+        n = put_str(buf, n, "\"}}");
+        i += 1;
+    }
+    return put(buf, n, 93);
+}
+
+fun ms(us: i64) -> i64 { return us / 1000; }
+
+fun main() -> i32 {
+    var count: i64 = 150000;
+    var cap: i64 = count * 220;
+    var buf: ptr<u8> = mem_alloc(cap);
+    var len: i64 = make_records(buf, count);
+    println("{} records, {} bytes", count, len);
+
+    var best_w: i64 = 1000000000;
+    var best_r: i64 = 1000000000;
+    var run: i32 = 0;
+    while (run < 5) {
+        var t0: i64 = c_clock();
+        var w: ptr<u8> = wjson::ffi::ffi_parse(buf, len, 0, 0);
+        var t1: i64 = c_clock();
+        var r: ptr<u8> = wjson::ffi_rust::ffi_parse(buf, len, 0, 0);
+        var t2: i64 = c_clock();
+        if (t1 - t0 < best_w) { best_w = t1 - t0; }
+        if (t2 - t1 < best_r) { best_r = t2 - t1; }
+        wjson::ffi::ffi_free(w);
+        wjson::ffi_rust::ffi_free(r);
+        run += 1;
+    }
+    println("parse        wave {} ms   rust {} ms", ms(best_w), ms(best_r));
+
+    var w2: ptr<u8> = wjson::ffi::ffi_parse(buf, len, 0, 0);
+    var r2: ptr<u8> = wjson::ffi_rust::ffi_parse(buf, len, 0, 0);
+    var root_w: i32 = wjson::ffi::ffi_root(w2);
+    var root_r: i32 = wjson::ffi_rust::ffi_root(r2);
+    best_w = 1000000000;
+    best_r = 1000000000;
+    run = 0;
+    var sink: i64 = 0;
+    while (run < 5) {
+        var a0: i64 = c_clock();
+        var i: i64 = 0;
+        while (i < count) {
+            var rec: i32 = wjson::ffi::ffi_at(w2, root_w, i);
+            var addr: i32 = wjson::ffi::ffi_get(w2, rec, "address" as ptr<u8>, 7);
+            sink += wjson::ffi::ffi_get(w2, addr, "zip" as ptr<u8>, 3) as i64;
+            sink += wjson::ffi::ffi_get(w2, rec, "email" as ptr<u8>, 5) as i64;
+            i += 1;
+        }
+        var a1: i64 = c_clock();
+        i = 0;
+        while (i < count) {
+            var rec2: i32 = wjson::ffi_rust::ffi_at(r2, root_r, i);
+            var addr2: i32 = wjson::ffi_rust::ffi_get(r2, rec2, "address" as ptr<u8>, 7);
+            sink += wjson::ffi_rust::ffi_get(r2, addr2, "zip" as ptr<u8>, 3) as i64;
+            sink += wjson::ffi_rust::ffi_get(r2, rec2, "email" as ptr<u8>, 5) as i64;
+            i += 1;
+        }
+        var a2: i64 = c_clock();
+        if (a1 - a0 < best_w) { best_w = a1 - a0; }
+        if (a2 - a1 < best_r) { best_r = a2 - a1; }
+        run += 1;
+    }
+    println("lookups      wave {} ms   rust {} ms   (600k gets)", ms(best_w), ms(best_r));
+    wjson::ffi::ffi_free(w2);
+    wjson::ffi_rust::ffi_free(r2);
+
+    best_w = 1000000000;
+    best_r = 1000000000;
+    run = 0;
+    while (run < 5) {
+        var s0: i64 = c_clock();
+        var rw: ptr<u8> = wjson::ffi::ffi_reader_new(0, 0);
+        var off: i64 = 0;
+        var ev: i32 = 1;
+        var events_w: i64 = 0;
+        while (ev > 0 || ev == 0) {
+            ev = wjson::ffi::ffi_reader_next(rw);
+            if (ev == 0) {
+                if (off < len) {
+                    var step: i64 = 65536;
+                    if (off + step > len) { step = len - off; }
+                    wjson::ffi::ffi_reader_feed(rw, buf + off, step);
+                    off += step;
+                } else {
+                    wjson::ffi::ffi_reader_finish(rw);
+                }
+            } else if (ev > 0 && ev < 11) {
+                events_w += 1;
+            } else {
+                ev = 0 - 2;
+            }
+        }
+        wjson::ffi::ffi_reader_free(rw);
+        var s1: i64 = c_clock();
+        var rr: ptr<u8> = wjson::ffi_rust::ffi_reader_new(0, 0);
+        off = 0;
+        ev = 1;
+        var events_r: i64 = 0;
+        while (ev > 0 || ev == 0) {
+            ev = wjson::ffi_rust::ffi_reader_next(rr);
+            if (ev == 0) {
+                if (off < len) {
+                    var step2: i64 = 65536;
+                    if (off + step2 > len) { step2 = len - off; }
+                    wjson::ffi_rust::ffi_reader_feed(rr, buf + off, step2);
+                    off += step2;
+                } else {
+                    wjson::ffi_rust::ffi_reader_finish(rr);
+                }
+            } else if (ev > 0 && ev < 11) {
+                events_r += 1;
+            } else {
+                ev = 0 - 2;
+            }
+        }
+        wjson::ffi_rust::ffi_reader_free(rr);
+        var s2: i64 = c_clock();
+        if (events_w != events_r) { println("event counts differ: {} {}", events_w, events_r); }
+        if (s1 - s0 < best_w) { best_w = s1 - s0; }
+        if (s2 - s1 < best_r) { best_r = s2 - s1; }
+        run += 1;
+    }
+    println("pull parser  wave {} ms   rust {} ms", ms(best_w), ms(best_r));
+    if (sink == 42) { println("{}", sink); }
+    mem_free(buf, cap);
+    return 0;
+}

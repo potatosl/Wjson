@@ -19,7 +19,7 @@ Wave ↔ Rust/C++ 경계는 모두 C ABI(`extern(c)`)입니다. C/C++ 프로그�
 
 wjson은 소스로 받아서 씁니다. 정적 라이브러리 두 개를 한 번 빌드한 뒤, 내 프로그램을 그 라이브러리에 링크해서 컴파일하면 돼요.
 
-**빠른 설치 (Linux, macOS).** 명령 한 줄이면 소스를 받아 라이브러리를 빌드하고, Wave 프로그램을 그 라이브러리에 맞춰 컴파일해 주는 래퍼까지 만들어 줘요. `wavec`, Rust, C++ 컴파일러가 `PATH`에 있어야 하고(아래 1단계), 없으면 알려 주기만 할 뿐 대신 설치하지는 않아요.
+**빠른 설치 (Linux, macOS).** 명령 한 줄이면 소스를 받아 라이브러리를 빌드하고, Wave 프로그램을 그 라이브러리에 맞춰 컴파일해 주는 래퍼까지 만들어 줘요. `wavec`와 C++ 컴파일러가 `PATH`에 있어야 하고(아래 1단계), 없으면 알려 주기만 할 뿐 대신 설치하지는 않아요.
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/potatosl/wjson/main/install.sh | sh
@@ -28,7 +28,7 @@ curl -fsSL https://raw.githubusercontent.com/potatosl/wjson/main/install.sh | sh
 
 스크립트는 짧으니 실행 전에 [읽어 보세요](install.sh). `~/.wjson`에 설치되고(폴더를 지우면 제거돼요), `WJSON_REF=<태그 또는 커밋>`으로 `main` 대신 버전을 고르고, `WJSON_DIR`로 설치 위치를, `WJSON_SHA256`으로 받은 파일의 SHA-256이 다르면 중단하도록 지정할 수 있어요(실제 값은 항상 출력돼요). 아래 단계는 같은 일을 손으로 하는 방법이고, Windows에서는 아래 단계 또는 `setup-windows.cmd`를 쓰세요.
 
-**1. 도구 설치** — Wave 컴파일러 `wavec`(0.2.1-pre-beta, 현재 최신), Rust 1.99 이상, C++20 컴파일러. Wave 공식 설치 방법은 [설치 페이지](https://wave-lang.dev/docs/en/getting-started/install)에 있어요:
+**1. 도구 설치** — Wave 컴파일러 `wavec`(0.2.1-pre-beta, 현재 최신)와 C++20 컴파일러. Rust 1.99 이상은 전체 테스트를 돌릴 때만 필요해요(Rust 코어는 Wave 코드를 비교 검증하는 기준). Wave 공식 설치 방법은 [설치 페이지](https://wave-lang.dev/docs/en/getting-started/install)에 있어요:
 
 ```sh
 curl -fsSL https://wave-lang.dev/install.sh | bash     # Linux, macOS, FreeBSD

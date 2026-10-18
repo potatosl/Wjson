@@ -76,6 +76,16 @@ minor releases.
   for C and C++ users. `tests/ffi_wave_test.wave` compares the handle layer with
   the Rust C ABI on null handles, failed parses, bad ids and lengths, error
   messages and readers (3,000 checks); the other tests run unchanged.
+- Programs that use the Wave library no longer link the Rust core: the examples,
+  the wrapper written by `install.sh`, `WJSON_RUN` and `WJSON_TASK=libs` build
+  and link the C++ layer only (`--link=m --link=c`), so installing on Linux and
+  macOS needs `wavec` and a C++ compiler, not Rust. The tests that compare with
+  the Rust core still link it; `WJSON_CORE=1` adds it to `libs` and `WJSON_RUN`.
+  Windows is unchanged (its link flags come with the Rust build). New
+  `WJSON_TASK=apibench` / `tests/api_bench.wave` times the Wave document model
+  and pull parser against the Rust core on a 24.6 MB records file (best of 5,
+  `-O2`): parse 61 ms vs 94 ms, 600k key lookups 1 ms vs 4 ms, pull parser
+  61 ms vs 62 ms; with `-O0` Wave is 2x to 5x slower (189 / 8 / 312 ms).
 - Windows on ARM64 is supported, natively and without MSVC like x64. `wjlink`
   (the MSVC-free link driver) now takes the architecture as a value: import
   libraries use the matching machine type and RVA relocation, and the startup

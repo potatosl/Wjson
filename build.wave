@@ -4,8 +4,9 @@
 //
 //   wavec run build.wave                         build everything, run all tests + examples
 //   WJSON_RUN=examples/show_data.wave wavec run build.wave     build and run one program
-//   WJSON_TASK=libs wavec run build.wave         only build the Rust + C++ libraries
+//   WJSON_TASK=libs wavec run build.wave         only build the libraries (C++ layer; WJSON_CORE=1 adds the Rust core)
 //   WJSON_TASK=bench wavec run build.wave        run the Rust and C++ benchmarks
+//   WJSON_TASK=apibench wavec run build.wave     Wave document model + pull parser vs the Rust core
 //   WJSON_TASK=sanitize wavec run build.wave     C++ tests under ASan + UBSan, then C++ and Rust
 //                                                tests under valgrind (Linux; valgrind is optional)
 //   WJSON_DRY_RUN=1 wavec run build.wave         print the commands without running them
@@ -40,6 +41,8 @@ extern(c, "fflush") fun c_fflush(stream: ptr<u8>) -> i32;
 const BUILD: str = "build";
 const LIBS_FILE: str = "build/native-static-libs.txt";
 const SYSROOT_FILE: str = "build/rust-sysroot.txt";
+// Link flags for programs that do not use the Rust core (not Windows).
+const LEAN_FLAGS: str = " --link=m --link=c";
 const GCC_PATH_FILE: str = "build/gcc-runtime-path.txt";
 // wjlink and the libraries it generates (in lib/ next to the executable).
 const WJLINK: str = "build/chain/release/wjlink.exe";
@@ -376,7 +379,12 @@ fun collect_link_flags(b: ptr<Buffer>, flags: ptr<Buffer>) -> bool {
     return true;
 }
 
-fun build_libs(b: ptr<Buffer>, flags: ptr<Buffer>) -> bool {
+// The Wave library needs only the C++ console layer; the Rust core is a
+// reference for the tests and a library for C and C++ users. Without
+// `with_rust` (and off Windows, where the toolchain and the C runtime come from
+// the Rust build) only the C++ layer is built and the link flags are the C
+// runtime and math libraries.
+fun build_libs(b: ptr<Buffer>, flags: ptr<Buffer>, with_rust: bool) -> bool {
     create_dir(BUILD);
     if (WINDOWS && !TOOLCHAIN_READY) {
         if (!build_toolchain(b)) {
@@ -384,13 +392,20 @@ fun build_libs(b: ptr<Buffer>, flags: ptr<Buffer>) -> bool {
         }
         TOOLCHAIN_READY = true;
     }
+    if (!with_rust && !WINDOWS) {
+        add(flags, LEAN_FLAGS);
+        return build_native(b);
+    }
     return build_core(b) && build_native(b) && collect_link_flags(b, flags);
 }
 
 // ---- Wave programs -------------------------------------------------------------------
 
 // wavec build <src> <native> <core> --dep=wjson=. <link flags> -o <output>
-fun wave_build(b: ptr<Buffer>, flags: ptr<Buffer>, source: str, output: str) -> bool {
+// `use_core` links the Rust core too (the tests that compare against it need
+// it); programs that only use the Wave library link the C++ layer alone, except
+// on Windows, where the link flags come with the Rust build.
+fun wave_build(b: ptr<Buffer>, flags: ptr<Buffer>, source: str, output: str, use_core: bool) -> bool {
     step(source);
     add(b, env_or("WAVEC", "wavec"));
     if (env_set("WAVE_STD")) {
@@ -403,10 +418,15 @@ fun wave_build(b: ptr<Buffer>, flags: ptr<Buffer>, source: str, output: str) -> 
     add(b, source);
     add(b, " ");
     add(b, native_lib());
-    add(b, " ");
-    add(b, core_lib());
-    add(b, " --dep=wjson=.");
-    buffer_append_buffer(b, flags);
+    if (use_core || WINDOWS) {
+        add(b, " ");
+        add(b, core_lib());
+        add(b, " --dep=wjson=.");
+        buffer_append_buffer(b, flags);
+    } else {
+        add(b, " --dep=wjson=.");
+        add(b, LEAN_FLAGS);
+    }
     add(b, " -o ");
     add(b, output);
     if (WINDOWS) {
@@ -504,7 +524,7 @@ fun task_test(b: ptr<Buffer>, flags: ptr<Buffer>) {
     }
     must(b);
 
-    if (!build_libs(b, flags)) {
+    if (!build_libs(b, flags, true)) {
         return;
     }
     cxx_test(b, flags);
@@ -521,7 +541,7 @@ fun task_test(b: ptr<Buffer>, flags: ptr<Buffer>) {
         add(&tbin, "build/");
         add(&tbin, tests[t]);
         buffer_push(&tbin, 0);
-        if (wave_build(b, flags, buffer_as_ptr(&tsrc) as str, buffer_as_ptr(&tbin) as str)) {
+        if (wave_build(b, flags, buffer_as_ptr(&tsrc) as str, buffer_as_ptr(&tbin) as str, t >= 5)) {
             run_in(b, ".", buffer_as_ptr(&tbin) as str);
         }
         buffer_free(&tsrc);
@@ -543,7 +563,7 @@ fun task_test(b: ptr<Buffer>, flags: ptr<Buffer>) {
         add(&bin, "build/examples/");
         add(&bin, examples[i]);
         buffer_push(&bin, 0);
-        if (wave_build(b, flags, buffer_as_ptr(&src) as str, buffer_as_ptr(&bin) as str)) {
+        if (wave_build(b, flags, buffer_as_ptr(&src) as str, buffer_as_ptr(&bin) as str, false)) {
             run_in(b, "examples", buffer_as_ptr(&bin) as str);
         }
         buffer_free(&src);
@@ -584,6 +604,16 @@ fun task_bench(b: ptr<Buffer>) {
     }
 }
 
+// The Wave document model and pull parser next to the Rust core (tests/api_bench.wave).
+fun task_apibench(b: ptr<Buffer>, flags: ptr<Buffer>) {
+    if (!build_libs(b, flags, true)) {
+        return;
+    }
+    if (wave_build(b, flags, "tests/api_bench.wave", "build/api_bench", true)) {
+        run_in(b, ".", "build/api_bench");
+    }
+}
+
 // Memory-safety checks (Linux): the C++ tests under AddressSanitizer and
 // UBSan, then the C++ tests and the Rust unit tests under valgrind. Only
 // "definite" leaks count for valgrind: Rust's std keeps a few thread-start
@@ -593,7 +623,7 @@ fun task_sanitize(b: ptr<Buffer>, flags: ptr<Buffer>) {
         println("sanitize: Linux only (AddressSanitizer, UBSan and valgrind)");
         return;
     }
-    if (!build_libs(b, flags)) {
+    if (!build_libs(b, flags, true)) {
         return;
     }
     var srcs: str = " -Iinclude -Inative/include native/src/number.cpp native/src/escape.cpp native/src/console.cpp native/tests/native_test.cpp build/cargo/release/libwjson_core.a -lpthread -ldl";
@@ -635,7 +665,7 @@ fun task_sanitize(b: ptr<Buffer>, flags: ptr<Buffer>) {
 
 // WJSON_RUN=dir/name.wave -> build/run/name, executed inside dir/.
 fun task_run(b: ptr<Buffer>, flags: ptr<Buffer>, source: str) {
-    if (!build_libs(b, flags)) {
+    if (!build_libs(b, flags, env_set("WJSON_CORE"))) {
         return;
     }
     var p: ptr<u8> = source as ptr<u8>;
@@ -667,7 +697,7 @@ fun task_run(b: ptr<Buffer>, flags: ptr<Buffer>, source: str) {
     }
     buffer_push(&dir, 0);
 
-    if (wave_build(b, flags, source, buffer_as_ptr(&bin) as str)) {
+    if (wave_build(b, flags, source, buffer_as_ptr(&bin) as str, env_set("WJSON_CORE"))) {
         step("run");
         run_in(b, buffer_as_ptr(&dir) as str, buffer_as_ptr(&bin) as str);
     }
@@ -714,16 +744,20 @@ fun main() -> i32 {
         task_run(&b, &flags, env_or("WJSON_RUN", ""));
     } else if (streq(env_or("WJSON_TASK", "test"), "bench")) {
         task_bench(&b);
+    } else if (streq(env_or("WJSON_TASK", "test"), "apibench")) {
+        task_apibench(&b, &flags);
     } else if (streq(env_or("WJSON_TASK", "test"), "sanitize")) {
         task_sanitize(&b, &flags);
         if (FAILED == 0) {
             step("sanitizers clean");
         }
     } else if (streq(env_or("WJSON_TASK", "test"), "libs")) {
-        if (build_libs(&b, &flags)) {
+        if (build_libs(&b, &flags, env_set("WJSON_CORE"))) {
             buffer_push(&flags, 0);
             println("");
-            println("core   : {}", core_lib());
+            if (env_set("WJSON_CORE") || WINDOWS) {
+                println("core   : {}", core_lib());
+            }
             println("native : {}", native_lib());
             println("link   :{}", buffer_as_ptr(&flags) as str);
         }
