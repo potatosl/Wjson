@@ -3,11 +3,12 @@
 // Throughput of the Wave document model and pull parser (src/ffi.wave) next to
 // the Rust core (src/ffi_rust.wave) on the same generated records file: DOM
 // parse, key lookups, and pulling every event with 64 KiB chunks. Best of
-// several runs, CPU time. Not part of the test run:
+// several runs, CPU time (WJSON_BENCH_RECORDS sets the record count). Not part of the test run:
 //   WJSON_TASK=apibench wavec run build.wave
 
 import("std::mem::alloc")::{mem_alloc, mem_free};
 extern(c, "clock") fun c_clock() -> i64;
+extern(c, "getenv") fun c_getenv(name: ptr<u8>) -> ptr<u8>;
 import("wjson::ffi");
 import("wjson::ffi_rust");
 
@@ -65,6 +66,18 @@ fun ms(us: i64) -> i64 { return us / 1000; }
 
 fun main() -> i32 {
     var count: i64 = 150000;
+    var env: ptr<u8> = c_getenv("WJSON_BENCH_RECORDS" as ptr<u8>);
+    if (env != null) {
+        var x: i64 = 0;
+        var k: i64 = 0;
+        while (env[k] >= 48 && env[k] <= 57) {
+            x = x * 10 + ((env[k] - 48) as i64);
+            k += 1;
+        }
+        if (x > 0) {
+            count = x;
+        }
+    }
     var cap: i64 = count * 220;
     var buf: ptr<u8> = mem_alloc(cap);
     var len: i64 = make_records(buf, count);

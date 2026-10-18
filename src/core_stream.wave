@@ -342,6 +342,22 @@ fun _text_put(r: ptr<CoreReader>, c: u8) -> bool {
     return true;
 }
 
+// Makes room for `extra` more bytes plus the NUL. Returns false when memory
+// runs out.
+fun _text_reserve(r: ptr<CoreReader>, extra: i64) -> bool {
+    var need: i64 = deref r.text_len + extra + 1;
+    if (need > deref r.text_cap) {
+        var nc: i64 = deref r.text_cap * 2;
+        if (nc < 64) { nc = 64; }
+        while (nc < need) { nc = nc * 2; }
+        var g: ptr<u8> = core_realloc(deref r.text, nc);
+        if (g == null) { return false; }
+        deref r.text = g;
+        deref r.text_cap = nc;
+    }
+    return true;
+}
+
 // Makes the text empty but valid (a lone NUL), allocating if needed.
 fun _text_begin(r: ptr<CoreReader>) -> bool {
     deref r.text_len = 0;
@@ -615,12 +631,25 @@ fun _put_utf8(r: ptr<CoreReader>, code: i64) -> bool {
 fun _decode(r: ptr<CoreReader>, raw: ptr<u8>, n: i64) -> i32 {
     var i: i64 = 0;
     while (i < n) {
-        while (i < n && raw[i] != 92 && raw[i] >= 32) {
-            if (!_text_put(r, raw[i])) {
+        // A run of plain characters is copied in one piece.
+        var run: i64 = i;
+        while (run < n && raw[run] != 92 && raw[run] >= 32) {
+            run += 1;
+        }
+        if (run > i) {
+            if (!_text_reserve(r, run - i)) {
                 deref r.lx_n = i;
                 return ERR_TOO_LARGE;
             }
-            i += 1;
+            var t: ptr<u8> = deref r.text;
+            var tl: i64 = deref r.text_len;
+            while (i < run) {
+                deref t[tl] = raw[i];
+                tl += 1;
+                i += 1;
+            }
+            deref t[tl] = 0;
+            deref r.text_len = tl;
         }
         if (i == n) {
             break;
@@ -694,10 +723,12 @@ fun _lex_string(r: ptr<CoreReader>) -> i32 {
     // earlier, incomplete attempt stopped.
     var i: i64 = deref r.resume;
     if (i < 1) { i = 1; }
+    var sb: ptr<u8> = deref r.buf;
+    var sp: i64 = deref r.pos;
     while (true) {
         var c: i32 = 0 - 1;
         if (i < rest) {
-            c = _at(r, i);
+            c = sb[sp + i] as i32;
         }
         if (c < 0) {
             if (deref r.eof) {
