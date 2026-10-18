@@ -109,6 +109,18 @@ minor releases.
   (`ulimit -v`: every failure is a clean error or refusal, no crash), the
   examples' output identical on both backends, and mutation checks of limits,
   surrogate ranges and the parser's resume logic all came out clean.
+- Parsing strings is about 20% cheaper in instructions: the UTF-8 check is
+  skipped for strings that are plain ASCII (the scan for the closing quote
+  notes whether any byte is 128 or above, escaped ones included), ASCII bytes
+  inside a string that has other characters skip the decoder, and the decoder
+  reserves room once per string and copies runs without a capacity check per
+  byte. New `tests/api_bench_shapes.wave` (part of `WJSON_TASK=apibench`) times
+  other document shapes, Wave against Rust, `-O2`, best of 5: float pairs 16 MB
+  54 ms vs 47 ms, strings with escapes and UTF-8 23 MB 36 ms vs 23 ms, one object
+  with 300,000 keys 12 ms vs 8 ms, a million pushes plus 200,000 `obj_set`
+  37 ms vs 53 ms; the records file of `api_bench.wave` 58 ms vs 91 ms. So Wave
+  is level or faster on records and edits and up to 1.5x slower on strings,
+  numbers and very wide objects.
 - Windows on ARM64 is supported, natively and without MSVC like x64. `wjlink`
   (the MSVC-free link driver) now takes the architecture as a value: import
   libraries use the matching machine type and RVA relocation, and the startup

@@ -639,6 +639,9 @@ fun task_apibench(b: ptr<Buffer>, flags: ptr<Buffer>) {
     if (wave_build(b, flags, "tests/api_bench.wave", "build/api_bench", true)) {
         run_in(b, ".", "build/api_bench");
     }
+    if (wave_build(b, flags, "tests/api_bench_shapes.wave", "build/api_bench_shapes", true)) {
+        run_in(b, ".", "build/api_bench_shapes");
+    }
 }
 
 // Memory-safety checks (Linux): the C++ tests under AddressSanitizer and

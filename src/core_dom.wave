@@ -206,6 +206,25 @@ pub fun core_bytes_put(d: ptr<CoreDoc>, c: u8) -> bool {
     return true;
 }
 
+// Makes room for `extra` more bytes. Returns false when memory runs out.
+pub fun core_bytes_reserve(d: ptr<CoreDoc>, extra: i64) -> bool {
+    var need: i64 = deref d.byte_len + extra;
+    var cap: i64 = deref d.byte_cap;
+    if (need > cap) {
+        var nc: i64 = _next_cap(cap, 256);
+        while (nc < need) {
+            nc = _next_cap(nc, 256);
+        }
+        var grown: ptr<u8> = _regrow(deref d.bytes, cap, nc);
+        if (grown == null) {
+            return false;
+        }
+        deref d.bytes = grown;
+        deref d.byte_cap = nc;
+    }
+    return true;
+}
+
 // Appends `n` bytes of `src` followed by a NUL; returns the start offset or -1.
 pub fun core_bytes_push(d: ptr<CoreDoc>, src: ptr<u8>, n: i64) -> i64 {
     var start: i64 = deref d.byte_len;

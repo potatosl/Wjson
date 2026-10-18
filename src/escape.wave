@@ -191,6 +191,11 @@ pub fun esc_utf8_check(src: ptr<u8>, len: i64) -> i64 {
     }
     var p: i64 = 0;
     while (p < len) {
+        // Plain ASCII needs no decoding.
+        if (src[p] < 128) {
+            p += 1;
+            continue;
+        }
         var cp: u32 = 0;
         var n: i32 = _decode_utf8(&src[p], len - p, &cp);
         if (n == 0) {

@@ -7,7 +7,7 @@
 
 import("./escape")::{esc_utf8_check};
 import("./core_dom")::{
-    CoreDoc, core_doc_empty, core_doc_release, core_bytes_put, core_bytes_push, core_node_push,
+    CoreDoc, core_doc_empty, core_doc_release, core_bytes_put, core_bytes_reserve, core_bytes_push, core_node_push,
     core_elems_push, core_members_push, core_index_build, CORE_INDEX_THRESHOLD, core_alloc, core_realloc, core_free,
     CORE_NULL, CORE_BOOL, CORE_NUMBER, CORE_STRING, CORE_ARRAY, CORE_OBJECT,
     CORE_NUM_INTEGER, CORE_NUM_NEGATIVE, CORE_PARENT_ROOT,
@@ -240,16 +240,23 @@ fun _put_utf8(doc: ptr<CoreDoc>, code: i64) -> bool {
 // `base` is the offset of raw[0].
 fun _decode(p: ptr<CoreParser>, raw: ptr<u8>, n: i64, base: i64) -> bool {
     var doc: ptr<CoreDoc> = deref p.doc;
+    // The decoded text is never longer than the raw text, so one reservation
+    // covers every plain run; escapes grow the buffer themselves if needed.
+    if (!core_bytes_reserve(doc, n)) {
+        _fail(p, CORE_ERR_TOO_LARGE, base);
+        return false;
+    }
     var i: i64 = 0;
     while (i < n) {
         // Copy the run up to the next backslash or control character.
+        var dst: ptr<u8> = deref doc.bytes;
+        var at: i64 = deref doc.byte_len;
         while (i < n && raw[i] != 92 && raw[i] >= 32) {
-            if (!core_bytes_put(doc, raw[i])) {
-                _fail(p, CORE_ERR_TOO_LARGE, base + i);
-                return false;
-            }
+            deref dst[at] = raw[i];
+            at += 1;
             i += 1;
         }
+        deref doc.byte_len = at;
         if (i == n) {
             break;
         }
@@ -323,6 +330,7 @@ fun _string(p: ptr<CoreParser>, out_start: ptr<u32>, out_len: ptr<u32>) -> bool 
     var len: i64 = deref p.len;
     // Find the closing quote, skipping escaped characters.
     var i: i64 = open + 1;
+    var high: u8 = 0;       // OR of every byte seen: below 128 means plain ASCII
     while (true) {
         if (i >= len) {
             _fail(p, CORE_ERR_UNEXPECTED_END, open);
@@ -332,7 +340,11 @@ fun _string(p: ptr<CoreParser>, out_start: ptr<u32>, out_len: ptr<u32>) -> bool 
         if (c == 34) {
             break;
         }
+        high = high | c;
         if (c == 92) {
+            if (i + 1 < len) {
+                high = high | src[i + 1];
+            }
             i += 2;
         } else {
             i += 1;
@@ -340,10 +352,12 @@ fun _string(p: ptr<CoreParser>, out_start: ptr<u32>, out_len: ptr<u32>) -> bool 
     }
     var n: i64 = i - open - 1;
     var raw: ptr<u8> = &src[open + 1];
-    var bad: i64 = esc_utf8_check(raw, n);
-    if (bad >= 0) {
-        _fail(p, CORE_ERR_INVALID_UTF8, open + 1 + bad);
-        return false;
+    if (high >= 128) {
+        var bad: i64 = esc_utf8_check(raw, n);
+        if (bad >= 0) {
+            _fail(p, CORE_ERR_INVALID_UTF8, open + 1 + bad);
+            return false;
+        }
     }
     var doc: ptr<CoreDoc> = deref p.doc;
     var start: i64 = deref doc.byte_len;

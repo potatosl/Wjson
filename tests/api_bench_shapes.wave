@@ -1,0 +1,123 @@
+// SPDX-License-Identifier: MPL-2.0
+//
+// Throughput of the Wave document model (src/ffi.wave) next to the Rust core
+// (src/ffi_rust.wave) on differently shaped documents: float pairs, strings
+// with escapes and UTF-8, one object with 300,000 keys, and editing. Best of
+// several runs, CPU time. Not part of the test run:
+//   WJSON_TASK=apibench wavec run build.wave
+
+import("std::mem::alloc")::{mem_alloc, mem_free};
+extern(c, "clock") fun c_clock() -> i64;
+import("wjson::ffi");
+import("wjson::ffi_rust");
+
+fun put(buf: ptr<u8>, at: i64, c: u8) -> i64 { deref buf[at] = c; return at + 1; }
+fun put_str(buf: ptr<u8>, at: i64, s: str) -> i64 {
+    var p: ptr<u8> = s as ptr<u8>; var n: i64 = at; var i: i64 = 0;
+    while (p[i] != 0) { deref buf[n] = p[i]; n += 1; i += 1; }
+    return n;
+}
+fun put_int(buf: ptr<u8>, at: i64, v: i64) -> i64 {
+    if (v >= 10) { var m: i64 = put_int(buf, at, v / 10); return put(buf, m, (48 + v % 10) as u8); }
+    return put(buf, at, (48 + v) as u8);
+}
+fun ms(us: i64) -> i64 { return us / 1000; }
+
+// numbers: [[-123.4567890,45.6789012],...]
+fun make_numbers(buf: ptr<u8>, count: i64) -> i64 {
+    var n: i64 = put(buf, 0, 91);
+    var x: i64 = 88172645463325252;
+    var i: i64 = 0;
+    while (i < count) {
+        if (i > 0) { n = put(buf, n, 44); }
+        x = (x * 6364136223846793005 + 1442695040888963407);
+        var a: i64 = ((x >> 20) & 140737488355327) % 3600000000;
+        var b: i64 = ((x >> 7) & 140737488355327) % 1800000000;
+        n = put_str(buf, n, "[-");
+        n = put_int(buf, n, a / 10000000); n = put(buf, n, 46); n = put_int(buf, n, 10000000 + a % 10000000);
+        n = put(buf, n, 44);
+        n = put_int(buf, n, b / 10000000); n = put(buf, n, 46); n = put_int(buf, n, 10000000 + b % 10000000);
+        n = put(buf, n, 93);
+        i += 1;
+    }
+    return put(buf, n, 93);
+}
+// strings with escapes and UTF-8
+fun make_strings(buf: ptr<u8>, count: i64) -> i64 {
+    var n: i64 = put(buf, 0, 91);
+    var i: i64 = 0;
+    while (i < count) {
+        if (i > 0) { n = put(buf, n, 44); }
+        n = put_str(buf, n, "\"line one\\nline two \\\"quoted\\\" \\u00e9\\ud83d\\ude00 caf\xc3\xa9 \xed\x95\x9c\xea\xb8\x80 and a longer plain run of ascii text to scan ");
+        n = put_int(buf, n, i);
+        n = put(buf, n, 34);
+        i += 1;
+    }
+    return put(buf, n, 93);
+}
+// one object with many keys
+fun make_wide(buf: ptr<u8>, count: i64) -> i64 {
+    var n: i64 = put(buf, 0, 123);
+    var i: i64 = 0;
+    while (i < count) {
+        if (i > 0) { n = put(buf, n, 44); }
+        n = put_str(buf, n, "\"key_"); n = put_int(buf, n, i); n = put_str(buf, n, "\":"); n = put_int(buf, n, i);
+        i += 1;
+    }
+    return put(buf, n, 125);
+}
+
+fun best_parse(buf: ptr<u8>, len: i64, rust: bool) -> i64 {
+    var best: i64 = 1000000000; var run: i32 = 0;
+    while (run < 5) {
+        var t0: i64 = c_clock();
+        if (rust) { var r: ptr<u8> = wjson::ffi_rust::ffi_parse(buf, len, 0, 0); var t1: i64 = c_clock(); if (t1 - t0 < best) { best = t1 - t0; } wjson::ffi_rust::ffi_free(r); }
+        else { var w: ptr<u8> = wjson::ffi::ffi_parse(buf, len, 0, 0); var t2: i64 = c_clock(); if (t2 - t0 < best) { best = t2 - t0; } wjson::ffi::ffi_free(w); }
+        run += 1;
+    }
+    return best;
+}
+
+fun main() -> i32 {
+    var cap: i64 = 60000000;
+    var buf: ptr<u8> = mem_alloc(cap);
+    var len: i64 = make_numbers(buf, 600000);
+    println("numbers  {} MB: parse wave {} ms  rust {} ms", len / 1000000, ms(best_parse(buf, len, false)), ms(best_parse(buf, len, true)));
+    len = make_strings(buf, 200000);
+    println("strings  {} MB: parse wave {} ms  rust {} ms", len / 1000000, ms(best_parse(buf, len, false)), ms(best_parse(buf, len, true)));
+    len = make_wide(buf, 300000);
+    println("wide obj {} MB: parse wave {} ms  rust {} ms", len / 1000000, ms(best_parse(buf, len, false)), ms(best_parse(buf, len, true)));
+
+    // edits: build 1M-element array of ints, 200k-key object, then remove/insert
+    var bw: i64 = 1000000000; var br: i64 = 1000000000; var run: i32 = 0;
+    while (run < 3) {
+        var a0: i64 = c_clock();
+        var w: ptr<u8> = wjson::ffi::ffi_new_doc();
+        var arr: i32 = wjson::ffi::ffi_new_array(w);
+        var obj: i32 = wjson::ffi::ffi_new_object(w);
+        var i: i64 = 0;
+        while (i < 1000000) { var v: i32 = wjson::ffi::ffi_new_number(w, "12345" as ptr<u8>, 5); wjson::ffi::ffi_arr_push(w, arr, v); i += 1; }
+        i = 0;
+        while (i < 200000) { var k: i32 = wjson::ffi::ffi_new_null(w); wjson::ffi::ffi_obj_set(w, obj, "some_key_name" as ptr<u8>, 13, k); i += 1; }
+        i = 0;
+        while (i < 100) { wjson::ffi::ffi_arr_insert(w, arr, 0, wjson::ffi::ffi_new_null(w)); i += 1; }
+        wjson::ffi::ffi_free(w);
+        var a1: i64 = c_clock();
+        var r: ptr<u8> = wjson::ffi_rust::ffi_new_doc();
+        var arr2: i32 = wjson::ffi_rust::ffi_new_array(r);
+        var obj2: i32 = wjson::ffi_rust::ffi_new_object(r);
+        i = 0;
+        while (i < 1000000) { var v2: i32 = wjson::ffi_rust::ffi_new_number(r, "12345" as ptr<u8>, 5); wjson::ffi_rust::ffi_arr_push(r, arr2, v2); i += 1; }
+        i = 0;
+        while (i < 200000) { var k2: i32 = wjson::ffi_rust::ffi_new_null(r); wjson::ffi_rust::ffi_obj_set(r, obj2, "some_key_name" as ptr<u8>, 13, k2); i += 1; }
+        i = 0;
+        while (i < 100) { wjson::ffi_rust::ffi_arr_insert(r, arr2, 0, wjson::ffi_rust::ffi_new_null(r)); i += 1; }
+        wjson::ffi_rust::ffi_free(r);
+        var a2: i64 = c_clock();
+        if (a1 - a0 < bw) { bw = a1 - a0; }
+        if (a2 - a1 < br) { br = a2 - a1; }
+        run += 1;
+    }
+    println("edits (1M pushes, 200k obj_set, 100 front inserts): wave {} ms  rust {} ms", ms(bw), ms(br));
+    return 0;
+}
