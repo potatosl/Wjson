@@ -1,3 +1,7 @@
+<p align="center">
+  <a href="https://wave-lang.dev"><img src="docs/wave.svg" alt="Wave" width="220"></a>
+</p>
+
 # wjson — Wave용 JSON 라이브러리
 
 [English](README.md) | **한국어**
