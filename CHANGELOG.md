@@ -98,6 +98,17 @@ minor releases.
   program. Checked: the whole suite and all examples on both backends, at
   `-O2` and `-O0`; the randomized tests at 100,000 documents (pull parser: 100
   million checks); the Wave tests under valgrind without errors or leaks; clippy.
+- Fixes found by checking the Wave code against the Rust core from more
+  angles: a document copied into itself no longer keeps half a copy when the
+  copy fails (nesting over 2048 levels, or out of memory); the input size limit
+  is 2 GiB exactly as in the Rust core (an input of 2,147,483,647 bytes was
+  refused). Tests added: the nesting limit of copies, the 2 GiB boundary,
+  `\u` escapes at the 1/2/3/4-byte encoding and surrogate boundaries, a long
+  string fed byte by byte (no rescanning), and `WJSON_SEED=n` to run the random
+  tests on other inputs. Eight seeds at 200,000 documents, out-of-memory runs
+  (`ulimit -v`: every failure is a clean error or refusal, no crash), the
+  examples' output identical on both backends, and mutation checks of limits,
+  surrogate ranges and the parser's resume logic all came out clean.
 - Windows on ARM64 is supported, natively and without MSVC like x64. `wjlink`
   (the MSVC-free link driver) now takes the architecture as a value: import
   libraries use the matching machine type and RVA relocation, and the startup

@@ -11,6 +11,7 @@
 // Run from the repository root:  wavec run build.wave
 
 import("std::mem::alloc")::{mem_alloc, mem_free};
+extern(c, "clock") fun c_clock() -> i64;
 extern(c, "getenv") fun c_getenv(name: ptr<u8>) -> ptr<u8>;
 import("wjson::ffi_rust")::{
     ffi_reader_new, ffi_reader_free, ffi_reader_set_max_token, ffi_reader_feed, ffi_reader_finish,
@@ -228,6 +229,22 @@ fun test_fixed() {
         agree_str("\"\\ud83dx\"", f);
         agree_str("\"\\ude00\"", f);
         agree_str("\"\\ud83d\\u0041\"", f);
+        // Encoding boundaries of \\u escapes.
+        agree_str("\"\\u007f\\u0080\"", f);
+        agree_str("\"\\u07ff\\u0800\"", f);
+        agree_str("\"\\uffff\"", f);
+        agree_str("\"\\ud800\\udc00\\udbff\\udfff\"", f);
+        // Surrogate boundaries.
+        agree_str("\"\\udc00\"", f);
+        agree_str("\"\\udfff\"", f);
+        agree_str("\"\\ud7ff\"", f);
+        agree_str("\"\\ue000\"", f);
+        agree_str("\"\\ud800\\udc00\"", f);
+        agree_str("\"\\udbff\\udfff\"", f);
+        agree_str("\"\\udbff\\udbff\"", f);
+        agree_str("\"\\ud800\\ue000\"", f);
+        agree_str("\"\\ud800\\udbff\"", f);
+        agree_str("\"\\uDBFF\\uDFFF\"", f);
         agree_str("\"\\uZZZZ\"", f);
         agree_str("\"tab\there\"", f);
         agree_str("\"nl\nhere\"", f);
@@ -284,6 +301,43 @@ fun test_depth() {
         k += 1;
     }
     mem_free(buf, 5000);
+}
+
+// A long string fed one byte at a time must not be rescanned from its start
+// on every byte (that would take minutes): the Wave reader resumes where the
+// last scan stopped.
+fun test_resume() {
+    var n: i64 = 400000;
+    var buf: ptr<u8> = mem_alloc(n + 2);
+    deref buf[0] = 34;
+    var i: i64 = 1;
+    while (i <= n) {
+        deref buf[i] = 97;
+        i += 1;
+    }
+    deref buf[n + 1] = 34;
+    var w: CoreReader = core_reader_new(0, 0);
+    var t0: i64 = c_clock();
+    var fed: i64 = 0;
+    var ev: i32 = 0;
+    var steps: i64 = 0;
+    while (ev == 0 && steps < 2 * n + 10) {
+        ev = core_reader_next(&w);
+        steps += 1;
+        if (ev == 0) {
+            if (fed < n + 2) {
+                core_reader_feed(&w, buf + fed, 1);
+                fed += 1;
+            } else {
+                core_reader_finish(&w);
+            }
+        }
+    }
+    var t1: i64 = c_clock();
+    check(ev == 6, "long string fed byte by byte");
+    check(t1 - t0 < 3000000, "long string fed byte by byte is not quadratic");
+    core_reader_free(&w);
+    mem_free(buf, n + 2);
 }
 
 // A token that never ends must hit the cap at the same moment in both readers.
@@ -552,6 +606,19 @@ fun test_random(iters: i32) {
 }
 
 fun main() -> i32 {
+    // WJSON_SEED=n mixes n into the random generator, for runs on other inputs.
+    var sp: ptr<u8> = c_getenv("WJSON_SEED" as ptr<u8>);
+    if (sp != null) {
+        var seed: u64 = 0;
+        var si: i64 = 0;
+        while (sp[si] >= 48 && sp[si] <= 57) {
+            seed = seed * 10 + ((sp[si] - 48) as u64);
+            si += 1;
+        }
+        if (seed > 0) {
+            RNG = RNG ^ (seed * 2654435761 + 1);
+        }
+    }
     var iters: i32 = 3000;
     var p: ptr<u8> = c_getenv("WJSON_FUZZ_ITERS" as ptr<u8>);
     if (p != null) {
@@ -578,6 +645,7 @@ fun main() -> i32 {
     test_fixed();
     test_depth();
     test_max_token();
+    test_resume();
     test_random(iters);
     println("core_stream_test: {}/{} checks passed", CHECKS - FAILURES, CHECKS);
     if (FAILURES != 0) {

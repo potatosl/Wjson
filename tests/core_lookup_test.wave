@@ -265,6 +265,19 @@ fun test_doc(src: ptr<u8>, n: i64, scratch: ptr<u8>) {
 }
 
 fun main() -> i32 {
+    // WJSON_SEED=n mixes n into the random generator, for runs on other inputs.
+    var sp: ptr<u8> = c_getenv("WJSON_SEED" as ptr<u8>);
+    if (sp != null) {
+        var seed: u64 = 0;
+        var si: i64 = 0;
+        while (sp[si] >= 48 && sp[si] <= 57) {
+            seed = seed * 10 + ((sp[si] - 48) as u64);
+            si += 1;
+        }
+        if (seed > 0) {
+            RNG = RNG ^ (seed * 2654435761 + 1);
+        }
+    }
     var iters: i32 = 3000;
     var p: ptr<u8> = c_getenv("WJSON_FUZZ_ITERS" as ptr<u8>);
     if (p != null) {

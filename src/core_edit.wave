@@ -23,7 +23,7 @@
 
 import("./escape")::{esc_utf8_check};
 import("./core_dom")::{
-    CoreDoc, core_doc_empty, core_node_push, core_text, core_extra_push, core_elems_extend,
+    CoreDoc, core_doc_empty, core_doc_release, core_node_push, core_text, core_extra_push, core_elems_extend,
     core_members_extend, core_caps_ensure, core_find_member, core_index_drop, core_index_add,
     core_index_build, core_type, core_at,
     CORE_NULL, CORE_BOOL, CORE_NUMBER, CORE_STRING, CORE_ARRAY, CORE_OBJECT,
@@ -583,5 +583,19 @@ fun _copy_nested(dst: ptr<CoreDoc>, src: ptr<CoreDoc>, src_node: i64, depth: i32
 
 pub fun core_copy(dst: ptr<CoreDoc>, src: ptr<CoreDoc>, src_node: i32) -> i32 {
     if (!_ok_doc(dst) || !_ok_doc(src)) { return CORE_EDIT_INVALID; }
-    return _copy_nested(dst, src, src_node as i64, 0);
+    if (dst != src) {
+        return _copy_nested(dst, src, src_node as i64, 0);
+    }
+    // Copying a document into itself goes through a scratch document, as the
+    // Rust core does, so a copy that fails (too deep, out of memory) leaves the
+    // document exactly as it was instead of with half a copy in it.
+    var tmp: CoreDoc = core_new_doc();
+    var root: i32 = _copy_nested(&tmp, src, src_node as i64, 0);
+    if (root < 0) {
+        core_doc_release(&tmp);
+        return root;
+    }
+    var result: i32 = _copy_nested(dst, &tmp, root as i64, 0);
+    core_doc_release(&tmp);
+    return result;
 }

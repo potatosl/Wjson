@@ -35,7 +35,7 @@ pub const CORE_ERR_TOO_LARGE: i32 = 12;
 pub const CORE_ERR_INVALID_ARGUMENT: i32 = 13;
 
 // Offsets in the parse table must stay below 2^31.
-const MAX_INPUT: i64 = 2147483647;
+const MAX_INPUT: i64 = 2147483648;
 
 struct CoreParser {
     src: ptr<u8>;

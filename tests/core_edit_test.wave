@@ -338,7 +338,74 @@ fun test_sequence(ops: i32, start_parsed: bool) {
     core_doc_release(&d2);
 }
 
+// A chain of nested arrays of the given depth, copied into the same document
+// and into another one: both sides must agree on where the nesting limit is.
+fun test_copy_depth() {
+    var depths: array<i32, 7> = [1, 2046, 2047, 2048, 2049, 2050, 3000];
+    var k: i32 = 0;
+    while (k < 7) {
+        var depth: i32 = depths[k];
+        var r: ptr<u8> = ffi_new_doc();
+        var d: CoreDoc = core_new_doc();
+        var rr: i32 = ffi_new_array(r);
+        var dd: i32 = core_new_array(&d);
+        var rtop: i32 = rr;
+        var dtop: i32 = dd;
+        var level: i32 = 1;
+        while (level < depth) {
+            var rn: i32 = ffi_new_array(r);
+            var dn: i32 = core_new_array(&d);
+            ffi_arr_push(r, rn, rtop);
+            core_arr_push(&d, dn, dtop);
+            rtop = rn;
+            dtop = dn;
+            level += 1;
+        }
+        check(rtop == dtop, "chain ids");
+        ffi_set_root(r, rtop);
+        core_set_root(&d, dtop);
+        // Copy into the same document.
+        var cr: i32 = ffi_copy(r, r, rtop);
+        var cd: i32 = core_copy(&d, &d, dtop);
+        check(cr == cd, "copy depth into itself");
+        if (cr == cd && cr < 0) {
+            check(cr == 0 - 7, "copy depth error is TooDeep");
+        }
+        // Copy into a fresh document.
+        var r2: ptr<u8> = ffi_new_doc();
+        var d2: CoreDoc = core_new_doc();
+        var cr2: i32 = ffi_copy(r2, r, rtop);
+        var cd2: i32 = core_copy(&d2, &d, dtop);
+        check(cr2 == cd2, "copy depth into another document");
+        if (cr2 == cd2 && cr2 >= 0) {
+            ffi_set_root(r2, cr2);
+            core_set_root(&d2, cd2);
+            check(compare_trees(r2, &d2) == 0, "copied chain");
+        }
+        // Edits that build a chain have no depth limit, so the original still matches.
+        check(compare_trees(r, &d) == 0, "chain itself");
+        ffi_free(r);
+        ffi_free(r2);
+        core_doc_release(&d);
+        core_doc_release(&d2);
+        k += 1;
+    }
+}
+
 fun main() -> i32 {
+    // WJSON_SEED=n mixes n into the random generator, for runs on other inputs.
+    var sp: ptr<u8> = c_getenv("WJSON_SEED" as ptr<u8>);
+    if (sp != null) {
+        var seed: u64 = 0;
+        var si: i64 = 0;
+        while (sp[si] >= 48 && sp[si] <= 57) {
+            seed = seed * 10 + ((sp[si] - 48) as u64);
+            si += 1;
+        }
+        if (seed > 0) {
+            RNG = RNG ^ (seed * 2654435761 + 1);
+        }
+    }
     var iters: i32 = 300;
     var p: ptr<u8> = c_getenv("WJSON_FUZZ_ITERS" as ptr<u8>);
     if (p != null) {
@@ -352,6 +419,7 @@ fun main() -> i32 {
             iters = x;
         }
     }
+    test_copy_depth();
     var i: i32 = 0;
     while (i < iters) {
         test_sequence(150 + (below(150) as i32), i % 3 == 0);

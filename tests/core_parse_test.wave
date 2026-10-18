@@ -224,6 +224,22 @@ fun test_fixed() {
         agree_str("\"\\ud83dx\"", f);
         agree_str("\"\\ude00\"", f);
         agree_str("\"\\ud83d\\u0041\"", f);
+        // Encoding boundaries of \\u escapes.
+        agree_str("\"\\u007f\\u0080\"", f);
+        agree_str("\"\\u07ff\\u0800\"", f);
+        agree_str("\"\\uffff\"", f);
+        agree_str("\"\\ud800\\udc00\\udbff\\udfff\"", f);
+        // Surrogate boundaries.
+        agree_str("\"\\udc00\"", f);
+        agree_str("\"\\udfff\"", f);
+        agree_str("\"\\ud7ff\"", f);
+        agree_str("\"\\ue000\"", f);
+        agree_str("\"\\ud800\\udc00\"", f);
+        agree_str("\"\\udbff\\udfff\"", f);
+        agree_str("\"\\udbff\\udbff\"", f);
+        agree_str("\"\\ud800\\ue000\"", f);
+        agree_str("\"\\ud800\\udbff\"", f);
+        agree_str("\"\\uDBFF\\uDFFF\"", f);
         agree_str("\"\\uZZZZ\"", f);
         agree_str("\"tab\there\"", f);
         agree_str("\"nl\nhere\"", f);
@@ -486,7 +502,49 @@ fun test_random(iters: i32) {
     mem_free(buf, 65536);
 }
 
+// Inputs around the 2 GiB limit: one byte below it parses (the rest of the
+// buffer is never read, the parse stops at the first bad byte), at and above it
+// is "too large". The buffer is untouched virtual memory, so this costs nothing.
+fun test_size_limit() {
+    var big: i64 = 2147483648;
+    var buf: ptr<u8> = mem_alloc(big + 16);
+    if (buf == null) {
+        println("core_parse_test: skipped the 2 GiB boundary (no address space)");
+        return;
+    }
+    deref buf[0] = 91;
+    var sizes: array<i64, 6> = [2147483646, 2147483647, 2147483648, 2147483649, 4294967296, 5000000000];
+    var i: i32 = 0;
+    while (i < 6) {
+        var n: i64 = sizes[i];
+        if (n <= big + 16) {
+            agree(buf, n, 0, 0, "size limit");
+        } else {
+            var d: CoreDoc = core_parse(buf, n, 0, 0);
+            var r: ptr<u8> = ffi_parse(buf, n, 0, 0);
+            check(d.err_code == ffi_error_code(r) && d.err_offset == ffi_error_offset(r), "size limit above the buffer");
+            ffi_free(r);
+            core_doc_release(&d);
+        }
+        i += 1;
+    }
+    mem_free(buf, big + 16);
+}
+
 fun main() -> i32 {
+    // WJSON_SEED=n mixes n into the random generator, for runs on other inputs.
+    var sp: ptr<u8> = c_getenv("WJSON_SEED" as ptr<u8>);
+    if (sp != null) {
+        var seed: u64 = 0;
+        var si: i64 = 0;
+        while (sp[si] >= 48 && sp[si] <= 57) {
+            seed = seed * 10 + ((sp[si] - 48) as u64);
+            si += 1;
+        }
+        if (seed > 0) {
+            RNG = RNG ^ (seed * 2654435761 + 1);
+        }
+    }
     var iters: i32 = 5000;
     var p: ptr<u8> = c_getenv("WJSON_FUZZ_ITERS" as ptr<u8>);
     if (p != null) {
@@ -513,6 +571,7 @@ fun main() -> i32 {
     core_doc_release(&d);
     agree(null, 0, 0, 0, "null source, length 0");
 
+    test_size_limit();
     test_fixed();
     test_depth();
     test_random(iters);
