@@ -1,0 +1,904 @@
+// SPDX-License-Identifier: MPL-2.0
+//
+// Incremental pull parser in pure Wave. A port of core/src/stream.rs.
+//
+// Feed input in chunks of any size, then pull events one at a time. When a
+// token is cut by a chunk boundary, core_reader_next returns NEED_MORE without
+// consuming anything; feed more (or call core_reader_finish) and call again.
+// Only the unconsumed tail of the input is kept, so memory stays bounded by the
+// largest single token, not by the document size.
+//
+// Grammar rules are the same as the DOM parser (strict RFC 8259 plus the
+// optional trailing-comma and comment relaxations). The MULTI flag accepts a
+// sequence of top-level values (JSON Lines / concatenated JSON).
+
+import("./escape")::{esc_utf8_check};
+import("./core_dom")::{core_alloc, core_realloc, core_free};
+
+pub const CORE_STREAM_OPT_TRAILING_COMMAS: u32 = 1;
+pub const CORE_STREAM_OPT_COMMENTS: u32 = 2;
+pub const CORE_STREAM_OPT_MULTI: u32 = 4;
+
+// Events.
+pub const CORE_EV_ERROR: i32 = -1;
+pub const CORE_EV_NEED_MORE: i32 = 0;
+pub const CORE_EV_OBJECT_START: i32 = 1;
+pub const CORE_EV_OBJECT_END: i32 = 2;
+pub const CORE_EV_ARRAY_START: i32 = 3;
+pub const CORE_EV_ARRAY_END: i32 = 4;
+pub const CORE_EV_KEY: i32 = 5;
+pub const CORE_EV_STRING: i32 = 6;
+pub const CORE_EV_NUMBER: i32 = 7;
+pub const CORE_EV_TRUE: i32 = 8;
+pub const CORE_EV_FALSE: i32 = 9;
+pub const CORE_EV_NULL: i32 = 10;
+pub const CORE_EV_END: i32 = 11;
+
+// Error codes (the values of JSON_ERR_*).
+const ERR_EMPTY: i32 = 1;
+const ERR_UNEXPECTED_CHAR: i32 = 2;
+const ERR_UNEXPECTED_END: i32 = 3;
+const ERR_INVALID_NUMBER: i32 = 4;
+const ERR_INVALID_ESCAPE: i32 = 6;
+const ERR_INVALID_UNICODE: i32 = 7;
+const ERR_CONTROL_CHAR: i32 = 8;
+const ERR_INVALID_UTF8: i32 = 9;
+const ERR_TRAILING_DATA: i32 = 10;
+const ERR_TOO_DEEP: i32 = 11;
+const ERR_TOO_LARGE: i32 = 12;
+
+const DEFAULT_MAX_DEPTH: i64 = 512;
+// Default cap on the unconsumed bytes held while one token is incomplete.
+const DEFAULT_MAX_TOKEN: i64 = 268435456;
+// Longest number lexeme accepted (numbers are rescanned as input arrives).
+const MAX_NUMBER_LEN: i64 = 65536;
+
+// Parser states.
+const ST_VALUE: i32 = 0;         // a value is required
+const ST_VALUE_OR_END: i32 = 1;  // after '[' (or ',' with trailing commas): value or ']'
+const ST_KEY_OR_END: i32 = 2;    // after '{' (or ',' with trailing commas): key or '}'
+const ST_KEY: i32 = 3;           // after ',' in an object: a key is required
+const ST_COLON: i32 = 4;
+const ST_COMMA_OR_END: i32 = 5;
+const ST_DONE: i32 = 6;          // a complete top-level value has been read
+
+// Lexing outcomes.
+const LEX_TOKEN: i32 = 0;
+const LEX_INCOMPLETE: i32 = 1;
+const LEX_FAIL: i32 = 2;
+
+// skip_ws result meaning "carry on" (anything else is an event to return).
+const WS_OK: i32 = 1000;
+
+static EMPTY_TEXT: array<u8, 1> = [0];
+
+pub struct CoreReader {
+    buf: ptr<u8>;
+    buf_len: i64;
+    buf_cap: i64;
+    pos: i64;
+    eof: bool;
+    // Position of buf[pos] in the whole input.
+    offset: i64;
+    line: i64;
+    column: i64;
+    stack: ptr<u8>;
+    stack_len: i64;
+    stack_cap: i64;
+    state: i32;
+    max_depth: i64;
+    flags: u32;
+    // Current key/string (decoded) or number lexeme, followed by a NUL.
+    text: ptr<u8>;
+    text_len: i64;
+    text_cap: i64;
+    err_code: i32;
+    err_offset: i64;
+    err_line: i64;
+    err_column: i64;
+    documents: i64;
+    started: bool;
+    max_token: i64;
+    // Where the scan of an incomplete string/comment stopped, relative to pos.
+    resume: i64;
+    // Result of the last lexing call: event or error code, and byte count or
+    // relative error offset.
+    lx_a: i32;
+    lx_n: i64;
+}
+
+pub fun core_reader_new(max_depth: i32, flags: u32) -> CoreReader {
+    var depth: i64 = DEFAULT_MAX_DEPTH;
+    if (max_depth > 0) {
+        depth = max_depth as i64;
+    }
+    return CoreReader {
+        buf: null, buf_len: 0, buf_cap: 0, pos: 0, eof: false,
+        offset: 0, line: 1, column: 1,
+        stack: null, stack_len: 0, stack_cap: 0,
+        state: ST_VALUE, max_depth: depth, flags: flags,
+        text: null, text_len: 0, text_cap: 0,
+        err_code: 0, err_offset: 0, err_line: 0, err_column: 0,
+        documents: 0, started: false, max_token: DEFAULT_MAX_TOKEN, resume: 0,
+        lx_a: 0, lx_n: 0,
+    };
+}
+
+pub fun core_reader_free(r: ptr<CoreReader>) {
+    if (deref r.buf != null) { core_free(deref r.buf); }
+    if (deref r.stack != null) { core_free(deref r.stack); }
+    if (deref r.text != null) { core_free(deref r.text); }
+    deref r.buf = null;
+    deref r.buf_len = 0;
+    deref r.buf_cap = 0;
+    deref r.pos = 0;
+    deref r.stack = null;
+    deref r.stack_len = 0;
+    deref r.stack_cap = 0;
+    deref r.text = null;
+    deref r.text_len = 0;
+    deref r.text_cap = 0;
+}
+
+// Limits how much input may be buffered while one token is incomplete;
+// exceeding it yields TooLarge. 0 or less restores the default.
+pub fun core_reader_set_max_token(r: ptr<CoreReader>, bytes: i64) {
+    if (bytes <= 0) {
+        deref r.max_token = DEFAULT_MAX_TOKEN;
+    } else {
+        deref r.max_token = bytes;
+    }
+}
+
+// Appends input. Returns 0, or -1 after finish / on bad arguments.
+pub fun core_reader_feed(r: ptr<CoreReader>, data: ptr<u8>, len: i64) -> i32 {
+    if (len < 0 || (len > 0 && data == null)) {
+        return 0 - 1;
+    }
+    if (deref r.eof) {
+        return 0 - 1;
+    }
+    // Reclaim consumed space before growing.
+    var pos: i64 = deref r.pos;
+    var blen: i64 = deref r.buf_len;
+    if (pos > 0 && (pos >= 65536 || pos * 2 >= blen)) {
+        var b: ptr<u8> = deref r.buf;
+        var i: i64 = 0;
+        while (pos + i < blen) {
+            deref b[i] = b[pos + i];
+            i += 1;
+        }
+        blen = blen - pos;
+        deref r.buf_len = blen;
+        deref r.pos = 0;
+    }
+    if (len == 0) {
+        return 0;
+    }
+    if (blen + len > deref r.buf_cap) {
+        var nc: i64 = deref r.buf_cap * 2;
+        if (nc < 256) { nc = 256; }
+        while (nc < blen + len) { nc = nc * 2; }
+        var g: ptr<u8> = core_realloc(deref r.buf, nc);
+        if (g == null) {
+            return 0 - 1;
+        }
+        deref r.buf = g;
+        deref r.buf_cap = nc;
+    }
+    var buf: ptr<u8> = deref r.buf;
+    var k: i64 = 0;
+    while (k < len) {
+        deref buf[blen + k] = data[k];
+        k += 1;
+    }
+    deref r.buf_len = blen + len;
+    return 0;
+}
+
+// Marks the end of input.
+pub fun core_reader_finish(r: ptr<CoreReader>) {
+    deref r.eof = true;
+}
+
+// Key/string (decoded) or number lexeme of the last event, NUL-terminated;
+// valid until the next call to core_reader_next.
+pub fun core_reader_text(r: ptr<CoreReader>, out_len: ptr<i64>) -> ptr<u8> {
+    if (deref r.text == null || deref r.text_len == 0) {
+        if (out_len != null) { deref out_len = 0; }
+        return &EMPTY_TEXT[0];
+    }
+    if (out_len != null) { deref out_len = deref r.text_len; }
+    return deref r.text;
+}
+
+pub fun core_reader_depth(r: ptr<CoreReader>) -> i32 {
+    return deref r.stack_len as i32;
+}
+
+pub fun core_reader_documents(r: ptr<CoreReader>) -> i64 {
+    return deref r.documents;
+}
+
+// Bytes currently held (unconsumed input).
+pub fun core_reader_buffered(r: ptr<CoreReader>) -> i64 {
+    return deref r.buf_len - deref r.pos;
+}
+
+pub fun core_reader_error_code(r: ptr<CoreReader>) -> i32 {
+    return deref r.err_code;
+}
+
+pub fun core_reader_error_offset(r: ptr<CoreReader>) -> i64 {
+    return deref r.err_offset;
+}
+
+pub fun core_reader_error_line(r: ptr<CoreReader>) -> i64 {
+    return deref r.err_line;
+}
+
+pub fun core_reader_error_column(r: ptr<CoreReader>) -> i64 {
+    return deref r.err_column;
+}
+
+// ---- internals ----------------------------------------------------------------------------
+
+fun _rest_len(r: ptr<CoreReader>) -> i64 {
+    return deref r.buf_len - deref r.pos;
+}
+
+// Byte at pos + i, or -1 when the buffer ends before it.
+fun _at(r: ptr<CoreReader>, i: i64) -> i32 {
+    var p: i64 = deref r.pos + i;
+    if (p >= deref r.buf_len) {
+        return 0 - 1;
+    }
+    var b: ptr<u8> = deref r.buf;
+    return b[p] as i32;
+}
+
+// Consumes n bytes, keeping offset/line/column in step.
+fun _advance(r: ptr<CoreReader>, n: i64) {
+    if (n > 0) {
+        deref r.resume = 0;
+    }
+    var b: ptr<u8> = deref r.buf;
+    var pos: i64 = deref r.pos;
+    var line: i64 = deref r.line;
+    var column: i64 = deref r.column;
+    var i: i64 = 0;
+    while (i < n) {
+        var c: u8 = b[pos + i];
+        if (c == 10) {
+            line += 1;
+            column = 1;
+        } else if ((c & 192) != 128) {
+            column += 1;
+        }
+        i += 1;
+    }
+    deref r.line = line;
+    deref r.column = column;
+    deref r.offset = deref r.offset + n;
+    deref r.pos = pos + n;
+}
+
+fun _fail(r: ptr<CoreReader>, code: i32, rel_in: i64) -> i32 {
+    var rel: i64 = rel_in;
+    var avail: i64 = _rest_len(r);
+    if (rel > avail) {
+        rel = avail;
+    }
+    var b: ptr<u8> = deref r.buf;
+    var pos: i64 = deref r.pos;
+    var line: i64 = deref r.line;
+    var column: i64 = deref r.column;
+    var i: i64 = 0;
+    while (i < rel) {
+        var c: u8 = b[pos + i];
+        if (c == 10) {
+            line += 1;
+            column = 1;
+        } else if ((c & 192) != 128) {
+            column += 1;
+        }
+        i += 1;
+    }
+    deref r.err_code = code;
+    deref r.err_offset = deref r.offset + rel;
+    deref r.err_line = line;
+    deref r.err_column = column;
+    return CORE_EV_ERROR;
+}
+
+// Result of a lexing call, stored in the reader.
+fun _lex(r: ptr<CoreReader>, kind: i32, a: i32, n: i64) -> i32 {
+    deref r.lx_a = a;
+    deref r.lx_n = n;
+    return kind;
+}
+
+fun _text_reset(r: ptr<CoreReader>) {
+    deref r.text_len = 0;
+}
+
+// Appends one byte to the current text, keeping it NUL-terminated. Returns
+// false when memory runs out.
+fun _text_put(r: ptr<CoreReader>, c: u8) -> bool {
+    var n: i64 = deref r.text_len;
+    if (n + 2 > deref r.text_cap) {
+        var nc: i64 = deref r.text_cap * 2;
+        if (nc < 64) { nc = 64; }
+        while (nc < n + 2) { nc = nc * 2; }
+        var g: ptr<u8> = core_realloc(deref r.text, nc);
+        if (g == null) { return false; }
+        deref r.text = g;
+        deref r.text_cap = nc;
+    }
+    var t: ptr<u8> = deref r.text;
+    deref t[n] = c;
+    deref t[n + 1] = 0;
+    deref r.text_len = n + 1;
+    return true;
+}
+
+// Makes the text empty but valid (a lone NUL), allocating if needed.
+fun _text_begin(r: ptr<CoreReader>) -> bool {
+    deref r.text_len = 0;
+    if (deref r.text == null) {
+        var g: ptr<u8> = core_alloc(64);
+        if (g == null) { return false; }
+        deref r.text = g;
+        deref r.text_cap = 64;
+    }
+    var t: ptr<u8> = deref r.text;
+    deref t[0] = 0;
+    return true;
+}
+
+fun _push_state(r: ptr<CoreReader>, c: u8) -> bool {
+    var n: i64 = deref r.stack_len;
+    if (n >= deref r.stack_cap) {
+        var nc: i64 = deref r.stack_cap * 2;
+        if (nc < 32) { nc = 32; }
+        var g: ptr<u8> = core_realloc(deref r.stack, nc);
+        if (g == null) { return false; }
+        deref r.stack = g;
+        deref r.stack_cap = nc;
+    }
+    var s: ptr<u8> = deref r.stack;
+    deref s[n] = c;
+    deref r.stack_len = n + 1;
+    return true;
+}
+
+fun _after_value(r: ptr<CoreReader>) {
+    if (deref r.stack_len == 0) {
+        deref r.state = ST_DONE;
+        deref r.documents = deref r.documents + 1;
+    } else {
+        deref r.state = ST_COMMA_OR_END;
+    }
+}
+
+fun _close(r: ptr<CoreReader>, event: i32) -> i32 {
+    _advance(r, 1);
+    if (deref r.stack_len > 0) {
+        deref r.stack_len = deref r.stack_len - 1;
+    }
+    _after_value(r);
+    return event;
+}
+
+// Skips whitespace and (optionally) comments. Returns WS_OK, or the event to
+// return (NEED_MORE when the buffer ends inside a comment, or an error).
+fun _skip_ws(r: ptr<CoreReader>) -> i32 {
+    while (true) {
+        var rest: i64 = _rest_len(r);
+        var i: i64 = 0;
+        while (i < rest) {
+            var c: i32 = _at(r, i);
+            if (c == 32 || c == 9 || c == 10 || c == 13) {
+                i += 1;
+            } else {
+                break;
+            }
+        }
+        _advance(r, i);
+        rest = _rest_len(r);
+        if (rest == 0 || _at(r, 0) != 47 || (deref r.flags & CORE_STREAM_OPT_COMMENTS) == 0) {
+            return WS_OK;
+        }
+        var second: i32 = _at(r, 1);
+        if (second < 0) {
+            if (!(deref r.eof)) {
+                return CORE_EV_NEED_MORE;
+            }
+            return _fail(r, ERR_UNEXPECTED_CHAR, 0);
+        }
+        var from: i64 = deref r.resume;
+        if (from < 2) { from = 2; }
+        if (second == 47) {  // "//" comment: runs to the end of the line
+            var j: i64 = from;
+            var found: i64 = 0 - 1;
+            while (j < rest) {
+                if (_at(r, j) == 10) {
+                    found = j;
+                    break;
+                }
+                j += 1;
+            }
+            if (found >= 0) {
+                _advance(r, found + 1);
+            } else if (deref r.eof) {
+                _advance(r, rest);
+            } else {
+                deref r.resume = rest;
+                return CORE_EV_NEED_MORE;
+            }
+        } else if (second == 42) {  // "/*" comment
+            var j2: i64 = from;
+            var found2: i64 = 0 - 1;
+            while (j2 + 1 < rest) {
+                if (_at(r, j2) == 42 && _at(r, j2 + 1) == 47) {
+                    found2 = j2;
+                    break;
+                }
+                j2 += 1;
+            }
+            if (found2 >= 0) {
+                _advance(r, found2 + 2);
+            } else if (deref r.eof) {
+                return _fail(r, ERR_UNEXPECTED_END, 0);
+            } else {
+                // Keep the last byte: it may be the '*' of "*/".
+                var keep: i64 = rest - 1;
+                if (keep < 2) { keep = 2; }
+                deref r.resume = keep;
+                return CORE_EV_NEED_MORE;
+            }
+        } else {
+            return _fail(r, ERR_UNEXPECTED_CHAR, 0);
+        }
+    }
+    return WS_OK;
+}
+
+// ---- lexing ---------------------------------------------------------------------------------
+
+fun _lex_literal(r: ptr<CoreReader>, word: str, wlen: i64, event: i32) -> i32 {
+    var w: ptr<u8> = word as ptr<u8>;
+    var rest: i64 = _rest_len(r);
+    if (rest < wlen) {
+        var prefix: bool = true;
+        var i: i64 = 0;
+        while (i < rest) {
+            if ((_at(r, i) as u8) != w[i]) {
+                prefix = false;
+                break;
+            }
+            i += 1;
+        }
+        if (prefix) {
+            if (deref r.eof) {
+                return _lex(r, LEX_FAIL, ERR_UNEXPECTED_END, rest);
+            }
+            return _lex(r, LEX_INCOMPLETE, 0, 0);
+        }
+        return _lex(r, LEX_FAIL, ERR_UNEXPECTED_CHAR, 0);
+    }
+    var k: i64 = 0;
+    while (k < wlen) {
+        if ((_at(r, k) as u8) != w[k]) {
+            return _lex(r, LEX_FAIL, ERR_UNEXPECTED_CHAR, 0);
+        }
+        k += 1;
+    }
+    return _lex(r, LEX_TOKEN, event, wlen);
+}
+
+fun _is_digit_at(r: ptr<CoreReader>, i: i64) -> bool {
+    var c: i32 = _at(r, i);
+    return c >= 48 && c <= 57;
+}
+
+// Is the decision at index i dependent on bytes not received yet?
+fun _more(r: ptr<CoreReader>, i: i64) -> bool {
+    return i >= _rest_len(r) && !(deref r.eof);
+}
+
+fun _lex_number_prefix(r: ptr<CoreReader>) -> i32 {
+    var i: i64 = 0;
+    if (_at(r, i) == 45) {
+        i += 1;
+    }
+    if (_more(r, i)) { return _lex(r, LEX_INCOMPLETE, 0, 0); }
+    var c: i32 = _at(r, i);
+    if (c == 48) {
+        i += 1;
+        if (_more(r, i)) { return _lex(r, LEX_INCOMPLETE, 0, 0); }
+        if (_is_digit_at(r, i)) { return _lex(r, LEX_FAIL, ERR_INVALID_NUMBER, i); }
+    } else if (c >= 49 && c <= 57) {
+        while (_is_digit_at(r, i)) { i += 1; }
+    } else if (c < 0) {
+        return _lex(r, LEX_FAIL, ERR_UNEXPECTED_END, i);
+    } else {
+        return _lex(r, LEX_FAIL, ERR_INVALID_NUMBER, i);
+    }
+    if (_more(r, i)) { return _lex(r, LEX_INCOMPLETE, 0, 0); }
+    if (_at(r, i) == 46) {
+        i += 1;
+        var st: i64 = i;
+        while (_is_digit_at(r, i)) { i += 1; }
+        if (_more(r, i)) { return _lex(r, LEX_INCOMPLETE, 0, 0); }
+        if (i == st) { return _lex(r, LEX_FAIL, ERR_INVALID_NUMBER, i); }
+    }
+    var e: i32 = _at(r, i);
+    if (e == 101 || e == 69) {
+        i += 1;
+        if (_more(r, i)) { return _lex(r, LEX_INCOMPLETE, 0, 0); }
+        var sg: i32 = _at(r, i);
+        if (sg == 43 || sg == 45) {
+            i += 1;
+        }
+        var st2: i64 = i;
+        while (_is_digit_at(r, i)) { i += 1; }
+        if (_more(r, i)) { return _lex(r, LEX_INCOMPLETE, 0, 0); }
+        if (i == st2) { return _lex(r, LEX_FAIL, ERR_INVALID_NUMBER, i); }
+    }
+    if (!_text_begin(r)) { return _lex(r, LEX_FAIL, ERR_TOO_LARGE, 0); }
+    var k: i64 = 0;
+    while (k < i) {
+        if (!_text_put(r, _at(r, k) as u8)) { return _lex(r, LEX_FAIL, ERR_TOO_LARGE, 0); }
+        k += 1;
+    }
+    return _lex(r, LEX_TOKEN, CORE_EV_NUMBER, i);
+}
+
+fun _lex_number(r: ptr<CoreReader>) -> i32 {
+    var kind: i32 = _lex_number_prefix(r);
+    if (kind == LEX_INCOMPLETE && core_reader_buffered(r) > MAX_NUMBER_LEN) {
+        return _lex(r, LEX_FAIL, ERR_TOO_LARGE, 0);
+    }
+    if (kind == LEX_TOKEN && deref r.lx_n > MAX_NUMBER_LEN) {
+        return _lex(r, LEX_FAIL, ERR_TOO_LARGE, 0);
+    }
+    return kind;
+}
+
+// Four hex digits at raw[at..at+4] (raw has n bytes), or -1.
+fun _hex4(raw: ptr<u8>, n: i64, at: i64) -> i64 {
+    if (at + 4 > n) {
+        return 0 - 1;
+    }
+    var v: i64 = 0;
+    var i: i64 = 0;
+    while (i < 4) {
+        var b: u8 = raw[at + i];
+        var d: i64 = 0;
+        if (b >= 48 && b <= 57) {
+            d = (b - 48) as i64;
+        } else if (b >= 97 && b <= 102) {
+            d = (b - 87) as i64;
+        } else if (b >= 65 && b <= 70) {
+            d = (b - 55) as i64;
+        } else {
+            return 0 - 1;
+        }
+        v = v * 16 + d;
+        i += 1;
+    }
+    return v;
+}
+
+fun _put_utf8(r: ptr<CoreReader>, code: i64) -> bool {
+    if (code < 128) {
+        return _text_put(r, code as u8);
+    }
+    if (code < 2048) {
+        return _text_put(r, (192 | (code >> 6)) as u8) && _text_put(r, (128 | (code & 63)) as u8);
+    }
+    if (code < 65536) {
+        return _text_put(r, (224 | (code >> 12)) as u8)
+            && _text_put(r, (128 | ((code >> 6) & 63)) as u8)
+            && _text_put(r, (128 | (code & 63)) as u8);
+    }
+    return _text_put(r, (240 | (code >> 18)) as u8)
+        && _text_put(r, (128 | ((code >> 12) & 63)) as u8)
+        && _text_put(r, (128 | ((code >> 6) & 63)) as u8)
+        && _text_put(r, (128 | (code & 63)) as u8);
+}
+
+// Decodes the content between the quotes (already valid UTF-8) into the
+// reader's text. Same rules as the DOM parser's decoder. Returns 0, or an error
+// code with its offset (relative to raw) in lx_n.
+fun _decode(r: ptr<CoreReader>, raw: ptr<u8>, n: i64) -> i32 {
+    var i: i64 = 0;
+    while (i < n) {
+        while (i < n && raw[i] != 92 && raw[i] >= 32) {
+            if (!_text_put(r, raw[i])) {
+                deref r.lx_n = i;
+                return ERR_TOO_LARGE;
+            }
+            i += 1;
+        }
+        if (i == n) {
+            break;
+        }
+        if (raw[i] < 32) {
+            deref r.lx_n = i;
+            return ERR_CONTROL_CHAR;
+        }
+        if (i + 1 >= n) {
+            deref r.lx_n = i;
+            return ERR_INVALID_ESCAPE;
+        }
+        var esc: u8 = raw[i + 1];
+        var simple: i32 = 0 - 1;
+        if (esc == 34) { simple = 34; }
+        else if (esc == 92) { simple = 92; }
+        else if (esc == 47) { simple = 47; }
+        else if (esc == 98) { simple = 8; }
+        else if (esc == 102) { simple = 12; }
+        else if (esc == 110) { simple = 10; }
+        else if (esc == 114) { simple = 13; }
+        else if (esc == 116) { simple = 9; }
+        else if (esc != 117) {
+            deref r.lx_n = i;
+            return ERR_INVALID_ESCAPE;
+        }
+        if (simple >= 0) {
+            if (!_text_put(r, simple as u8)) {
+                deref r.lx_n = i;
+                return ERR_TOO_LARGE;
+            }
+            i += 2;
+            continue;
+        }
+        var hi: i64 = _hex4(raw, n, i + 2);
+        if (hi < 0) {
+            deref r.lx_n = i;
+            return ERR_INVALID_UNICODE;
+        }
+        var used: i64 = 6;
+        var code: i64 = hi;
+        if (hi >= 55296 && hi < 56320) {
+            if (i + 7 >= n || raw[i + 6] != 92 || raw[i + 7] != 117) {
+                deref r.lx_n = i;
+                return ERR_INVALID_UNICODE;
+            }
+            var lo: i64 = _hex4(raw, n, i + 8);
+            if (lo < 56320 || lo >= 57344) {
+                deref r.lx_n = i;
+                return ERR_INVALID_UNICODE;
+            }
+            used = 12;
+            code = 65536 + ((hi - 55296) << 10) + (lo - 56320);
+        } else if (hi >= 56320 && hi < 57344) {
+            deref r.lx_n = i;
+            return ERR_INVALID_UNICODE;
+        }
+        if (!_put_utf8(r, code)) {
+            deref r.lx_n = i;
+            return ERR_TOO_LARGE;
+        }
+        i += used;
+    }
+    return 0;
+}
+
+// Lexes a string at pos (which holds '"') into the text, decoded.
+fun _lex_string(r: ptr<CoreReader>) -> i32 {
+    var rest: i64 = _rest_len(r);
+    // Find the closing quote, skipping escaped characters; continue where an
+    // earlier, incomplete attempt stopped.
+    var i: i64 = deref r.resume;
+    if (i < 1) { i = 1; }
+    while (true) {
+        var c: i32 = 0 - 1;
+        if (i < rest) {
+            c = _at(r, i);
+        }
+        if (c < 0) {
+            if (deref r.eof) {
+                return _lex(r, LEX_FAIL, ERR_UNEXPECTED_END, 0);
+            }
+            deref r.resume = i;
+            return _lex(r, LEX_INCOMPLETE, 0, 0);
+        }
+        if (c == 34) {
+            break;
+        }
+        if (c == 92) {
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    var b: ptr<u8> = deref r.buf;
+    var raw: ptr<u8> = &b[deref r.pos + 1];
+    var n: i64 = i - 1;
+    var bad: i64 = esc_utf8_check(raw, n);
+    if (bad >= 0) {
+        return _lex(r, LEX_FAIL, ERR_INVALID_UTF8, 1 + bad);
+    }
+    if (!_text_begin(r)) { return _lex(r, LEX_FAIL, ERR_TOO_LARGE, 0); }
+    var code: i32 = _decode(r, raw, n);
+    if (code != 0) {
+        var at: i64 = deref r.lx_n;
+        _text_put(r, 0);       // keeps the (partial) text valid, as the Rust reader does
+        deref r.text_len = deref r.text_len - 1;
+        return _lex(r, LEX_FAIL, code, 1 + at);
+    }
+    return _lex(r, LEX_TOKEN, CORE_EV_STRING, i + 1);
+}
+
+// ---- the event loop ----------------------------------------------------------------------------
+
+// Applies the outcome of a lexing call: Token -> consume + after_value-style
+// handling by the caller; Incomplete -> NEED_MORE; Fail -> error.
+fun _value(r: ptr<CoreReader>, c: i32) -> i32 {
+    var kind: i32 = LEX_FAIL;
+    if (c == 123 || c == 91) {
+        if (deref r.stack_len >= deref r.max_depth) {
+            return _fail(r, ERR_TOO_DEEP, 0);
+        }
+        _advance(r, 1);
+        if (!_push_state(r, c as u8)) {
+            return _fail(r, ERR_TOO_LARGE, 0);
+        }
+        if (c == 123) {
+            deref r.state = ST_KEY_OR_END;
+            return CORE_EV_OBJECT_START;
+        }
+        deref r.state = ST_VALUE_OR_END;
+        return CORE_EV_ARRAY_START;
+    } else if (c == 34) {
+        kind = _lex_string(r);
+    } else if (c == 116) {
+        kind = _lex_literal(r, "true", 4, CORE_EV_TRUE);
+    } else if (c == 102) {
+        kind = _lex_literal(r, "false", 5, CORE_EV_FALSE);
+    } else if (c == 110) {
+        kind = _lex_literal(r, "null", 4, CORE_EV_NULL);
+    } else if (c == 45 || (c >= 48 && c <= 57)) {
+        kind = _lex_number(r);
+    } else {
+        kind = _lex(r, LEX_FAIL, ERR_UNEXPECTED_CHAR, 0);
+    }
+    if (kind == LEX_TOKEN) {
+        _advance(r, deref r.lx_n);
+        _after_value(r);
+        return deref r.lx_a;
+    }
+    if (kind == LEX_INCOMPLETE) {
+        return CORE_EV_NEED_MORE;
+    }
+    return _fail(r, deref r.lx_a, deref r.lx_n);
+}
+
+fun _next_event(r: ptr<CoreReader>) -> i32 {
+    if (deref r.err_code != 0) {
+        return CORE_EV_ERROR;
+    }
+    if (!(deref r.started)) {
+        // Skip a UTF-8 BOM at the very start (wait until we can tell).
+        var rest: i64 = _rest_len(r);
+        if (rest < 3 && !(deref r.eof)) {
+            // Is what we have a prefix of the BOM (EF BB BF)?
+            var prefix: bool = true;
+            var bom: array<u8, 3> = [239, 187, 191];
+            var i: i64 = 0;
+            while (i < rest) {
+                if ((_at(r, i) as u8) != bom[i as i32]) {
+                    prefix = false;
+                    break;
+                }
+                i += 1;
+            }
+            if (prefix) {
+                return CORE_EV_NEED_MORE;
+            }
+        }
+        if (rest >= 3 && _at(r, 0) == 239 && _at(r, 1) == 187 && _at(r, 2) == 191) {
+            deref r.pos = deref r.pos + 3;
+            deref r.offset = deref r.offset + 3;
+        }
+        deref r.started = true;
+    }
+    while (true) {
+        var ws: i32 = _skip_ws(r);
+        if (ws != WS_OK) {
+            return ws;
+        }
+        if (deref r.pos == deref r.buf_len) {
+            if (!(deref r.eof)) {
+                return CORE_EV_NEED_MORE;
+            }
+            var st: i32 = deref r.state;
+            if (st == ST_DONE) {
+                return CORE_EV_END;
+            }
+            if (st == ST_VALUE && deref r.stack_len == 0 && deref r.documents > 0) {
+                return CORE_EV_END;
+            }
+            if (st == ST_VALUE && deref r.stack_len == 0) {
+                return _fail(r, ERR_EMPTY, 0);
+            }
+            return _fail(r, ERR_UNEXPECTED_END, 0);
+        }
+        var c: i32 = _at(r, 0);
+        var state: i32 = deref r.state;
+        if (state == ST_DONE) {
+            if ((deref r.flags & CORE_STREAM_OPT_MULTI) != 0) {
+                deref r.state = ST_VALUE;
+                continue;
+            }
+            return _fail(r, ERR_TRAILING_DATA, 0);
+        }
+        if (state == ST_COLON) {
+            if (c != 58) {
+                return _fail(r, ERR_UNEXPECTED_CHAR, 0);
+            }
+            _advance(r, 1);
+            deref r.state = ST_VALUE;
+            continue;
+        }
+        if (state == ST_COMMA_OR_END) {
+            var top: i32 = 91;
+            if (deref r.stack_len > 0) {
+                var s: ptr<u8> = deref r.stack;
+                top = s[deref r.stack_len - 1] as i32;
+            }
+            if (c == 44) {
+                _advance(r, 1);
+                var trailing: bool = (deref r.flags & CORE_STREAM_OPT_TRAILING_COMMAS) != 0;
+                if (top == 123) {
+                    if (trailing) { deref r.state = ST_KEY_OR_END; } else { deref r.state = ST_KEY; }
+                } else {
+                    if (trailing) { deref r.state = ST_VALUE_OR_END; } else { deref r.state = ST_VALUE; }
+                }
+                continue;
+            }
+            if (c == 125 && top == 123) {
+                return _close(r, CORE_EV_OBJECT_END);
+            }
+            if (c == 93 && top == 91) {
+                return _close(r, CORE_EV_ARRAY_END);
+            }
+            return _fail(r, ERR_UNEXPECTED_CHAR, 0);
+        }
+        if (state == ST_KEY_OR_END || state == ST_KEY) {
+            if (c == 125 && state == ST_KEY_OR_END) {
+                return _close(r, CORE_EV_OBJECT_END);
+            }
+            if (c != 34) {
+                return _fail(r, ERR_UNEXPECTED_CHAR, 0);
+            }
+            var kind: i32 = _lex_string(r);
+            if (kind == LEX_TOKEN) {
+                _advance(r, deref r.lx_n);
+                deref r.state = ST_COLON;
+                return CORE_EV_KEY;
+            }
+            if (kind == LEX_INCOMPLETE) {
+                return CORE_EV_NEED_MORE;
+            }
+            return _fail(r, deref r.lx_a, deref r.lx_n);
+        }
+        if (state == ST_VALUE_OR_END && c == 93) {
+            return _close(r, CORE_EV_ARRAY_END);
+        }
+        return _value(r, c);
+    }
+    return CORE_EV_ERROR;
+}
+
+// Pulls the next event. NEED_MORE is a normal result, not the end.
+pub fun core_reader_next(r: ptr<CoreReader>) -> i32 {
+    var event: i32 = _next_event(r);
+    if (event == CORE_EV_NEED_MORE && core_reader_buffered(r) > deref r.max_token) {
+        return _fail(r, ERR_TOO_LARGE, 0);
+    }
+    return event;
+}

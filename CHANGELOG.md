@@ -60,6 +60,14 @@ minor releases.
   edits (including invalid ones) to a Rust document and a Wave document and
   compares every returned code, the whole tree and the answers of key lookups
   and JSON Pointers (1.2 million checks at 300 sequences).
+- New `src/core_stream.wave`: the incremental pull parser (chunked input,
+  `NEED_MORE`, trailing-comma / comment / multi-document options, depth and
+  token-size limits), a port of `stream.rs`. Not used by the Wave API yet.
+  `tests/core_stream_test.wave` steps the Rust reader and the Wave reader in
+  lockstep on the same input, fed whole, byte by byte, in fixed sizes and in
+  random chunks, and compares every event, the text that goes with it, depth,
+  buffered bytes, document count and the error code, offset, line and column
+  (3 million checks at 3000 random documents, valid and damaged).
 - Windows on ARM64 is supported, natively and without MSVC like x64. `wjlink`
   (the MSVC-free link driver) now takes the architecture as a value: import
   libraries use the matching machine type and RVA relocation, and the startup
