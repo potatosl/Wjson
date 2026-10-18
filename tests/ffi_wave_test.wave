@@ -1,0 +1,300 @@
+// SPDX-License-Identifier: MPL-2.0
+//
+// Edge-case test for the handle layer (src/ffi.wave), which serves the C-ABI
+// shaped functions from the Wave code, against the Rust core's C ABI
+// (src/ffi_rust.wave): null handles, documents that failed to parse, bad node
+// ids, negative lengths, null pointers with a length, the error messages, and
+// readers. The tree and edit logic behind it is covered by core_parse_test,
+// core_lookup_test, core_edit_test and core_stream_test.
+// Run from the repository root:  wavec run build.wave
+
+import("wjson::ffi");
+import("wjson::ffi_rust");
+
+static CHECKS: i32 = 0;
+static FAILURES: i32 = 0;
+
+fun check(cond: bool, label: str) {
+    CHECKS += 1;
+    if (!cond) {
+        FAILURES += 1;
+        if (FAILURES <= 20) {
+            println("FAIL: {}", label);
+        }
+    }
+}
+
+fun len_of(p: ptr<u8>) -> i64 {
+    var n: i64 = 0;
+    while (p[n] != 0) {
+        n += 1;
+    }
+    return n;
+}
+
+fun same_null(a: ptr<u8>, b: ptr<u8>) -> bool {
+    if (a == null) {
+        return b == null;
+    }
+    return b != null;
+}
+
+fun same_cstr(a: ptr<u8>, b: ptr<u8>) -> bool {
+    if (a == null || b == null) {
+        return a == b;
+    }
+    var n: i64 = len_of(a);
+    if (n != len_of(b)) {
+        return false;
+    }
+    var i: i64 = 0;
+    while (i < n) {
+        if (a[i] != b[i]) {
+            return false;
+        }
+        i += 1;
+    }
+    return true;
+}
+
+// Same pointer-ness and, when set, same length and bytes.
+fun same_text(a: ptr<u8>, la: i64, b: ptr<u8>, lb: i64) -> bool {
+    if (la != lb || !same_null(a, b)) {
+        return false;
+    }
+    var i: i64 = 0;
+    while (i < la) {
+        if (a[i] != b[i]) {
+            return false;
+        }
+        i += 1;
+    }
+    return true;
+}
+
+// Every accessor and editor on one pair of handles (wave handle, rust handle)
+// with a few node ids and arguments.
+fun probe(w: ptr<u8>, r: ptr<u8>, label: str) {
+    check(wjson::ffi::ffi_ok(w) == wjson::ffi_rust::ffi_ok(r), label);
+    check(wjson::ffi::ffi_error_code(w) == wjson::ffi_rust::ffi_error_code(r), label);
+    check(same_cstr(wjson::ffi::ffi_error_message(w), wjson::ffi_rust::ffi_error_message(r)), label);
+    check(wjson::ffi::ffi_error_offset(w) == wjson::ffi_rust::ffi_error_offset(r), label);
+    check(wjson::ffi::ffi_error_line(w) == wjson::ffi_rust::ffi_error_line(r), label);
+    check(wjson::ffi::ffi_error_column(w) == wjson::ffi_rust::ffi_error_column(r), label);
+    check(wjson::ffi::ffi_root(w) == wjson::ffi_rust::ffi_root(r), label);
+    check(wjson::ffi::ffi_node_count(w) == wjson::ffi_rust::ffi_node_count(r), label);
+    var ids: array<i32, 6> = [0 - 5, 0 - 1, 0, 1, 2, 100000];
+    var i: i32 = 0;
+    while (i < 6) {
+        var n: i32 = ids[i];
+        check(wjson::ffi::ffi_type(w, n) == wjson::ffi_rust::ffi_type(r, n), label);
+        check(wjson::ffi::ffi_bool(w, n) == wjson::ffi_rust::ffi_bool(r, n), label);
+        check(wjson::ffi::ffi_len(w, n) == wjson::ffi_rust::ffi_len(r, n), label);
+        check(wjson::ffi::ffi_at(w, n, 0) == wjson::ffi_rust::ffi_at(r, n, 0), label);
+        check(wjson::ffi::ffi_at(w, n, 0 - 1) == wjson::ffi_rust::ffi_at(r, n, 0 - 1), label);
+        check(wjson::ffi::ffi_at(w, n, 1) == wjson::ffi_rust::ffi_at(r, n, 1), label);
+        check(wjson::ffi::ffi_parent(w, n) == wjson::ffi_rust::ffi_parent(r, n), label);
+        check(wjson::ffi::ffi_num_is_int(w, n) == wjson::ffi_rust::ffi_num_is_int(r, n), label);
+        check(wjson::ffi::ffi_get(w, n, "a" as ptr<u8>, 1) == wjson::ffi_rust::ffi_get(r, n, "a" as ptr<u8>, 1), label);
+        check(wjson::ffi::ffi_get(w, n, "a" as ptr<u8>, 0 - 1) == wjson::ffi_rust::ffi_get(r, n, "a" as ptr<u8>, 0 - 1), label);
+        check(wjson::ffi::ffi_get(w, n, null, 1) == wjson::ffi_rust::ffi_get(r, n, null, 1), label);
+        check(wjson::ffi::ffi_get(w, n, null, 0) == wjson::ffi_rust::ffi_get(r, n, null, 0), label);
+        check(wjson::ffi::ffi_pointer(w, n, "/a" as ptr<u8>, 2) == wjson::ffi_rust::ffi_pointer(r, n, "/a" as ptr<u8>, 2), label);
+        check(wjson::ffi::ffi_pointer(w, n, "" as ptr<u8>, 0) == wjson::ffi_rust::ffi_pointer(r, n, "" as ptr<u8>, 0), label);
+        check(wjson::ffi::ffi_pointer(w, n, null, 2) == wjson::ffi_rust::ffi_pointer(r, n, null, 2), label);
+        check(wjson::ffi::ffi_pointer(w, n, "/a" as ptr<u8>, 0 - 1) == wjson::ffi_rust::ffi_pointer(r, n, "/a" as ptr<u8>, 0 - 1), label);
+        var lw: i64 = 77;
+        var lr: i64 = 77;
+        check(same_text(wjson::ffi::ffi_str(w, n, &lw), lw, wjson::ffi_rust::ffi_str(r, n, &lr), lr), label);
+        lw = 77;
+        lr = 77;
+        check(same_text(wjson::ffi::ffi_num(w, n, &lw), lw, wjson::ffi_rust::ffi_num(r, n, &lr), lr), label);
+        lw = 77;
+        lr = 77;
+        check(same_text(wjson::ffi::ffi_key(w, n, 0, &lw), lw, wjson::ffi_rust::ffi_key(r, n, 0, &lr), lr), label);
+        check(same_null(wjson::ffi::ffi_str(w, n, null), wjson::ffi_rust::ffi_str(r, n, null)), label);
+        i += 1;
+    }
+}
+
+// Edits on a handle pair; every result must match.
+fun probe_edit(w: ptr<u8>, r: ptr<u8>, label: str) {
+    check(wjson::ffi::ffi_new_null(w) == wjson::ffi_rust::ffi_new_null(r), label);
+    check(wjson::ffi::ffi_new_bool(w, 1) == wjson::ffi_rust::ffi_new_bool(r, 1), label);
+    check(wjson::ffi::ffi_new_number(w, "12" as ptr<u8>, 2) == wjson::ffi_rust::ffi_new_number(r, "12" as ptr<u8>, 2), label);
+    check(wjson::ffi::ffi_new_number(w, "1x" as ptr<u8>, 2) == wjson::ffi_rust::ffi_new_number(r, "1x" as ptr<u8>, 2), label);
+    check(wjson::ffi::ffi_new_number(w, null, 2) == wjson::ffi_rust::ffi_new_number(r, null, 2), label);
+    check(wjson::ffi::ffi_new_number(w, "1" as ptr<u8>, 0 - 1) == wjson::ffi_rust::ffi_new_number(r, "1" as ptr<u8>, 0 - 1), label);
+    check(wjson::ffi::ffi_new_string(w, "hi" as ptr<u8>, 2) == wjson::ffi_rust::ffi_new_string(r, "hi" as ptr<u8>, 2), label);
+    check(wjson::ffi::ffi_new_string(w, "\xff" as ptr<u8>, 1) == wjson::ffi_rust::ffi_new_string(r, "\xff" as ptr<u8>, 1), label);
+    check(wjson::ffi::ffi_new_string(w, null, 0) == wjson::ffi_rust::ffi_new_string(r, null, 0), label);
+    check(wjson::ffi::ffi_new_string(w, null, 3) == wjson::ffi_rust::ffi_new_string(r, null, 3), label);
+    check(wjson::ffi::ffi_new_array(w) == wjson::ffi_rust::ffi_new_array(r), label);
+    check(wjson::ffi::ffi_new_object(w) == wjson::ffi_rust::ffi_new_object(r), label);
+    check(wjson::ffi::ffi_set_root(w, 0) == wjson::ffi_rust::ffi_set_root(r, 0), label);
+    check(wjson::ffi::ffi_set_root(w, 0 - 1) == wjson::ffi_rust::ffi_set_root(r, 0 - 1), label);
+    check(wjson::ffi::ffi_arr_push(w, 0, 1) == wjson::ffi_rust::ffi_arr_push(r, 0, 1), label);
+    check(wjson::ffi::ffi_arr_insert(w, 0, 0, 1) == wjson::ffi_rust::ffi_arr_insert(r, 0, 0, 1), label);
+    check(wjson::ffi::ffi_arr_set(w, 0, 0, 1) == wjson::ffi_rust::ffi_arr_set(r, 0, 0, 1), label);
+    check(wjson::ffi::ffi_arr_remove(w, 0, 0) == wjson::ffi_rust::ffi_arr_remove(r, 0, 0), label);
+    check(wjson::ffi::ffi_obj_set(w, 0, "k" as ptr<u8>, 1, 1) == wjson::ffi_rust::ffi_obj_set(r, 0, "k" as ptr<u8>, 1, 1), label);
+    check(wjson::ffi::ffi_obj_set(w, 0, null, 1, 1) == wjson::ffi_rust::ffi_obj_set(r, 0, null, 1, 1), label);
+    check(wjson::ffi::ffi_obj_set(w, 0, "k" as ptr<u8>, 0 - 1, 1) == wjson::ffi_rust::ffi_obj_set(r, 0, "k" as ptr<u8>, 0 - 1, 1), label);
+    check(wjson::ffi::ffi_obj_remove(w, 0, "k" as ptr<u8>, 1) == wjson::ffi_rust::ffi_obj_remove(r, 0, "k" as ptr<u8>, 1), label);
+    check(wjson::ffi::ffi_obj_remove(w, 0, null, 1) == wjson::ffi_rust::ffi_obj_remove(r, 0, null, 1), label);
+    check(wjson::ffi::ffi_obj_clear(w, 0) == wjson::ffi_rust::ffi_obj_clear(r, 0), label);
+}
+
+fun test_null_handles() {
+    probe(null, null, "null handle");
+    probe_edit(null, null, "null handle edit");
+    check(wjson::ffi::ffi_copy(null, null, 0) == wjson::ffi_rust::ffi_copy(null, null, 0), "copy null");
+    wjson::ffi::ffi_free(null);
+    wjson::ffi_rust::ffi_free(null);
+}
+
+fun test_failed_parses() {
+    var inputs: array<str, 12> = ["", "x", "[1,", "{\"a\":}", "\"abc", "01", "[1] x", "\"\\q\"", "\"\\ud800\"", "\"\x01\"", "\xff", "[[[[[[[[[[[[[[[[[[[["];
+    var n: i32 = 0;
+    while (n < 12) {
+        var s: ptr<u8> = inputs[n] as ptr<u8>;
+        var depth: i32 = 0;
+        if (n == 11) {
+            depth = 3;
+        }
+        var w: ptr<u8> = wjson::ffi::ffi_parse(s, len_of(s), depth, 0);
+        var r: ptr<u8> = wjson::ffi_rust::ffi_parse(s, len_of(s), depth, 0);
+        probe(w, r, inputs[n]);
+        probe_edit(w, r, inputs[n]);
+        check(wjson::ffi::ffi_copy(w, w, 0) == wjson::ffi_rust::ffi_copy(r, r, 0), "copy of failed parse");
+        wjson::ffi::ffi_free(w);
+        wjson::ffi_rust::ffi_free(r);
+        n += 1;
+    }
+    // Bad arguments to parse.
+    var w2: ptr<u8> = wjson::ffi::ffi_parse(null, 5, 0, 0);
+    var r2: ptr<u8> = wjson::ffi_rust::ffi_parse(null, 5, 0, 0);
+    probe(w2, r2, "parse null source");
+    wjson::ffi::ffi_free(w2);
+    wjson::ffi_rust::ffi_free(r2);
+    w2 = wjson::ffi::ffi_parse("1" as ptr<u8>, 0 - 1, 0, 0);
+    r2 = wjson::ffi_rust::ffi_parse("1" as ptr<u8>, 0 - 1, 0, 0);
+    probe(w2, r2, "parse negative length");
+    wjson::ffi::ffi_free(w2);
+    wjson::ffi_rust::ffi_free(r2);
+}
+
+fun test_good_docs() {
+    var src: ptr<u8> = "{\"a\":[1,\"x\",true,null,{\"b\":2.5}],\"c\":\"d\"}" as ptr<u8>;
+    var w: ptr<u8> = wjson::ffi::ffi_parse(src, len_of(src), 0, 0);
+    var r: ptr<u8> = wjson::ffi_rust::ffi_parse(src, len_of(src), 0, 0);
+    probe(w, r, "good document");
+    probe_edit(w, r, "good document edit");
+    probe(w, r, "good document after edits");
+    // Copies between two documents and into itself, including a failed source.
+    var w2: ptr<u8> = wjson::ffi::ffi_new_doc();
+    var r2: ptr<u8> = wjson::ffi_rust::ffi_new_doc();
+    probe(w2, r2, "new document");
+    check(wjson::ffi::ffi_copy(w2, w, 0) == wjson::ffi_rust::ffi_copy(r2, r, 0), "copy across documents");
+    check(wjson::ffi::ffi_copy(w, w, 2) == wjson::ffi_rust::ffi_copy(r, r, 2), "copy into itself");
+    check(wjson::ffi::ffi_copy(w2, null, 0) == wjson::ffi_rust::ffi_copy(r2, null, 0), "copy from null");
+    var bw: ptr<u8> = wjson::ffi::ffi_parse("[" as ptr<u8>, 1, 0, 0);
+    var br: ptr<u8> = wjson::ffi_rust::ffi_parse("[" as ptr<u8>, 1, 0, 0);
+    check(wjson::ffi::ffi_copy(w2, bw, 0) == wjson::ffi_rust::ffi_copy(r2, br, 0), "copy from failed parse");
+    probe(w2, r2, "after copies");
+    probe(w, r, "after self copy");
+    wjson::ffi::ffi_free(bw);
+    wjson::ffi_rust::ffi_free(br);
+    wjson::ffi::ffi_free(w2);
+    wjson::ffi_rust::ffi_free(r2);
+    wjson::ffi::ffi_free(w);
+    wjson::ffi_rust::ffi_free(r);
+}
+
+fun test_messages() {
+    // Each code the parser can produce, reached through real inputs.
+    var codes: i32 = 0;
+    var inputs: array<str, 10> = ["", "x", "[", "-", "\"a", "\"\\q\"", "\"\\ud800\"", "\"\x01\"", "\"\xc3\"", "1 2"];
+    var n: i32 = 0;
+    while (n < 10) {
+        var s: ptr<u8> = inputs[n] as ptr<u8>;
+        var w: ptr<u8> = wjson::ffi::ffi_parse(s, len_of(s), 0, 0);
+        var r: ptr<u8> = wjson::ffi_rust::ffi_parse(s, len_of(s), 0, 0);
+        check(same_cstr(wjson::ffi::ffi_error_message(w), wjson::ffi_rust::ffi_error_message(r)), inputs[n]);
+        if (wjson::ffi::ffi_error_code(w) != 0) {
+            codes += 1;
+        }
+        wjson::ffi::ffi_free(w);
+        wjson::ffi_rust::ffi_free(r);
+        n += 1;
+    }
+    check(codes == 10, "all inputs fail");
+    // Too deep, and too large is not reachable here.
+    var deep: ptr<u8> = "[[[[" as ptr<u8>;
+    var wd: ptr<u8> = wjson::ffi::ffi_parse(deep, 4, 2, 0);
+    var rd: ptr<u8> = wjson::ffi_rust::ffi_parse(deep, 4, 2, 0);
+    check(same_cstr(wjson::ffi::ffi_error_message(wd), wjson::ffi_rust::ffi_error_message(rd)), "too deep");
+    wjson::ffi::ffi_free(wd);
+    wjson::ffi_rust::ffi_free(rd);
+    // The Rust version string is the library version.
+    check(same_cstr(wjson::ffi::ffi_version(), wjson::ffi_rust::ffi_version()), "version");
+}
+
+fun reader_probe(w: ptr<u8>, r: ptr<u8>, label: str) {
+    check(wjson::ffi::ffi_reader_next(w) == wjson::ffi_rust::ffi_reader_next(r), label);
+    var lw: i64 = 77;
+    var lr: i64 = 77;
+    check(same_text(wjson::ffi::ffi_reader_text(w, &lw), lw, wjson::ffi_rust::ffi_reader_text(r, &lr), lr), label);
+    check(same_null(wjson::ffi::ffi_reader_text(w, null), wjson::ffi_rust::ffi_reader_text(r, null)), label);
+    check(wjson::ffi::ffi_reader_depth(w) == wjson::ffi_rust::ffi_reader_depth(r), label);
+    check(wjson::ffi::ffi_reader_documents(w) == wjson::ffi_rust::ffi_reader_documents(r), label);
+    check(wjson::ffi::ffi_reader_buffered(w) == wjson::ffi_rust::ffi_reader_buffered(r), label);
+    check(wjson::ffi::ffi_reader_error_code(w) == wjson::ffi_rust::ffi_reader_error_code(r), label);
+    check(same_cstr(wjson::ffi::ffi_reader_error_message(w), wjson::ffi_rust::ffi_reader_error_message(r)), label);
+    check(wjson::ffi::ffi_reader_error_offset(w) == wjson::ffi_rust::ffi_reader_error_offset(r), label);
+    check(wjson::ffi::ffi_reader_error_line(w) == wjson::ffi_rust::ffi_reader_error_line(r), label);
+    check(wjson::ffi::ffi_reader_error_column(w) == wjson::ffi_rust::ffi_reader_error_column(r), label);
+    check(wjson::ffi::ffi_reader_feed(w, null, 4) == wjson::ffi_rust::ffi_reader_feed(r, null, 4), label);
+    check(wjson::ffi::ffi_reader_feed(w, "x" as ptr<u8>, 0 - 1) == wjson::ffi_rust::ffi_reader_feed(r, "x" as ptr<u8>, 0 - 1), label);
+}
+
+fun test_readers() {
+    reader_probe(null, null, "null reader");
+    wjson::ffi::ffi_reader_set_max_token(null, 5);
+    wjson::ffi_rust::ffi_reader_set_max_token(null, 5);
+    wjson::ffi::ffi_reader_finish(null);
+    wjson::ffi_rust::ffi_reader_finish(null);
+    wjson::ffi::ffi_reader_free(null);
+    wjson::ffi_rust::ffi_reader_free(null);
+
+    var w: ptr<u8> = wjson::ffi::ffi_reader_new(0, 0);
+    var r: ptr<u8> = wjson::ffi_rust::ffi_reader_new(0, 0);
+    reader_probe(w, r, "fresh reader");
+    check(wjson::ffi::ffi_reader_feed(w, "[1,\"a\"" as ptr<u8>, 6) == wjson::ffi_rust::ffi_reader_feed(r, "[1,\"a\"" as ptr<u8>, 6), "feed");
+    var i: i32 = 0;
+    while (i < 8) {
+        reader_probe(w, r, "reader sequence");
+        i += 1;
+    }
+    wjson::ffi::ffi_reader_finish(w);
+    wjson::ffi_rust::ffi_reader_finish(r);
+    check(wjson::ffi::ffi_reader_feed(w, "]" as ptr<u8>, 1) == wjson::ffi_rust::ffi_reader_feed(r, "]" as ptr<u8>, 1), "feed after finish");
+    reader_probe(w, r, "after finish");
+    reader_probe(w, r, "after finish 2");
+    wjson::ffi::ffi_reader_free(w);
+    wjson::ffi_rust::ffi_reader_free(r);
+}
+
+fun main() -> i32 {
+    test_null_handles();
+    test_failed_parses();
+    test_good_docs();
+    test_messages();
+    test_readers();
+    println("ffi_wave_test: {}/{} checks passed", CHECKS - FAILURES, CHECKS);
+    if (FAILURES != 0) {
+        println("ffi_wave_test: {} FAILED", FAILURES);
+        return 1;
+    }
+    return 0;
+}

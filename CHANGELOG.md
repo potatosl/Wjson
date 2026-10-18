@@ -68,6 +68,14 @@ minor releases.
   random chunks, and compares every event, the text that goes with it, depth,
   buffered bytes, document count and the error code, offset, line and column
   (3 million checks at 3000 random documents, valid and damaged).
+- The Wave API now runs on the Wave document model, parser, editor and pull
+  parser: `src/ffi.wave` serves the same functions from `core_dom`, `core_parse`,
+  `core_edit` and `core_stream` instead of calling the Rust core. The Rust
+  bindings moved to `src/ffi_rust.wave` and stay as the reference the
+  differential tests compare against; the Rust core is still built and exported
+  for C and C++ users. `tests/ffi_wave_test.wave` compares the handle layer with
+  the Rust C ABI on null handles, failed parses, bad ids and lengths, error
+  messages and readers (3,000 checks); the other tests run unchanged.
 - Windows on ARM64 is supported, natively and without MSVC like x64. `wjlink`
   (the MSVC-free link driver) now takes the architecture as a value: import
   libraries use the matching machine type and RVA relocation, and the startup

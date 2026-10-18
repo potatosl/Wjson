@@ -12,7 +12,7 @@
 
 import("std::mem::alloc")::{mem_alloc, mem_free};
 extern(c, "getenv") fun c_getenv(name: ptr<u8>) -> ptr<u8>;
-import("wjson::ffi")::{
+import("wjson::ffi_rust")::{
     ffi_reader_new, ffi_reader_free, ffi_reader_set_max_token, ffi_reader_feed, ffi_reader_finish,
     ffi_reader_next, ffi_reader_text, ffi_reader_depth, ffi_reader_documents, ffi_reader_buffered,
     ffi_reader_error_code, ffi_reader_error_offset, ffi_reader_error_line, ffi_reader_error_column,

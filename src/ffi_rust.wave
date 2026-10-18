@@ -1,0 +1,148 @@
+// SPDX-License-Identifier: MPL-2.0
+//
+// Raw C ABI bindings for the Rust core (core/src/lib.rs), kept under the same
+// names the public layer used before the document model moved to Wave. The
+// library itself no longer calls these: src/ffi.wave serves the same functions
+// from src/core_*.wave. They remain so the differential tests can compare the
+// Wave code with the Rust reference (import("wjson::ffi_rust")).
+
+extern(c, "wj_version") fun c_wj_version() -> ptr<u8>;
+extern(c, "wj_parse_ex") fun c_wj_parse_ex(src: ptr<u8>, len: i64, max_depth: i32, flags: u32) -> ptr<u8>;
+extern(c, "wj_free") fun c_wj_free(doc: ptr<u8>);
+extern(c, "wj_ok") fun c_wj_ok(doc: ptr<u8>) -> i32;
+extern(c, "wj_error_code") fun c_wj_error_code(doc: ptr<u8>) -> i32;
+extern(c, "wj_error_message") fun c_wj_error_message(doc: ptr<u8>) -> ptr<u8>;
+extern(c, "wj_error_offset") fun c_wj_error_offset(doc: ptr<u8>) -> i64;
+extern(c, "wj_error_line") fun c_wj_error_line(doc: ptr<u8>) -> i64;
+extern(c, "wj_error_column") fun c_wj_error_column(doc: ptr<u8>) -> i64;
+extern(c, "wj_root") fun c_wj_root(doc: ptr<u8>) -> i32;
+extern(c, "wj_node_count") fun c_wj_node_count(doc: ptr<u8>) -> i64;
+extern(c, "wj_type") fun c_wj_type(doc: ptr<u8>, node: i32) -> i32;
+extern(c, "wj_bool") fun c_wj_bool(doc: ptr<u8>, node: i32) -> i32;
+extern(c, "wj_len") fun c_wj_len(doc: ptr<u8>, node: i32) -> i64;
+extern(c, "wj_at") fun c_wj_at(doc: ptr<u8>, node: i32, index: i64) -> i32;
+extern(c, "wj_key") fun c_wj_key(doc: ptr<u8>, node: i32, index: i64, out_len: ptr<i64>) -> ptr<u8>;
+extern(c, "wj_get") fun c_wj_get(doc: ptr<u8>, node: i32, key: ptr<u8>, key_len: i64) -> i32;
+extern(c, "wj_pointer") fun c_wj_pointer(doc: ptr<u8>, node: i32, pointer: ptr<u8>, len: i64) -> i32;
+extern(c, "wj_str") fun c_wj_str(doc: ptr<u8>, node: i32, out_len: ptr<i64>) -> ptr<u8>;
+extern(c, "wj_num") fun c_wj_num(doc: ptr<u8>, node: i32, out_len: ptr<i64>) -> ptr<u8>;
+extern(c, "wj_num_is_int") fun c_wj_num_is_int(doc: ptr<u8>, node: i32) -> i32;
+
+pub fun ffi_version() -> ptr<u8> { return c_wj_version(); }
+pub fun ffi_parse(src: ptr<u8>, len: i64, max_depth: i32, flags: u32) -> ptr<u8> {
+    return c_wj_parse_ex(src, len, max_depth, flags);
+}
+pub fun ffi_free(doc: ptr<u8>) { c_wj_free(doc); }
+pub fun ffi_ok(doc: ptr<u8>) -> i32 { return c_wj_ok(doc); }
+pub fun ffi_error_code(doc: ptr<u8>) -> i32 { return c_wj_error_code(doc); }
+pub fun ffi_error_message(doc: ptr<u8>) -> ptr<u8> { return c_wj_error_message(doc); }
+pub fun ffi_error_offset(doc: ptr<u8>) -> i64 { return c_wj_error_offset(doc); }
+pub fun ffi_error_line(doc: ptr<u8>) -> i64 { return c_wj_error_line(doc); }
+pub fun ffi_error_column(doc: ptr<u8>) -> i64 { return c_wj_error_column(doc); }
+pub fun ffi_root(doc: ptr<u8>) -> i32 { return c_wj_root(doc); }
+pub fun ffi_node_count(doc: ptr<u8>) -> i64 { return c_wj_node_count(doc); }
+pub fun ffi_type(doc: ptr<u8>, node: i32) -> i32 { return c_wj_type(doc, node); }
+pub fun ffi_bool(doc: ptr<u8>, node: i32) -> i32 { return c_wj_bool(doc, node); }
+pub fun ffi_len(doc: ptr<u8>, node: i32) -> i64 { return c_wj_len(doc, node); }
+pub fun ffi_at(doc: ptr<u8>, node: i32, index: i64) -> i32 { return c_wj_at(doc, node, index); }
+pub fun ffi_key(doc: ptr<u8>, node: i32, index: i64, out_len: ptr<i64>) -> ptr<u8> {
+    return c_wj_key(doc, node, index, out_len);
+}
+pub fun ffi_get(doc: ptr<u8>, node: i32, key: ptr<u8>, key_len: i64) -> i32 {
+    return c_wj_get(doc, node, key, key_len);
+}
+pub fun ffi_pointer(doc: ptr<u8>, node: i32, pointer: ptr<u8>, len: i64) -> i32 {
+    return c_wj_pointer(doc, node, pointer, len);
+}
+pub fun ffi_str(doc: ptr<u8>, node: i32, out_len: ptr<i64>) -> ptr<u8> {
+    return c_wj_str(doc, node, out_len);
+}
+pub fun ffi_num(doc: ptr<u8>, node: i32, out_len: ptr<i64>) -> ptr<u8> {
+    return c_wj_num(doc, node, out_len);
+}
+pub fun ffi_num_is_int(doc: ptr<u8>, node: i32) -> i32 { return c_wj_num_is_int(doc, node); }
+
+// ---- Rust core: editing ----------------------------------------------------
+
+extern(c, "wj_new_doc") fun c_wj_new_doc() -> ptr<u8>;
+extern(c, "wj_new_null") fun c_wj_new_null(doc: ptr<u8>) -> i32;
+extern(c, "wj_new_bool") fun c_wj_new_bool(doc: ptr<u8>, value: i32) -> i32;
+extern(c, "wj_new_number") fun c_wj_new_number(doc: ptr<u8>, lexeme: ptr<u8>, len: i64) -> i32;
+extern(c, "wj_new_string") fun c_wj_new_string(doc: ptr<u8>, text: ptr<u8>, len: i64) -> i32;
+extern(c, "wj_new_array") fun c_wj_new_array(doc: ptr<u8>) -> i32;
+extern(c, "wj_new_object") fun c_wj_new_object(doc: ptr<u8>) -> i32;
+extern(c, "wj_set_root") fun c_wj_set_root(doc: ptr<u8>, node: i32) -> i32;
+extern(c, "wj_parent") fun c_wj_parent(doc: ptr<u8>, node: i32) -> i32;
+extern(c, "wj_arr_push") fun c_wj_arr_push(doc: ptr<u8>, arr: i32, value: i32) -> i32;
+extern(c, "wj_arr_insert") fun c_wj_arr_insert(doc: ptr<u8>, arr: i32, index: i64, value: i32) -> i32;
+extern(c, "wj_arr_set") fun c_wj_arr_set(doc: ptr<u8>, arr: i32, index: i64, value: i32) -> i32;
+extern(c, "wj_arr_remove") fun c_wj_arr_remove(doc: ptr<u8>, arr: i32, index: i64) -> i32;
+extern(c, "wj_obj_set") fun c_wj_obj_set(doc: ptr<u8>, obj: i32, key: ptr<u8>, key_len: i64, value: i32) -> i32;
+extern(c, "wj_obj_clear") fun c_wj_obj_clear(doc: ptr<u8>, obj: i32) -> i32;
+extern(c, "wj_obj_remove") fun c_wj_obj_remove(doc: ptr<u8>, obj: i32, key: ptr<u8>, key_len: i64) -> i32;
+extern(c, "wj_copy") fun c_wj_copy(doc: ptr<u8>, src: ptr<u8>, src_node: i32) -> i32;
+
+pub fun ffi_new_doc() -> ptr<u8> { return c_wj_new_doc(); }
+pub fun ffi_new_null(doc: ptr<u8>) -> i32 { return c_wj_new_null(doc); }
+pub fun ffi_new_bool(doc: ptr<u8>, value: i32) -> i32 { return c_wj_new_bool(doc, value); }
+pub fun ffi_new_number(doc: ptr<u8>, lexeme: ptr<u8>, len: i64) -> i32 {
+    return c_wj_new_number(doc, lexeme, len);
+}
+pub fun ffi_new_string(doc: ptr<u8>, text: ptr<u8>, len: i64) -> i32 {
+    return c_wj_new_string(doc, text, len);
+}
+pub fun ffi_new_array(doc: ptr<u8>) -> i32 { return c_wj_new_array(doc); }
+pub fun ffi_new_object(doc: ptr<u8>) -> i32 { return c_wj_new_object(doc); }
+pub fun ffi_set_root(doc: ptr<u8>, node: i32) -> i32 { return c_wj_set_root(doc, node); }
+pub fun ffi_parent(doc: ptr<u8>, node: i32) -> i32 { return c_wj_parent(doc, node); }
+pub fun ffi_arr_push(doc: ptr<u8>, arr: i32, value: i32) -> i32 { return c_wj_arr_push(doc, arr, value); }
+pub fun ffi_arr_insert(doc: ptr<u8>, arr: i32, index: i64, value: i32) -> i32 {
+    return c_wj_arr_insert(doc, arr, index, value);
+}
+pub fun ffi_arr_set(doc: ptr<u8>, arr: i32, index: i64, value: i32) -> i32 {
+    return c_wj_arr_set(doc, arr, index, value);
+}
+pub fun ffi_arr_remove(doc: ptr<u8>, arr: i32, index: i64) -> i32 { return c_wj_arr_remove(doc, arr, index); }
+pub fun ffi_obj_set(doc: ptr<u8>, obj: i32, key: ptr<u8>, key_len: i64, value: i32) -> i32 {
+    return c_wj_obj_set(doc, obj, key, key_len, value);
+}
+pub fun ffi_obj_clear(doc: ptr<u8>, obj: i32) -> i32 { return c_wj_obj_clear(doc, obj); }
+pub fun ffi_obj_remove(doc: ptr<u8>, obj: i32, key: ptr<u8>, key_len: i64) -> i32 {
+    return c_wj_obj_remove(doc, obj, key, key_len);
+}
+pub fun ffi_copy(doc: ptr<u8>, src: ptr<u8>, src_node: i32) -> i32 { return c_wj_copy(doc, src, src_node); }
+
+// ---- Rust core: streaming --------------------------------------------------
+
+extern(c, "wj_reader_new") fun c_wj_reader_new(max_depth: i32, flags: u32) -> ptr<u8>;
+extern(c, "wj_reader_free") fun c_wj_reader_free(r: ptr<u8>);
+extern(c, "wj_reader_set_max_token") fun c_wj_reader_set_max_token(r: ptr<u8>, bytes: i64);
+extern(c, "wj_reader_feed") fun c_wj_reader_feed(r: ptr<u8>, data: ptr<u8>, len: i64) -> i32;
+extern(c, "wj_reader_finish") fun c_wj_reader_finish(r: ptr<u8>);
+extern(c, "wj_reader_next") fun c_wj_reader_next(r: ptr<u8>) -> i32;
+extern(c, "wj_reader_text") fun c_wj_reader_text(r: ptr<u8>, out_len: ptr<i64>) -> ptr<u8>;
+extern(c, "wj_reader_depth") fun c_wj_reader_depth(r: ptr<u8>) -> i32;
+extern(c, "wj_reader_documents") fun c_wj_reader_documents(r: ptr<u8>) -> i64;
+extern(c, "wj_reader_buffered") fun c_wj_reader_buffered(r: ptr<u8>) -> i64;
+extern(c, "wj_reader_error_code") fun c_wj_reader_error_code(r: ptr<u8>) -> i32;
+extern(c, "wj_reader_error_message") fun c_wj_reader_error_message(r: ptr<u8>) -> ptr<u8>;
+extern(c, "wj_reader_error_offset") fun c_wj_reader_error_offset(r: ptr<u8>) -> i64;
+extern(c, "wj_reader_error_line") fun c_wj_reader_error_line(r: ptr<u8>) -> i64;
+extern(c, "wj_reader_error_column") fun c_wj_reader_error_column(r: ptr<u8>) -> i64;
+
+pub fun ffi_reader_new(max_depth: i32, flags: u32) -> ptr<u8> { return c_wj_reader_new(max_depth, flags); }
+pub fun ffi_reader_free(r: ptr<u8>) { c_wj_reader_free(r); }
+pub fun ffi_reader_set_max_token(r: ptr<u8>, bytes: i64) { c_wj_reader_set_max_token(r, bytes); }
+pub fun ffi_reader_feed(r: ptr<u8>, data: ptr<u8>, len: i64) -> i32 { return c_wj_reader_feed(r, data, len); }
+pub fun ffi_reader_finish(r: ptr<u8>) { c_wj_reader_finish(r); }
+pub fun ffi_reader_next(r: ptr<u8>) -> i32 { return c_wj_reader_next(r); }
+pub fun ffi_reader_text(r: ptr<u8>, out_len: ptr<i64>) -> ptr<u8> { return c_wj_reader_text(r, out_len); }
+pub fun ffi_reader_depth(r: ptr<u8>) -> i32 { return c_wj_reader_depth(r); }
+pub fun ffi_reader_documents(r: ptr<u8>) -> i64 { return c_wj_reader_documents(r); }
+pub fun ffi_reader_buffered(r: ptr<u8>) -> i64 { return c_wj_reader_buffered(r); }
+pub fun ffi_reader_error_code(r: ptr<u8>) -> i32 { return c_wj_reader_error_code(r); }
+pub fun ffi_reader_error_message(r: ptr<u8>) -> ptr<u8> { return c_wj_reader_error_message(r); }
+pub fun ffi_reader_error_offset(r: ptr<u8>) -> i64 { return c_wj_reader_error_offset(r); }
+pub fun ffi_reader_error_line(r: ptr<u8>) -> i64 { return c_wj_reader_error_line(r); }
+pub fun ffi_reader_error_column(r: ptr<u8>) -> i64 { return c_wj_reader_error_column(r); }
+

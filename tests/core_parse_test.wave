@@ -9,7 +9,7 @@
 
 import("std::mem::alloc")::{mem_alloc, mem_free};
 extern(c, "getenv") fun c_getenv(name: ptr<u8>) -> ptr<u8>;
-import("wjson::ffi")::{
+import("wjson::ffi_rust")::{
     ffi_parse, ffi_free, ffi_ok, ffi_error_code, ffi_error_offset, ffi_error_line, ffi_error_column,
     ffi_root, ffi_node_count, ffi_type, ffi_bool, ffi_len, ffi_at, ffi_key, ffi_str, ffi_num,
     ffi_num_is_int, ffi_parent,

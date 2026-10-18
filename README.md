@@ -7,8 +7,8 @@ each do the part they are best at.
 
 | Layer | Language | Responsibility | Location |
 | --- | --- | --- | --- |
-| API | **Wave** | navigation, path queries, document editing (incl. by path), writer, serialization, deep equality, file streaming; number conversion, string escaping and UTF-8 checks (`number.wave`, `escape.wave`) | `src/*.wave` |
-| Core | **Rust** | RFC 8259 parser, index-based DOM and edit operations, hash index for large objects, incremental (pull) parser, JSON Pointer, error positions | `core/` |
+| API | **Wave** | the parser, document model, edit operations, JSON Pointer and incremental (pull) parser (`core_*.wave`, served through `ffi.wave`); navigation, path queries, document editing (incl. by path), writer, serialization, deep equality, file streaming; number conversion, string escaping and UTF-8 checks (`number.wave`, `escape.wave`) | `src/*.wave` |
+| Core | **Rust** | the same RFC 8259 parser, index-based DOM, edit operations, hash index, pull parser, JSON Pointer and error positions for C and C++ users, and as the reference the Wave code is tested against (`src/ffi_rust.wave`) | `core/` |
 | Native | **C++20** (freestanding) | the same number conversion (correctly rounded parsing, shortest round-trip output), string escaping and UTF-8 validation for C and C++ users, and as the reference the Wave code is tested against; compiles without any standard-library or SDK headers | `native/` |
 | Toolchain | **Rust** | `wjlink`: the Windows link driver used instead of MSVC — generates import libraries from system DLLs, emits the startup object, archives objects, drives rust-lld | `chain/` |
 

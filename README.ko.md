@@ -6,8 +6,8 @@ Rust, C++, Wave가 각자 잘하는 일을 나눠 맡는 JSON 라이브러리입
 
 | 계층 | 언어 | 담당 | 위치 |
 | --- | --- | --- | --- |
-| API | **Wave** | 탐색, 경로 쿼리, 문서 수정·경로 기반 수정, writer, 직렬화, 깊은 비교, 파일 스트리밍 | `src/*.wave` |
-| 코어 | **Rust** | RFC 8259 파서, 인덱스 기반 DOM과 수정 연산, 큰 객체 키 해시 인덱스, 증분(pull) 파서, JSON Pointer, 에러 위치 | `core/` |
+| API | **Wave** | 파서, 문서 모델, 수정 연산, JSON Pointer, 증분(pull) 파서(`core_*.wave`, `ffi.wave`로 연결), 탐색, 경로 쿼리, 문서 수정·경로 기반 수정, writer, 직렬화, 깊은 비교, 파일 스트리밍 | `src/*.wave` |
+| 코어 | **Rust** | 같은 RFC 8259 파서, 인덱스 기반 DOM, 수정 연산, 해시 인덱스, pull 파서, JSON Pointer, 에러 위치. C/C++ 사용자용이며 Wave 코드를 테스트할 때 비교하는 기준(`src/ffi_rust.wave`) | `core/` |
 | 네이티브 | **C++20** (freestanding) | 숫자 변환(자체 구현: 정확한 반올림 파싱·최단 왕복 출력), 문자열 이스케이프, UTF-8 검사. 표준 라이브러리·SDK 헤더 없이 컴파일 | `native/` |
 | 툴체인 | **Rust** | `wjlink`: Windows에서 MSVC 대신 쓰는 링크 도구. 시스템 DLL에서 import 라이브러리 생성, 시작 코드(wjrt) 생성, 아카이버, rust-lld 구동 | `chain/` |
 

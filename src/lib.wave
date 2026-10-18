@@ -2,8 +2,10 @@
 //
 // wjson — JSON for Wave.
 //
-// Parsing runs in a Rust core, number conversion and string escaping in a
-// C++ layer, and everything you call lives here in Wave:
+// Parsing, the document model, editing, the pull parser, number conversion and
+// string escaping are all written in Wave (src/core_*.wave, number.wave,
+// escape.wave); the Rust core and the C++ layer remain for C and C++ users and
+// as the references the tests compare against. Everything you call lives here:
 //
 //   import("wjson")::{JsonDoc, Json, json_parse, json_ok, json_root,
 //                     json_path, json_as_str, json_free};
