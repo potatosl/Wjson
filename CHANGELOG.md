@@ -94,6 +94,10 @@ minor releases.
   and links it when the programs will be built with `-O0` and cargo is
   installed; otherwise it keeps the Wave backend. `WJSON_BACKEND=wave|rust|auto`
   overrides the choice. The installer's CI job checks both backends.
+  `build.wave` notices a Rust `ffi_backend.wave` and links the core into every
+  program. Checked: the whole suite and all examples on both backends, at
+  `-O2` and `-O0`; the randomized tests at 100,000 documents (pull parser: 100
+  million checks); the Wave tests under valgrind without errors or leaks; clippy.
 - Windows on ARM64 is supported, natively and without MSVC like x64. `wjlink`
   (the MSVC-free link driver) now takes the architecture as a value: import
   libraries use the matching machine type and RVA relocation, and the startup

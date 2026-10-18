@@ -56,6 +56,9 @@ static OPT: str = "-O2";
 static DRY: bool = false;
 static FAILED: i32 = 0;
 static TOOLCHAIN_READY: bool = false;
+// src/ffi_backend.wave was replaced by the Rust version (install.sh does this
+// for unoptimized builds): every program then needs the Rust core linked.
+static RUST_BACKEND: bool = false;
 
 // ---- small string helpers ----------------------------------------------------------
 
@@ -143,6 +146,30 @@ fun must(b: ptr<Buffer>) -> bool {
 }
 
 // Reads a small text file into a fresh NUL-terminated allocation.
+fun detect_backend() {
+    var size: i64 = 0;
+    var text: ptr<u8> = read_text("src/ffi_backend.wave", &size);
+    if (text == null) {
+        return;
+    }
+    var needle: ptr<u8> = "\"wj_parse_ex\"" as ptr<u8>;
+    var i: i64 = 0;
+    while (text[i] != 0 && !RUST_BACKEND) {
+        var k: i64 = 0;
+        while (needle[k] != 0 && text[i + k] == needle[k]) {
+            k += 1;
+        }
+        if (needle[k] == 0) {
+            RUST_BACKEND = true;
+        }
+        i += 1;
+    }
+    mem_free(text, size);
+    if (RUST_BACKEND) {
+        println("note: src/ffi_backend.wave is the Rust backend; programs link the Rust core");
+    }
+}
+
 fun read_text(path: str, size_out: ptr<i64>) -> ptr<u8> {
     var size: i64 = fs_file_size(path);
     if (size < 0) {
@@ -392,7 +419,7 @@ fun build_libs(b: ptr<Buffer>, flags: ptr<Buffer>, with_rust: bool) -> bool {
         }
         TOOLCHAIN_READY = true;
     }
-    if (!with_rust && !WINDOWS) {
+    if (!with_rust && !WINDOWS && !RUST_BACKEND) {
         add(flags, LEAN_FLAGS);
         return build_native(b);
     }
@@ -418,7 +445,7 @@ fun wave_build(b: ptr<Buffer>, flags: ptr<Buffer>, source: str, output: str, use
     add(b, source);
     add(b, " ");
     add(b, native_lib());
-    if (use_core || WINDOWS) {
+    if (use_core || WINDOWS || RUST_BACKEND) {
         add(b, " ");
         add(b, core_lib());
         add(b, " --dep=wjson=.");
@@ -737,6 +764,7 @@ fun main() -> i32 {
         detect_target();
     }
     detect_opt();
+    detect_backend();
     var b: Buffer = buffer_new(512);
     var flags: Buffer = buffer_new(256);
 
