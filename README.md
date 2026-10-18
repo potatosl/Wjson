@@ -1,14 +1,20 @@
-<p align="center">
-  <a href="https://wave-lang.dev"><img src="docs/wave.svg" alt="Wave" width="220"></a>
-</p>
+<div align="center">
 
-# wjson
+<img src="docs/wjson.svg" alt="wjson" height="90">
 
-[![CI](https://github.com/potatosl/wjson/actions/workflows/ci.yml/badge.svg)](https://github.com/potatosl/wjson/actions/workflows/ci.yml)
+<hr>
+
+**JSON for the Wave language.**
+
+Strict parsing, safe paths, editing in place and streaming for files of any size.
+
+[Guide](docs/GUIDE.md) · [API](docs/API.md) · [Examples](examples) · [Building](docs/BUILDING.md) · [Changelog](CHANGELOG.md)
+
+[![CI](https://github.com/potatosl/wjson/actions/workflows/ci.yml/badge.svg)](https://github.com/potatosl/wjson/actions/workflows/ci.yml) [![License](https://img.shields.io/github/license/potatosl/wjson?color=6654F1)](LICENSE) [![Made for Wave](https://img.shields.io/badge/made%20for-Wave-6654F1)](https://wave-lang.dev)
 
 **English** | [한국어](README.ko.md)
 
-A JSON library for [Wave](https://wave-lang.dev).
+</div>
 
 It reads and writes JSON, lets you look values up with paths that never crash, edits documents in place,
 and streams files that do not fit in memory. The parser is strict RFC 8259 with a depth limit, and
@@ -101,3 +107,7 @@ and the number code have been fuzzed against independent references.
 
 [MPL-2.0](LICENSE). Copyright (c) 2026 potatosl and the wjson contributors. Modified copies of the files in
 this repository must stay under the MPL-2.0; programs that merely use wjson may use any license.
+
+<p align="center">
+  <a href="https://wave-lang.dev"><img src="docs/wave.svg" alt="Wave" height="28"></a>
+</p>

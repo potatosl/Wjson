@@ -1,14 +1,20 @@
-<p align="center">
-  <a href="https://wave-lang.dev"><img src="docs/wave.svg" alt="Wave" width="220"></a>
-</p>
+<div align="center">
 
-# wjson
+<img src="docs/wjson.svg" alt="wjson" height="90">
 
-[![CI](https://github.com/potatosl/wjson/actions/workflows/ci.yml/badge.svg)](https://github.com/potatosl/wjson/actions/workflows/ci.yml)
+<hr>
+
+**Wave용 JSON 라이브러리.**
+
+엄격한 파싱, 안전한 경로, 제자리 수정, 어떤 크기의 파일이든 스트리밍.
+
+[안내서](docs/GUIDE.ko.md) · [API](docs/API.ko.md) · [예제](examples) · [빌드](docs/BUILDING.ko.md) · [변경 내역](CHANGELOG.md)
+
+[![CI](https://github.com/potatosl/wjson/actions/workflows/ci.yml/badge.svg)](https://github.com/potatosl/wjson/actions/workflows/ci.yml) [![License](https://img.shields.io/github/license/potatosl/wjson?color=6654F1)](LICENSE) [![Made for Wave](https://img.shields.io/badge/made%20for-Wave-6654F1)](https://wave-lang.dev)
 
 [English](README.md) | **한국어**
 
-[Wave](https://wave-lang.dev)용 JSON 라이브러리입니다.
+</div>
 
 JSON을 읽고 쓰고, 절대 죽지 않는 경로로 값을 찾고, 문서를 그 자리에서 고치고, 메모리에 다 올라가지 않는 큰 파일도
 스트리밍으로 읽습니다. 파서는 RFC 8259를 엄격하게 따르고 깊이 제한이 있으며, 설정 파일용으로 주석과 끝의 쉼표를
@@ -94,3 +100,7 @@ wjson은 0.x이고 Wave 자체가 pre-beta라서 마이너 버전에서 API가 �
 
 [MPL-2.0](LICENSE). Copyright (c) 2026 potatosl and the wjson contributors. 이 저장소 파일을 수정한 사본은 MPL-2.0을
 유지해야 하고, wjson을 그냥 사용하는 프로그램은 어떤 라이선스든 괜찮습니다.
+
+<p align="center">
+  <a href="https://wave-lang.dev"><img src="docs/wave.svg" alt="Wave" height="28"></a>
+</p>
