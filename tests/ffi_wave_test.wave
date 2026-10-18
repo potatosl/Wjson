@@ -11,8 +11,8 @@
 import("wjson::ffi");
 import("wjson::ffi_rust");
 
-static CHECKS: i32 = 0;
-static FAILURES: i32 = 0;
+static CHECKS: i64 = 0;
+static FAILURES: i64 = 0;
 
 fun check(cond: bool, label: str) {
     CHECKS += 1;

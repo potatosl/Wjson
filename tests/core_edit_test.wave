@@ -27,8 +27,8 @@ import("wjson::core_edit")::{
     core_obj_set, core_obj_remove, core_obj_clear, core_copy,
 };
 
-static CHECKS: i32 = 0;
-static FAILURES: i32 = 0;
+static CHECKS: i64 = 0;
+static FAILURES: i64 = 0;
 static RNG: u64 = 88172645463325252;
 static OPS: i32 = 0;
 static LAST_OP: i32 = 0;

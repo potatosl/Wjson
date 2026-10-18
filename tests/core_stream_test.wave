@@ -24,8 +24,8 @@ import("wjson::core_stream")::{
     core_reader_error_column,
 };
 
-static CHECKS: i32 = 0;
-static FAILURES: i32 = 0;
+static CHECKS: i64 = 0;
+static FAILURES: i64 = 0;
 static RNG: u64 = 88172645463325252;
 
 fun check(cond: bool, label: str) {
