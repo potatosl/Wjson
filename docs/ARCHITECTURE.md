@@ -2,11 +2,6 @@
 
 How the source is organised, and what is not finished. Back to the [README](../README.md).
 
-| [한국어](README.ko.md)
-
-A JSON library for [Wave](https://wave-lang.dev) in which Rust, C++ and Wave
-each do the part they are best at.
-
 | Layer | Language | Responsibility | Location |
 | --- | --- | --- | --- |
 | API | **Wave** | the parser, document model, edit operations, JSON Pointer and incremental (pull) parser (`core_*.wave`, served through `ffi.wave`); navigation, path queries, document editing (incl. by path), writer, serialization, deep equality, file streaming; number conversion, string escaping and UTF-8 checks (`number.wave`, `escape.wave`) | `src/*.wave` |

@@ -13,7 +13,7 @@ curl -fsSL https://raw.githubusercontent.com/potatosl/wjson/main/install.sh | sh
 ~/.wjson/bin/wjson-wavec hello.wave --run     # hello.wave는 3단계 참고
 ```
 
-스크립트는 짧으니 실행 전에 [읽어 보세요](install.sh). `~/.wjson`에 설치되고(폴더를 지우면 제거돼요), `WJSON_REF=<태그 또는 커밋>`으로 `main` 대신 버전을 고르고, `WJSON_DIR`로 설치 위치를, `WJSON_SHA256`으로 받은 파일의 SHA-256이 다르면 중단하도록 지정할 수 있어요(실제 값은 항상 출력돼요). 아래 단계는 같은 일을 손으로 하는 방법이고, Windows에서는 아래 단계 또는 `setup-windows.cmd`를 쓰세요.
+스크립트는 짧으니 실행 전에 [읽어 보세요](../install.sh). `~/.wjson`에 설치되고(폴더를 지우면 제거돼요), `WJSON_REF=<태그 또는 커밋>`으로 `main` 대신 버전을 고르고, `WJSON_DIR`로 설치 위치를, `WJSON_SHA256`으로 받은 파일의 SHA-256이 다르면 중단하도록 지정할 수 있어요(실제 값은 항상 출력돼요). 아래 단계는 같은 일을 손으로 하는 방법이고, Windows에서는 아래 단계 또는 `setup-windows.cmd`를 쓰세요.
 
 **1. 도구 설치** — Wave 컴파일러 `wavec`(0.2.1-pre-beta, 현재 최신)와 C++20 컴파일러. Rust 1.99 이상은 전체 테스트를 돌릴 때, 그리고 `install.sh`로 설치하면서 프로그램을 `-O0`으로 빌드하는 환경(macOS arm64)에서 필요해요. 그 환경에서는 설치기가 더 빠른 Rust 백엔드를 골라요(`WJSON_BACKEND=wave|rust|auto`). Wave 공식 설치 방법은 [설치 페이지](https://wave-lang.dev/docs/en/getting-started/install)에 있어요:
 

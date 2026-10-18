@@ -17,7 +17,7 @@ curl -fsSL https://raw.githubusercontent.com/potatosl/wjson/main/install.sh | sh
 ~/.wjson/bin/wjson-wavec hello.wave --run     # hello.wave: see step 3
 ```
 
-The script is short, [read it](install.sh) before running it. It installs into
+The script is short, [read it](../install.sh) before running it. It installs into
 `~/.wjson` (remove that folder to uninstall). `WJSON_REF=<tag or commit>` picks
 a version instead of `main`, `WJSON_DIR` the folder, and `WJSON_SHA256` makes
 it refuse a download whose SHA-256 differs (the actual value is always
