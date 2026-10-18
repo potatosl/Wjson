@@ -22,6 +22,11 @@
 #   WAVE_STD       Wave's standard library folder, if wavec cannot find it
 #   WJSON_OPT      optimization flag for programs built with the wrapper
 #                  (default: -O2, or -O0 on macOS arm64, see README)
+#   WJSON_BACKEND  wave | rust | auto (default). The parser and document model
+#                  exist in Wave and in Rust. Wave is as fast as Rust when
+#                  optimized, 2x to 5x slower at -O0, so auto picks Rust (which
+#                  needs cargo) when the programs will be built with -O0 and
+#                  cargo is installed, and Wave otherwise.
 #
 # To remove wjson, delete the install folder.
 
@@ -37,7 +42,7 @@ need() { command -v "$1" > /dev/null 2>&1; }
 
 case "${1:-}" in
     -h | --help)
-        sed -n '4,28p' "$0" 2> /dev/null | sed 's/^# \{0,1\}//' || true
+        sed -n '4,34p' "$0" 2> /dev/null | sed 's/^# \{0,1\}//' || true
         exit 0
         ;;
 esac
@@ -60,6 +65,30 @@ if ! need wavec; then
 and open a new shell."
 fi
 need "${CXX:-c++}" || die "a C++20 compiler (${CXX:-c++}) is required (Xcode command line tools on macOS, g++ or clang++ on Linux)"
+
+# Optimization level the wrapper will use, and from it the backend.
+opt_level="${WJSON_OPT:-}"
+if [ -z "$opt_level" ]; then
+    if [ "$(uname -s)-$(uname -m)" = "Darwin-arm64" ]; then opt_level=-O0; else opt_level=-O2; fi
+fi
+BACKEND="${WJSON_BACKEND:-auto}"
+case "$BACKEND" in
+    wave | rust) ;;
+    auto)
+        BACKEND=wave
+        if [ "$opt_level" = "-O0" ]; then
+            if need cargo; then
+                BACKEND=rust
+            else
+                say "note: programs will be built with -O0, where the Rust backend is faster, but cargo is not installed; using the Wave backend (about 2x to 5x slower). Install Rust 1.99+ and run again to switch."
+            fi
+        fi
+        ;;
+    *) die "WJSON_BACKEND must be wave, rust or auto" ;;
+esac
+if [ "$BACKEND" = "rust" ] && ! need cargo; then
+    die "WJSON_BACKEND=rust needs Rust (cargo) 1.99 or newer on PATH (curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh)"
+fi
 
 sha256_of() {
     if need sha256sum; then
@@ -122,7 +151,13 @@ mkdir -p "$SRC"
 tar -xzf "$tarball" -C "$SRC" --strip-components=1 || die "could not unpack the download"
 [ -f "$SRC/build.wave" ] || die "the download does not look like wjson (no build.wave)"
 
-say "building the library"
+if [ "$BACKEND" = "rust" ]; then
+    cp "$SRC/src/ffi_rust.wave" "$SRC/src/ffi_backend.wave"
+    export WJSON_CORE=1
+    say "building the library (Rust backend)"
+else
+    say "building the library (Wave backend)"
+fi
 log="$DIR/build.log"
 (
     cd "$SRC"
@@ -140,9 +175,16 @@ log="$DIR/build.log"
 link_flags="$(sed -n 's/^link[[:space:]]*:[[:space:]]*//p' "$log" | tail -n 1)"
 native_lib="$SRC/$(sed -n 's/^native[[:space:]]*:[[:space:]]*//p' "$log" | tail -n 1)"
 [ -f "$native_lib" ] || die "the build did not produce the library (see $log)"
+core_lib=""
+if [ "$BACKEND" = "rust" ]; then
+    core_lib="$SRC/$(sed -n 's/^core[[:space:]]*:[[:space:]]*//p' "$log" | tail -n 1)"
+    [ -f "$core_lib" ] || die "the build did not produce the Rust core (see $log)"
+fi
 
 # ---- the wrapper ----------------------------------------------------------------------
 
+libs_arg="\"$native_lib\""
+[ -z "$core_lib" ] || libs_arg="$libs_arg \"$core_lib\""
 wrapper="$DIR/bin/wjson-wavec"
 {
     printf '#!/bin/sh\n'
@@ -156,11 +198,11 @@ wrapper="$DIR/bin/wjson-wavec"
     printf 'fi\n'
     if [ -n "$STD_ROOT" ]; then
         printf 'std="${WAVE_STD:-%s}"\n' "$STD_ROOT"
-        printf 'exec wavec --std-root="$std" $opt build "$@" "%s" --dep=wjson="%s" %s\n' \
-            "$native_lib" "$SRC" "$link_flags"
+        printf 'exec wavec --std-root="$std" $opt build "$@" %s --dep=wjson="%s" %s\n' \
+            "$libs_arg" "$SRC" "$link_flags"
     else
-        printf 'exec wavec $opt build "$@" "%s" --dep=wjson="%s" %s\n' \
-            "$native_lib" "$SRC" "$link_flags"
+        printf 'exec wavec $opt build "$@" %s --dep=wjson="%s" %s\n' \
+            "$libs_arg" "$SRC" "$link_flags"
     fi
 } > "$wrapper"
 chmod +x "$wrapper"

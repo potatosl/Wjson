@@ -1,0 +1,315 @@
+// SPDX-License-Identifier: MPL-2.0
+//
+// The default backend of src/ffi.wave: documents, editing and readers served by
+// the Wave code (src/core_*.wave). src/ffi_rust.wave has the same functions on
+// top of the Rust core; the installer copies it over this file when programs
+// are built without optimization (see install.sh), where the Wave code is 2x to
+// 5x slower.
+
+// ---- Documents and readers (pure Wave) ---------------------------------------
+//
+// A document handle is a heap-allocated CoreDoc, a reader handle a heap-allocated
+// CoreReader (src/core_*.wave). The functions keep the contract of the Rust C ABI
+// that this layer used to wrap (src/ffi_rust.wave): null handles, bad ids and
+// negative lengths are tolerated, and a failed parse still yields a handle that
+// carries the error.
+
+import("std::mem::layout")::{size_of};
+import("./core_dom")::{
+    CoreDoc, core_alloc, core_free, core_doc_release, core_root, core_type, core_bool, core_len, core_at,
+    core_key, core_get, core_pointer, core_str, core_num, core_num_is_int, core_parent,
+};
+import("./core_parse")::{core_parse};
+import("./core_edit")::{
+    core_new_doc, core_new_null, core_new_bool, core_new_number, core_new_string, core_new_array,
+    core_new_object, core_set_root, core_arr_push, core_arr_insert, core_arr_set, core_arr_remove,
+    core_obj_set, core_obj_clear, core_obj_remove, core_copy,
+};
+import("./core_stream")::{
+    CoreReader, core_reader_new, core_reader_free, core_reader_set_max_token, core_reader_feed,
+    core_reader_finish, core_reader_next, core_reader_text, core_reader_depth,
+    core_reader_documents, core_reader_buffered, core_reader_error_code, core_reader_error_offset,
+    core_reader_error_line, core_reader_error_column,
+};
+
+const ERR_INVALID_ARGUMENT: i32 = 13;
+
+pub fun ffi_version() -> ptr<u8> { return "0.4.0" as ptr<u8>; }
+
+// Message for an error code (0 = ok), the same text as the Rust core's.
+fun message_of(code: i32) -> ptr<u8> {
+    if (code == 0) { return "ok" as ptr<u8>; }
+    if (code == 1) { return "empty input" as ptr<u8>; }
+    if (code == 2) { return "unexpected character" as ptr<u8>; }
+    if (code == 3) { return "unexpected end of input" as ptr<u8>; }
+    if (code == 4) { return "invalid number" as ptr<u8>; }
+    if (code == 5) { return "invalid string" as ptr<u8>; }
+    if (code == 6) { return "invalid escape sequence" as ptr<u8>; }
+    if (code == 7) { return "invalid \\u escape or lone surrogate" as ptr<u8>; }
+    if (code == 8) { return "unescaped control character in string" as ptr<u8>; }
+    if (code == 9) { return "invalid UTF-8" as ptr<u8>; }
+    if (code == 10) { return "trailing data after value" as ptr<u8>; }
+    if (code == 11) { return "nesting too deep" as ptr<u8>; }
+    if (code == 12) { return "document too large" as ptr<u8>; }
+    return "invalid argument" as ptr<u8>;
+}
+
+fun box_doc(d: CoreDoc) -> ptr<u8> {
+    var p: ptr<CoreDoc> = core_alloc(size_of<CoreDoc>() as i64) as ptr<CoreDoc>;
+    if (p == null) {
+        return null;
+    }
+    deref p = d;
+    return p as ptr<u8>;
+}
+
+fun doc_of(h: ptr<u8>) -> ptr<CoreDoc> { return h as ptr<CoreDoc>; }
+
+fun doc_err_code(h: ptr<u8>) -> i32 {
+    var d: ptr<CoreDoc> = h as ptr<CoreDoc>;
+    return deref d.err_code;
+}
+fun doc_err_offset(h: ptr<u8>) -> i64 {
+    var d: ptr<CoreDoc> = h as ptr<CoreDoc>;
+    return deref d.err_offset;
+}
+fun doc_err_line(h: ptr<u8>) -> i64 {
+    var d: ptr<CoreDoc> = h as ptr<CoreDoc>;
+    return deref d.err_line;
+}
+fun doc_err_column(h: ptr<u8>) -> i64 {
+    var d: ptr<CoreDoc> = h as ptr<CoreDoc>;
+    return deref d.err_column;
+}
+fun doc_node_count(h: ptr<u8>) -> i64 {
+    var d: ptr<CoreDoc> = h as ptr<CoreDoc>;
+    return deref d.node_count;
+}
+
+pub fun ffi_parse(src: ptr<u8>, len: i64, max_depth: i32, flags: u32) -> ptr<u8> {
+    return box_doc(core_parse(src, len, max_depth, flags));
+}
+pub fun ffi_free(doc: ptr<u8>) {
+    if (doc != null) {
+        core_doc_release(doc_of(doc));
+        core_free(doc);
+    }
+}
+pub fun ffi_ok(doc: ptr<u8>) -> i32 {
+    if (doc == null || doc_err_code(doc) != 0) { return 0; }
+    return 1;
+}
+pub fun ffi_error_code(doc: ptr<u8>) -> i32 {
+    if (doc == null) { return ERR_INVALID_ARGUMENT; }
+    return doc_err_code(doc);
+}
+pub fun ffi_error_message(doc: ptr<u8>) -> ptr<u8> { return message_of(ffi_error_code(doc)); }
+pub fun ffi_error_offset(doc: ptr<u8>) -> i64 {
+    if (doc == null) { return 0; }
+    return doc_err_offset(doc);
+}
+pub fun ffi_error_line(doc: ptr<u8>) -> i64 {
+    if (doc == null) { return 0; }
+    return doc_err_line(doc);
+}
+pub fun ffi_error_column(doc: ptr<u8>) -> i64 {
+    if (doc == null) { return 0; }
+    return doc_err_column(doc);
+}
+pub fun ffi_root(doc: ptr<u8>) -> i32 {
+    if (doc == null) { return 0 - 1; }
+    return core_root(doc_of(doc));
+}
+pub fun ffi_node_count(doc: ptr<u8>) -> i64 {
+    if (doc == null) { return 0; }
+    return doc_node_count(doc);
+}
+pub fun ffi_type(doc: ptr<u8>, node: i32) -> i32 {
+    if (doc == null) { return 0 - 1; }
+    return core_type(doc_of(doc), node);
+}
+pub fun ffi_bool(doc: ptr<u8>, node: i32) -> i32 {
+    if (doc == null) { return 0 - 1; }
+    return core_bool(doc_of(doc), node);
+}
+pub fun ffi_len(doc: ptr<u8>, node: i32) -> i64 {
+    if (doc == null) { return 0 - 1; }
+    return core_len(doc_of(doc), node);
+}
+pub fun ffi_at(doc: ptr<u8>, node: i32, index: i64) -> i32 {
+    if (doc == null) { return 0 - 1; }
+    return core_at(doc_of(doc), node, index);
+}
+pub fun ffi_key(doc: ptr<u8>, node: i32, index: i64, out_len: ptr<i64>) -> ptr<u8> {
+    if (doc == null) {
+        if (out_len != null) { deref out_len = 0; }
+        return null;
+    }
+    return core_key(doc_of(doc), node, index, out_len);
+}
+pub fun ffi_get(doc: ptr<u8>, node: i32, key: ptr<u8>, key_len: i64) -> i32 {
+    if (doc == null || key_len < 0 || (key_len > 0 && key == null)) { return 0 - 1; }
+    return core_get(doc_of(doc), node, key, key_len);
+}
+pub fun ffi_pointer(doc: ptr<u8>, node: i32, pointer: ptr<u8>, len: i64) -> i32 {
+    if (doc == null || len < 0 || (len > 0 && pointer == null)) { return 0 - 1; }
+    return core_pointer(doc_of(doc), node, pointer, len);
+}
+pub fun ffi_str(doc: ptr<u8>, node: i32, out_len: ptr<i64>) -> ptr<u8> {
+    if (doc == null) {
+        if (out_len != null) { deref out_len = 0; }
+        return null;
+    }
+    return core_str(doc_of(doc), node, out_len);
+}
+pub fun ffi_num(doc: ptr<u8>, node: i32, out_len: ptr<i64>) -> ptr<u8> {
+    if (doc == null) {
+        if (out_len != null) { deref out_len = 0; }
+        return null;
+    }
+    return core_num(doc_of(doc), node, out_len);
+}
+pub fun ffi_num_is_int(doc: ptr<u8>, node: i32) -> i32 {
+    if (doc == null) { return 0 - 1; }
+    return core_num_is_int(doc_of(doc), node);
+}
+
+// ---- Editing ----------------------------------------------------------------
+
+pub fun ffi_new_doc() -> ptr<u8> { return box_doc(core_new_doc()); }
+pub fun ffi_new_null(doc: ptr<u8>) -> i32 {
+    if (doc == null) { return 0 - 1; }
+    return core_new_null(doc_of(doc));
+}
+pub fun ffi_new_bool(doc: ptr<u8>, value: i32) -> i32 {
+    if (doc == null) { return 0 - 1; }
+    return core_new_bool(doc_of(doc), value);
+}
+pub fun ffi_new_number(doc: ptr<u8>, lexeme: ptr<u8>, len: i64) -> i32 {
+    if (doc == null || len < 0 || (len > 0 && lexeme == null)) { return 0 - 1; }
+    return core_new_number(doc_of(doc), lexeme, len);
+}
+pub fun ffi_new_string(doc: ptr<u8>, text: ptr<u8>, len: i64) -> i32 {
+    if (doc == null || len < 0 || (len > 0 && text == null)) { return 0 - 1; }
+    return core_new_string(doc_of(doc), text, len);
+}
+pub fun ffi_new_array(doc: ptr<u8>) -> i32 {
+    if (doc == null) { return 0 - 1; }
+    return core_new_array(doc_of(doc));
+}
+pub fun ffi_new_object(doc: ptr<u8>) -> i32 {
+    if (doc == null) { return 0 - 1; }
+    return core_new_object(doc_of(doc));
+}
+pub fun ffi_set_root(doc: ptr<u8>, node: i32) -> i32 {
+    if (doc == null) { return 0 - 1; }
+    return core_set_root(doc_of(doc), node);
+}
+pub fun ffi_parent(doc: ptr<u8>, node: i32) -> i32 {
+    if (doc == null) { return 0 - 3; }
+    return core_parent(doc_of(doc), node);
+}
+pub fun ffi_arr_push(doc: ptr<u8>, arr: i32, value: i32) -> i32 {
+    if (doc == null) { return 0 - 1; }
+    return core_arr_push(doc_of(doc), arr, value);
+}
+pub fun ffi_arr_insert(doc: ptr<u8>, arr: i32, index: i64, value: i32) -> i32 {
+    if (doc == null) { return 0 - 1; }
+    return core_arr_insert(doc_of(doc), arr, index, value);
+}
+pub fun ffi_arr_set(doc: ptr<u8>, arr: i32, index: i64, value: i32) -> i32 {
+    if (doc == null) { return 0 - 1; }
+    return core_arr_set(doc_of(doc), arr, index, value);
+}
+pub fun ffi_arr_remove(doc: ptr<u8>, arr: i32, index: i64) -> i32 {
+    if (doc == null) { return 0 - 1; }
+    return core_arr_remove(doc_of(doc), arr, index);
+}
+pub fun ffi_obj_set(doc: ptr<u8>, obj: i32, key: ptr<u8>, key_len: i64, value: i32) -> i32 {
+    if (doc == null || key_len < 0 || (key_len > 0 && key == null)) { return 0 - 1; }
+    return core_obj_set(doc_of(doc), obj, key, key_len, value);
+}
+pub fun ffi_obj_clear(doc: ptr<u8>, obj: i32) -> i32 {
+    if (doc == null) { return 0 - 1; }
+    return core_obj_clear(doc_of(doc), obj);
+}
+pub fun ffi_obj_remove(doc: ptr<u8>, obj: i32, key: ptr<u8>, key_len: i64) -> i32 {
+    if (doc == null || key_len < 0 || (key_len > 0 && key == null)) { return 0 - 1; }
+    return core_obj_remove(doc_of(doc), obj, key, key_len);
+}
+pub fun ffi_copy(doc: ptr<u8>, src: ptr<u8>, src_node: i32) -> i32 {
+    if (doc == null || src == null) { return 0 - 1; }
+    return core_copy(doc_of(doc), doc_of(src), src_node);
+}
+
+// ---- Streaming --------------------------------------------------------------
+
+fun reader_of(h: ptr<u8>) -> ptr<CoreReader> { return h as ptr<CoreReader>; }
+
+pub fun ffi_reader_new(max_depth: i32, flags: u32) -> ptr<u8> {
+    var p: ptr<CoreReader> = core_alloc(size_of<CoreReader>() as i64) as ptr<CoreReader>;
+    if (p == null) {
+        return null;
+    }
+    deref p = core_reader_new(max_depth, flags);
+    return p as ptr<u8>;
+}
+pub fun ffi_reader_free(r: ptr<u8>) {
+    if (r != null) {
+        core_reader_free(reader_of(r));
+        core_free(r);
+    }
+}
+pub fun ffi_reader_set_max_token(r: ptr<u8>, bytes: i64) {
+    if (r != null) { core_reader_set_max_token(reader_of(r), bytes); }
+}
+pub fun ffi_reader_feed(r: ptr<u8>, data: ptr<u8>, len: i64) -> i32 {
+    if (r == null) { return 0 - 1; }
+    return core_reader_feed(reader_of(r), data, len);
+}
+pub fun ffi_reader_finish(r: ptr<u8>) {
+    if (r != null) { core_reader_finish(reader_of(r)); }
+}
+pub fun ffi_reader_next(r: ptr<u8>) -> i32 {
+    if (r == null) { return 0 - 1; }
+    return core_reader_next(reader_of(r));
+}
+pub fun ffi_reader_text(r: ptr<u8>, out_len: ptr<i64>) -> ptr<u8> {
+    if (r == null) {
+        if (out_len != null) { deref out_len = 0; }
+        return "" as ptr<u8>;
+    }
+    return core_reader_text(reader_of(r), out_len);
+}
+pub fun ffi_reader_depth(r: ptr<u8>) -> i32 {
+    if (r == null) { return 0; }
+    return core_reader_depth(reader_of(r));
+}
+pub fun ffi_reader_documents(r: ptr<u8>) -> i64 {
+    if (r == null) { return 0; }
+    return core_reader_documents(reader_of(r));
+}
+pub fun ffi_reader_buffered(r: ptr<u8>) -> i64 {
+    if (r == null) { return 0; }
+    return core_reader_buffered(reader_of(r));
+}
+pub fun ffi_reader_error_code(r: ptr<u8>) -> i32 {
+    if (r == null) { return 0; }
+    return core_reader_error_code(reader_of(r));
+}
+pub fun ffi_reader_error_message(r: ptr<u8>) -> ptr<u8> {
+    return message_of(ffi_reader_error_code(r));
+}
+pub fun ffi_reader_error_offset(r: ptr<u8>) -> i64 {
+    if (r == null) { return 0; }
+    return core_reader_error_offset(reader_of(r));
+}
+pub fun ffi_reader_error_line(r: ptr<u8>) -> i64 {
+    if (r == null) { return 0; }
+    return core_reader_error_line(reader_of(r));
+}
+pub fun ffi_reader_error_column(r: ptr<u8>) -> i64 {
+    if (r == null) { return 0; }
+    return core_reader_error_column(reader_of(r));
+}
+

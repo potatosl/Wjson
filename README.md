@@ -49,7 +49,9 @@ printed). The steps below do the same by hand; on Windows use them or
 
 **1. Install the tools** — the Wave compiler `wavec` (0.2.1-pre-beta, the
 newest release) and a C++20 compiler; Rust 1.99 or newer is only needed to run the
-full test suite (the Rust core is the reference the Wave code is tested against). Wave's official
+full test suite (the Rust core is the reference the Wave code is tested against)
+and, with `install.sh`, when programs are built with `-O0` (macOS arm64), where
+the installer uses the faster Rust backend (`WJSON_BACKEND=wave|rust|auto`). Wave's official
 installer (see its [install page](https://wave-lang.dev/docs/en/getting-started/install)):
 
 ```sh

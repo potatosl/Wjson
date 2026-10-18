@@ -86,6 +86,14 @@ minor releases.
   and pull parser against the Rust core on a 24.6 MB records file (best of 5,
   `-O2`): parse 61 ms vs 94 ms, 600k key lookups 1 ms vs 4 ms, pull parser
   61 ms vs 62 ms; with `-O0` Wave is 2x to 5x slower (189 / 8 / 312 ms).
+- Backend choice for unoptimized builds. The document, edit and reader
+  functions of `src/ffi.wave` now live in `src/ffi_backend.wave` (Wave code);
+  `src/ffi_rust.wave` is the same set on the Rust core. Wave is as fast as Rust
+  with `-O2` and 2x to 5x slower with `-O0` (macOS arm64 builds with `-O0`), so
+  `install.sh` copies the Rust version over `ffi_backend.wave`, builds the core
+  and links it when the programs will be built with `-O0` and cargo is
+  installed; otherwise it keeps the Wave backend. `WJSON_BACKEND=wave|rust|auto`
+  overrides the choice. The installer's CI job checks both backends.
 - Windows on ARM64 is supported, natively and without MSVC like x64. `wjlink`
   (the MSVC-free link driver) now takes the architecture as a value: import
   libraries use the matching machine type and RVA relocation, and the startup

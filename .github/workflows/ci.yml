@@ -75,6 +75,10 @@ jobs:
           cd "$RUNNER_TEMP"
           "$RUNNER_TEMP/wjson-install/bin/wjson-wavec" hello.wave --run | tee hello.out
           grep -qx "0.0.0.0:8080" hello.out
+          # The Rust backend (used for -O0 builds) gives the same answer.
+          WJSON_BACKEND=rust WJSON_TARBALL="$RUNNER_TEMP/wjson.tar.gz" WJSON_DIR="$RUNNER_TEMP/wjson-install-rust" sh "$GITHUB_WORKSPACE/install.sh"
+          "$RUNNER_TEMP/wjson-install-rust/bin/wjson-wavec" hello.wave --run | tee hello-rust.out
+          grep -qx "0.0.0.0:8080" hello-rust.out
       - name: Sanitizers and valgrind
         run: |
           sudo apt-get update
